@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 
 import config
@@ -18,7 +18,6 @@ def create_application(arguments: list[str] | None = None) -> QApplication:
     """创建并配置全局 QApplication。"""
     QCoreApplication.setOrganizationName("字库编辑器")
     QCoreApplication.setApplicationName("字库编辑器")
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     app = QApplication(arguments if arguments is not None else sys.argv)
     app.setApplicationDisplayName("字库编辑器")
     apply_theme(app)
