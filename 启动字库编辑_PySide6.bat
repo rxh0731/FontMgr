@@ -4,17 +4,32 @@ cd /d "%~dp0"
 
 set "PYTHON_EXE=.venv\Scripts\python.exe"
 if not exist "%PYTHON_EXE%" (
-    echo [é”™è¯¯] æœªæ‰¾åˆ°é¡¹ç›®è™šæ‹Ÿç¯å¢ƒï¼š%PYTHON_EXE%
-    echo è¯·å…ˆåˆ›å»ºè™šæ‹Ÿç¯å¢ƒå¹¶å®‰è£… requirements.txt ä¸­çš„ä¾èµ–ã€‚
-    pause
-    exit /b 1
+    echo [ÌáÊ¾] Ê×´ÎÆô¶¯£¬ÕıÔÚ´´½¨ Python 3.12 ĞéÄâ»·¾³¡­¡­
+    where uv >nul 2>nul
+    if not errorlevel 1 (
+        uv venv --python 3.12 .venv
+        if errorlevel 1 goto :setup_failed
+        echo [ÌáÊ¾] ÕıÔÚ°²×°ÏîÄ¿ÒÀÀµ£¬ÇëÉÔºò¡­¡­
+        uv pip install --python "%PYTHON_EXE%" -r requirements.txt
+    ) else (
+        py -3.12 -m venv .venv
+        if errorlevel 1 goto :setup_failed
+        echo [ÌáÊ¾] ÕıÔÚ°²×°ÏîÄ¿ÒÀÀµ£¬ÇëÉÔºò¡­¡­
+        "%PYTHON_EXE%" -m pip install -r requirements.txt
+    )
+    if errorlevel 1 goto :setup_failed
 )
 
 "%PYTHON_EXE%" main.py
 if errorlevel 1 (
     echo.
-    echo [é”™è¯¯] å­—åº“ç¼–è¾‘å™¨å¯åŠ¨å¤±è´¥ï¼Œé€€å‡ºç ï¼š%errorlevel%
+    echo [´íÎó] ×Ö¿â±à¼­Æ÷Æô¶¯Ê§°Ü£¬ÍË³öÂë£º%errorlevel%
     pause
 )
+exit /b %errorlevel%
 
-endlocal
+:setup_failed
+echo.
+echo [´íÎó] ÔËĞĞ»·¾³´´½¨Ê§°Ü£¬Çë¼ì²éÍøÂçÁ¬½ÓºÍ Python 3.12¡£
+pause
+exit /b 1
