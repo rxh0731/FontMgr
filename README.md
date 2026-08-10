@@ -7,7 +7,8 @@
 - 已复制与 GUI 无关的业务层：`core`、`data`、`services`、`utils`。
 - 已复制旧版 Tk 界面到 `reference/tk_ui`，仅供行为和布局参考。
 - 已复制并验证流畅的 PySide6 画布原型到 `prototype`。
-- 已复制算法注册表、应用图标、开发说明书和小型测试字库。
+- 已复制算法注册表、应用图标和小型测试字库。
+- 已建立现行规范 `字库编辑_PySide6_开发说明书.md`，旧版说明书已归档到 `reference`。
 - `ui` 是新 PySide6 正式界面的开发目录，目前尚未开始正式迁移。
 
 ## 开始开发
@@ -25,7 +26,7 @@ py -m venv .venv
 
 ## 新会话建议提示
 
-> 请在 `D:\Code\FontEditor-PySide6` 中继续开发 PySide6 版字库编辑器。先阅读 `AGENTS.md`、`README.md` 和 `字库编辑_V2_开发说明书.md`，再检查 `prototype/PySide6画布性能测试.py`、`reference/tk_ui/edit_canvas.py`、`data`、`services`、`core`。旧版 `D:\Code\FontEditor` 必须保持不变。第一阶段先建立 PySide6 主窗口并迁移手工审核页面，画布必须沿用持久 `QImage`、`QPainter`、脏矩形刷新架构。
+> 请继续开发 `D:\Code\FontEditor-PySide6`。先阅读 `AGENTS.md`、`字库编辑_PySide6_开发说明书.md` 和 `README.md`，核对当前 Git 状态，然后按开发说明书从 PySide6 应用骨架和手工审核页面开始。`D:\Code\FontEditor` 只读且必须保持不变。
 
 ## 隔离说明
 
