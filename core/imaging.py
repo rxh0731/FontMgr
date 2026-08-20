@@ -7,6 +7,40 @@ from typing import Optional, Tuple
 
 
 # ============================================================
+# 灰度与极性
+# ============================================================
+
+def normalize_text_polarity(gray_arr: np.ndarray) -> tuple[np.ndarray, bool]:
+    """将文字图自动校正为白底深字，返回校正结果及是否执行过反相。"""
+    arr = np.clip(gray_arr, 0, 255).astype(np.float32)
+    if arr.ndim != 2 or arr.size == 0:
+        raise ValueError("极性判断需要非空的二维灰度图。")
+
+    height, width = arr.shape
+    border_width = max(1, min(height, width) // 20)
+    border = np.concatenate((
+        arr[:border_width, :].ravel(),
+        arr[-border_width:, :].ravel(),
+        arr[:, :border_width].ravel(),
+        arr[:, -border_width:].ravel(),
+    ))
+    low = float(np.percentile(arr, 5))
+    high = float(np.percentile(arr, 95))
+    if high - low < 12.0:
+        should_invert = float(np.median(border)) < 127.5
+    else:
+        pivot = (low + high) / 2.0
+        dark_border_ratio = float(np.mean(border < pivot))
+        if dark_border_ratio >= 0.65:
+            should_invert = True
+        elif dark_border_ratio <= 0.35:
+            should_invert = False
+        else:
+            should_invert = float(np.median(arr)) < pivot
+    return (255.0 - arr if should_invert else arr), should_invert
+
+
+# ============================================================
 # 缩放与裁剪
 # ============================================================
 

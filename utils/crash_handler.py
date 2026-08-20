@@ -1,6 +1,7 @@
 # crash_handler.py — 全局异常捕获与崩溃日志
 
 import sys
+import threading
 import traceback
 from datetime import datetime
 
@@ -16,7 +17,8 @@ def setup_crash_handler(log_file: str) -> None:
     _log_file = log_file
 
     original_excepthook = sys.excepthook
-    original_threadexcepthook = getattr(sys, "unraisablehook", None)
+    original_threadexcepthook = getattr(threading, "excepthook", None)
+    original_unraisablehook = getattr(sys, "unraisablehook", None)
 
     def _log_exception(exc_type: type, exc_value: BaseException, exc_tb: object) -> None:
         today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -37,6 +39,14 @@ def setup_crash_handler(log_file: str) -> None:
         if original_threadexcepthook is not None:
             original_threadexcepthook(args)
 
+    def _custom_unraisablehook(args):
+        exc_type = args.exc_type or type(args.exc_value)
+        _log_exception(exc_type, args.exc_value, args.exc_traceback)
+        if original_unraisablehook is not None:
+            original_unraisablehook(args)
+
     sys.excepthook = _custom_excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _custom_threadexcepthook
     if hasattr(sys, "unraisablehook"):
-        sys.unraisablehook = _custom_threadexcepthook
+        sys.unraisablehook = _custom_unraisablehook

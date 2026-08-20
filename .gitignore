@@ -1,12 +1,45 @@
+# Python：字节码与解释器缓存
 __pycache__/
 *.py[cod]
+
+# Python：虚拟环境
 .venv/
-.idea/
-.vscode/
+
+# Python：测试与静态检查缓存
 .pytest_cache/
 .ruff_cache/
-*.log
+
+# 开发工具：IDE 与编辑器配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 本地配置：用户专属设置与环境变量
+配置/用户设置.json
+配置/字库状态索引.json
+.env
+
+# 运行数据：本地字库与测试输出
+字库/
 测试日志/
+便携版/
+
+# 运行日志与临时文件
+*.log
+*.log.old
+*.tmp
+*.bak
+nulcd
+restore_language_tokens.py
+
+# 构建产物：PyInstaller 输出
 build/
 dist/
 *.spec
+
+# 操作系统：自动生成的元数据文件
+Thumbs.db
+.DS_Store
+desktop.ini

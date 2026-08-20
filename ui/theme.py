@@ -63,6 +63,11 @@ def apply_theme(app: QApplication) -> None:
             font-weight: 600;
         }}
         QPushButton[role="primary"]:hover {{ background: {COLORS['accent_hover']}; }}
+        QPushButton[role="primary"]:disabled {{
+            color: #737D8A;
+            background: #252B34;
+            border-color: #343C47;
+        }}
         QFrame[role="card"] {{
             background: {COLORS['surface']};
             border: 1px solid {COLORS['border']};
@@ -87,6 +92,64 @@ def apply_theme(app: QApplication) -> None:
             color: {COLORS['text']};
             background: {COLORS['surface_alt']};
             border: 1px solid {COLORS['border']};
+        }}
+        QLabel#homeTitle {{ font-size: 27px; font-weight: 700; color: #F4F7FB; }}
+        QLabel#homeSubtitle {{ color: {COLORS['muted']}; font-size: 12px; }}
+        QLabel#sectionTitle {{ font-size: 16px; font-weight: 700; color: #E8EDF5; }}
+        QLabel#cardTitle {{ font-size: 14px; font-weight: 700; color: #E8EDF5; }}
+        QLabel#cardDetail, QLabel#stageStatus {{ color: {COLORS['muted']}; font-size: 11px; }}
+        QLabel#cardArrow {{ color: #768396; font-size: 25px; }}
+        QLabel#metricValue {{ color: #EAF1FA; font-size: 21px; font-weight: 700; }}
+        QFrame#toolCard, QFrame#stageCard, QFrame#exportStageCard, QFrame#selectorPanel {{
+            background: rgba(31, 37, 47, 242);
+            border: 1px solid {COLORS['border']};
+            border-radius: 7px;
+        }}
+        QFrame#libraryFlowPanel, QFrame#libraryCreatePanel {{
+            background: rgba(24, 29, 37, 218);
+            border: 1px solid #4A5666;
+            border-radius: 7px;
+        }}
+        QFrame#toolCard:hover {{ background: #29313D; border-color: #526177; }}
+        QFrame#exportStageCard {{ background: rgba(28, 48, 72, 246); border-color: #416A9D; }}
+        QFrame#stageCard[available="false"], QFrame#exportStageCard[available="false"] {{
+            background: rgba(26, 31, 39, 232);
+            border-color: #303844;
+        }}
+        QFrame#stageCard[available="false"] QLabel#cardTitle,
+        QFrame#stageCard[available="false"] QLabel#cardDetail,
+        QFrame#stageCard[available="false"] QLabel#stageStatus,
+        QFrame#stageCard[available="false"] QLabel#metricValue,
+        QFrame#exportStageCard[available="false"] QLabel#cardTitle,
+        QFrame#exportStageCard[available="false"] QLabel#cardDetail,
+        QFrame#exportStageCard[available="false"] QLabel#stageStatus,
+        QFrame#exportStageCard[available="false"] QLabel#metricValue {{ color: #68717E; }}
+        QPushButton#compactButton, QPushButton#dangerCompactButton {{ min-height: 28px; padding: 0 11px; border-radius: 5px; font-size: 12px; }}
+        QPushButton[controlRole="segment"]:checked {{
+            color: #FFFFFF;
+            background: #294D75;
+            border-color: {COLORS['accent']};
+        }}
+        QPushButton#dangerCompactButton {{ color: #F2B6B6; border-color: #734545; background: #482D31; }}
+        QPushButton#dangerCompactButton:hover {{ color: #FFFFFF; border-color: #B65B5B; background: #68373B; }}
+        QTableWidget {{
+            border: 1px solid {COLORS['border']};
+            border-radius: 5px;
+            background: rgba(26, 31, 39, 245);
+            alternate-background-color: #202630;
+            selection-background-color: #294D75;
+            gridline-color: transparent;
+        }}
+        QTableWidget::item {{ padding: 5px 8px; border-bottom: 1px solid #2B333E; }}
+        QHeaderView::section {{
+            min-height: 31px;
+            padding: 0 8px;
+            color: #D7DEE8;
+            background: #252C36;
+            border: 0;
+            border-right: 1px solid {COLORS['border']};
+            border-bottom: 1px solid {COLORS['border']};
+            font-weight: 600;
         }}
         """
     )

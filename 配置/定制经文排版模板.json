@@ -1,0 +1,131 @@
+{
+  "数据版本": 1,
+  "用户模板": {
+    "builtin:default": {
+      "名称": "默认模板",
+      "说明": "程序内置的定制排版托底参数，不能覆盖或删除。",
+      "创建时间": "",
+      "修改时间": "",
+      "参数": {
+        "boards": [
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 20.0,
+            "base_row_gap_mm": 2.0,
+            "base_column_characters": 21,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          }
+        ],
+        "include_punctuation": false,
+        "add_annotations": false
+      }
+    },
+    "8a0bba3043714a0391e64eb3aefce4ea": {
+      "名称": "小品",
+      "说明": "",
+      "创建时间": "2026-08-19T22:50:05+08:00",
+      "修改时间": "2026-08-19T22:50:05+08:00",
+      "参数": {
+        "boards": [
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 18.0,
+            "base_row_gap_mm": 2.9,
+            "base_column_characters": 71,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          },
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 18.0,
+            "base_row_gap_mm": 2.9,
+            "base_column_characters": 71,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          },
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 18.0,
+            "base_row_gap_mm": 2.9,
+            "base_column_characters": 83,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          },
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 18.0,
+            "base_row_gap_mm": 2.9,
+            "base_column_characters": 83,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          },
+          {
+            "dpi": 300,
+            "cell_width_mm": 18.0,
+            "cell_height_mm": 18.0,
+            "base_row_gap_mm": 2.9,
+            "base_column_characters": 83,
+            "column_gap_mm": 3.0,
+            "draw_outer_frame": true,
+            "frame_top_mm": 2.0,
+            "frame_bottom_mm": 2.0,
+            "frame_left_mm": 2.0,
+            "frame_right_mm": 2.0,
+            "canvas_top_mm": 8.0,
+            "canvas_bottom_mm": 8.0,
+            "canvas_left_mm": 8.0,
+            "canvas_right_mm": 8.0
+          }
+        ],
+        "include_punctuation": false,
+        "add_annotations": false
+      }
+    }
+  }
+}

@@ -1,12 +1,22 @@
 # config.py — 全局常量、路径、默认参数
 
 import os
+import sys
 
-SCRIPT_DIR: str = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR: str = os.path.dirname(os.path.abspath(sys.executable))
+    RESOURCE_DIR: str = getattr(sys, "_MEIPASS", SCRIPT_DIR)
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    RESOURCE_DIR = SCRIPT_DIR
 CONFIG_DIR: str = os.path.join(SCRIPT_DIR, "配置")
 REGISTRY_FILE: str = os.path.join(CONFIG_DIR, "算法注册表.json")
 TEMPLATE_FILE: str = os.path.join(CONFIG_DIR, "优化模板.json")
 GLOBAL_CONFIG_FILE: str = os.path.join(CONFIG_DIR, "用户设置.json")
+LIBRARY_SUMMARY_CACHE_FILE: str = os.path.join(CONFIG_DIR, "字库状态索引.json")
+LAYOUT_TEMPLATE_FILE: str = os.path.join(CONFIG_DIR, "通用经文排版模板.json")
+LEGACY_LAYOUT_TEMPLATE_FILE: str = os.path.join(CONFIG_DIR, "排版模板.json")
+CUSTOM_LAYOUT_TEMPLATE_FILE: str = os.path.join(CONFIG_DIR, "定制经文排版模板.json")
 ZIKU_ROOT: str = os.path.join(SCRIPT_DIR, "字库")
 LOG_FILE: str = os.path.join(SCRIPT_DIR, "font_editor.log")
 LOG_MAX_BYTES: int = 2 * 1024 * 1024
@@ -53,4 +63,10 @@ STATUS_COLORS: dict[str, str] = {
 
 MAX_IMPORT_WORKERS: int = max(1, (os.cpu_count() or 4) // 2)
 THUMB_CACHE_MAX: int = 200
-ICON_FILE: str = os.path.join(SCRIPT_DIR, "FontEditor.ico")
+ICON_FILE: str = os.path.join(RESOURCE_DIR, "FontEditor.ico")
+WINDOW_ICON_FILE: str = os.path.join(
+    RESOURCE_DIR,
+    "assets",
+    "font_editor_icon_color_blocks.png",
+)
+WINDOWS_APP_USER_MODEL_ID: str = "RuanXiaohua.FontEditor.PySide6"

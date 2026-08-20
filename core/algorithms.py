@@ -4,6 +4,13 @@ import cv2
 import numpy as np
 from typing import Optional, Tuple
 
+from core import foreground_analysis
+from core import stroke_scale_analysis
+from core.component_policy import (
+    PRIMARY_CLUSTER_COMPONENT_LIMIT,
+    STRUCTURE_PROTECTION_COMPONENT_LIMIT,
+)
+
 
 # ============================================================
 # L1 降噪层
@@ -87,6 +94,26 @@ def blackhat_background_enhance(arr: np.ndarray, kernel: int = 15, strength: flo
     return np.clip(result, 0, 255).astype(np.float32)
 
 
+def low_contrast_background_correct(
+    arr: np.ndarray,
+    background_kernel: int = 51,
+    clip_limit: float = 1.4,
+    tile_grid: int = 8,
+) -> np.ndarray:
+    """校正缓慢变化的亮背景，并可选使用受限 CLAHE 提升低对比笔画。"""
+    arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
+    size = _odd_kernel(background_kernel)
+    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    background = cv2.morphologyEx(arr_u8, cv2.MORPH_CLOSE, element).astype(np.float32)
+    corrected = cv2.divide(arr_u8.astype(np.float32), np.maximum(background, 1.0), scale=255.0)
+    corrected_u8 = np.clip(corrected, 0, 255).astype(np.uint8)
+    if float(clip_limit) <= 0:
+        return corrected_u8.astype(np.float32)
+    grid = max(2, min(32, int(tile_grid)))
+    clahe = cv2.createCLAHE(clipLimit=max(0.1, float(clip_limit)), tileGridSize=(grid, grid))
+    return clahe.apply(corrected_u8).astype(np.float32)
+
+
 # ============================================================
 # L3 二值化层
 # ============================================================
@@ -108,6 +135,59 @@ def fixed_threshold_binarize(arr: np.ndarray, threshold: int = 160) -> np.ndarra
     arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
     value = max(1, min(254, int(threshold)))
     return (arr_u8 < value).astype(np.uint8) * 255
+
+
+def seeded_reconstruction_binarize(
+    arr: np.ndarray,
+    seed_offset: int = -28,
+    support_offset: int = 18,
+) -> np.ndarray:
+    """以深墨核心为种子，在宽松阈值支持区内恢复连通笔画。
+
+    与单阈值不同，浅色像素只有连接到稳定深墨核心时才会保留，适合
+    同时存在浅笔画和大量孤立散点的重污染字图。
+    """
+    arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
+    otsu, _ = cv2.threshold(arr_u8, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    seed_threshold = int(np.clip(float(otsu) + int(seed_offset), 1, 253))
+    support_threshold = int(np.clip(float(otsu) + int(support_offset), seed_threshold + 1, 254))
+    seed = arr_u8 <= seed_threshold
+    support = (arr_u8 <= support_threshold).astype(np.uint8)
+    if not seed.any():
+        return (arr_u8 <= int(otsu)).astype(np.uint8) * 255
+
+    count, labels = cv2.connectedComponents(support, connectivity=8, ltype=cv2.CV_32S)
+    if count <= 1:
+        return np.zeros_like(arr_u8, dtype=np.uint8)
+    seed_labels = np.unique(labels[seed])
+    seed_labels = seed_labels[seed_labels > 0]
+    if not seed_labels.size:
+        return (arr_u8 <= int(otsu)).astype(np.uint8) * 255
+    keep = np.zeros(count, dtype=bool)
+    keep[seed_labels] = True
+    return keep[labels].astype(np.uint8) * 255
+
+
+def stroke_scale_core_reconstruct(
+    arr: np.ndarray,
+    strength_level: int = 1,
+    min_confidence: float = 0.78,
+    minimum_noise_components: int = 8,
+) -> np.ndarray:
+    """按主体笔画与密集细噪的尺度差异重建文字掩码。"""
+    strengths = (
+        stroke_scale_analysis.ReconstructionStrength.CONSERVATIVE,
+        stroke_scale_analysis.ReconstructionStrength.BALANCED,
+        stroke_scale_analysis.ReconstructionStrength.STRONG,
+    )
+    level = max(0, min(2, int(strength_level)))
+    analysis = stroke_scale_analysis.analyze_stroke_scale(
+        arr,
+        min_confidence=float(min_confidence),
+        minimum_noise_components=max(1, int(minimum_noise_components)),
+    )
+    result = stroke_scale_analysis.reconstruct_stroke_scale(analysis, strengths[level])
+    return result.mask.astype(np.uint8) * 255
 
 
 def sauvola_binarize(arr: np.ndarray, window: int = 25, k: float = 0.2, R: int = 128) -> np.ndarray:
@@ -207,6 +287,13 @@ def wolf_binarize(arr: np.ndarray, window: int = 31, k: float = 0.35) -> np.ndar
     min_gray = float(arr_u8.min())
     threshold = mean_arr + float(k) * (std_arr / max_std - 1.0) * (mean_arr - min_gray)
     return (arr_u8 < threshold).astype(np.uint8) * 255
+
+
+def triangle_binarize(arr: np.ndarray) -> np.ndarray:
+    """使用 Triangle 直方图阈值生成深色文字掩码。"""
+    arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
+    _, mask = cv2.threshold(arr_u8, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_TRIANGLE)
+    return mask
 
 
 # ============================================================
@@ -323,7 +410,7 @@ def border_component_filter(
     mask: np.ndarray,
     max_width_ratio: float = 0.18,
     max_height_ratio: float = 0.18,
-    preserve_largest: int = 8,
+    preserve_largest: int = STRUCTURE_PROTECTION_COMPONENT_LIMIT,
 ) -> np.ndarray:
     """删除贴边的窄条、版框和扫描阴影，同时保护主要文字连通域。"""
     source = (mask > 0).astype(np.uint8) * 255
@@ -340,6 +427,29 @@ def border_component_filter(
         if touches and label not in protected and (narrow_vertical or narrow_horizontal):
             continue
         result[labels == label] = 255
+    return result
+
+
+def external_pollution_filter(
+    mask: np.ndarray,
+    min_confidence: float = 0.78,
+    max_area_ratio: float = 0.20,
+    gap_stroke_ratio: float = 1.25,
+    edge_margin_ratio: float = 0.18,
+    remove_small_isolated: bool = True,
+    min_area: int = 10,
+) -> np.ndarray:
+    """高置信删除主体外围污染簇，低置信时完整保留输入掩码。"""
+    analysis = foreground_analysis.analyze_external_pollution(
+        mask,
+        min_confidence=min_confidence,
+        max_area_ratio=max_area_ratio,
+        gap_stroke_ratio=gap_stroke_ratio,
+        edge_margin_ratio=edge_margin_ratio,
+    )
+    result = analysis.cleaned_mask * 255
+    if analysis.applied and remove_small_isolated:
+        result = area_filter(result, min_area=max(1, int(min_area)))
     return result
 
 
@@ -372,12 +482,14 @@ def area_shape_filter(
         ref = total_text_pixels if total_text_pixels is not None else int(mask_u8.sum() / 255)
         min_area = max(min_area, int(ref * relative_ratio))
 
-    # 计算文字主体区域（前 5 大连通域）的质心
+    # 主体簇只参与空间距离估算；结构保护使用更宽松的 8 域策略。
     areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
     areas.sort(key=lambda x: x[1], reverse=True)
     main_centroids = []
     main_areas = []
-    main_ids = {idx for idx, _ in areas[:5]}
+    main_ids = {
+        idx for idx, _ in areas[:PRIMARY_CLUSTER_COMPONENT_LIMIT]
+    }
     for idx in main_ids:
         cx, cy = centroids[idx]
         main_centroids.append(np.array([cx, cy]))
