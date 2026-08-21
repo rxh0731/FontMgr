@@ -216,9 +216,7 @@ class LibraryParametersDialog(QDialog):
                 self.invalidated_count = self._service.update_output_spec(
                     dpi, width_px, height_px, width_mm, height_mm
                 )
-            current_metadata = self._service._data.setdefault("元数据", {})
-            current_metadata.pop("成品风格", None)
-            current_metadata.pop("透明背景", None)
+            self._service.remove_metadata_keys("成品风格", "透明背景")
             self._service.save()
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"参数保存失败：{exc}")

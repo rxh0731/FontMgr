@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,8 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 import config
+import services.adjustment_service as adjustment_service_module
+from data.library_database import LibraryDatabase
 from services.adjustment_service import AdjustmentService, CoordinationCancelled
 from services.batch_persistence import BatchPersistenceSession
 from services.glyph_service import GlyphService
@@ -1072,11 +1075,11 @@ class AdjustmentServiceTests(unittest.TestCase):
             finished_dir = Path(glyph.get_workflow_dirs()["成品"])
             cancel_requested = False
             commit_gate_calls = 0
-            real_snapshot = glyph.snapshot_state
+            real_snapshot = glyph.snapshot_variant_state
 
-            def snapshot_then_cancel() -> dict[str, object]:
+            def snapshot_then_cancel(variant_id: str) -> dict[str, object]:
                 nonlocal cancel_requested
-                snapshot = real_snapshot()
+                snapshot = real_snapshot(variant_id)
                 cancel_requested = True
                 return snapshot
 
@@ -1086,7 +1089,11 @@ class AdjustmentServiceTests(unittest.TestCase):
                 return not cancel_requested
 
             with (
-                patch.object(glyph, "snapshot_state", side_effect=snapshot_then_cancel),
+                patch.object(
+                    glyph,
+                    "snapshot_variant_state",
+                    side_effect=snapshot_then_cancel,
+                ),
                 self.assertRaisesRegex(CoordinationCancelled, "本批次未提交"),
             ):
                 service.save_coordinated_variants(
@@ -1113,7 +1120,7 @@ class AdjustmentServiceTests(unittest.TestCase):
             with (
                 patch.object(
                     glyph,
-                    "snapshot_state",
+                    "snapshot_variant_state",
                     side_effect=RuntimeError("模拟状态快照失败"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "模拟状态快照失败"),
@@ -1160,6 +1167,52 @@ class AdjustmentServiceTests(unittest.TestCase):
             finished_dir = Path(glyph.get_workflow_dirs()["成品"])
             self.assertEqual(len(list(finished_dir.glob("*.png"))), len(variants))
             self.assertFalse(list(finished_dir.glob(".fonteditor_coordination_*")))
+
+    def test_coordination_transaction_snapshot_scales_with_saved_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (90, 140))
+            for index in range(500):
+                glyph.add_original(
+                    chr(0x3400 + index),
+                    f"扩展-{index:04d}.png",
+                    f"扩展-{index:04d}.png",
+                    f"extra-{index:04d}",
+                )
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            captured: list[dict[str, object]] = []
+            real_snapshot = (
+                adjustment_service_module.recovery_variant_batch_state_snapshot
+            )
+
+            def capture_snapshot(snapshots):
+                payload = real_snapshot(snapshots)
+                captured.append(payload)
+                return payload
+
+            with patch.object(
+                adjustment_service_module,
+                "recovery_variant_batch_state_snapshot",
+                side_effect=capture_snapshot,
+            ):
+                result = service.save_coordinated_variants(
+                    variants,
+                    {},
+                    {"启用": False, "基准": baseline["墨色基准"]},
+                    baseline,
+                )
+
+            self.assertEqual(result, {"成功": 2, "失败": 0, "失败详情": []})
+            self.assertEqual(len(captured), 2)
+            self.assertTrue(
+                all(payload["快照类型"] == "字形批次" for payload in captured)
+            )
+            self.assertTrue(
+                all(len(payload["字形状态"]) == 2 for payload in captured)
+            )
+            batch_size = len(json.dumps(captured[0], ensure_ascii=False))
+            full_size = len(json.dumps(glyph.snapshot_state(), ensure_ascii=False))
+            self.assertLess(batch_size * 10, full_size)
 
     def test_empty_identity_fields_reject_batch_before_rendering(self) -> None:
         invalid_cases = (
@@ -1280,6 +1333,68 @@ class AdjustmentServiceTests(unittest.TestCase):
                     any(str(detail["归属字"]) in label for label in rendered_labels)
                 )
 
+    def test_unchanged_finished_output_is_reused_without_rendering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (100,))
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            ink_config = {"启用": False, "基准": baseline["墨色基准"]}
+            first = service.save_coordinated_variants(
+                variants,
+                {},
+                ink_config,
+                baseline,
+            )
+            finished = Path(glyph.get_workflow_dirs()["成品"]) / str(
+                variants[0]["成品文件"]
+            )
+            before = finished.read_bytes()
+
+            with patch.object(
+                service,
+                "_render_coordination_item",
+                wraps=service._render_coordination_item,
+            ) as render:
+                second = service.save_coordinated_variants(
+                    variants,
+                    {},
+                    ink_config,
+                    baseline,
+                )
+
+            self.assertEqual(first["成功"], 1)
+            self.assertEqual(second["成功"], 1)
+            render.assert_not_called()
+            self.assertEqual(finished.read_bytes(), before)
+
+    def test_coordination_rendering_uses_bounded_worker_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (90, 140))
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            barrier = threading.Barrier(2)
+            thread_names: set[str] = set()
+            original = service._render_coordination_item
+
+            def render(*args: object, **kwargs: object) -> dict[str, object]:
+                thread_names.add(threading.current_thread().name)
+                barrier.wait(timeout=5)
+                return original(*args, **kwargs)
+
+            with patch.object(service, "_render_coordination_item", side_effect=render):
+                result = service.save_coordinated_variants(
+                    variants,
+                    {},
+                    {"启用": False, "基准": baseline["墨色基准"]},
+                    baseline,
+                )
+
+            self.assertEqual(result["成功"], 2)
+            self.assertEqual(len(thread_names), 2)
+            self.assertTrue(
+                all(name.startswith("整体协调渲染") for name in thread_names)
+            )
+
     def test_progress_callback_failure_does_not_break_batch_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             glyph, variants = self._build_reviewed_library(Path(directory), (110,))
@@ -1320,8 +1435,7 @@ class AdjustmentServiceTests(unittest.TestCase):
 
             finished_dir = Path(glyph.get_workflow_dirs()["成品"])
             state_before = glyph.snapshot_state()
-            json_path = Path(glyph.ziku_dir) / f"{glyph.ziku_name}.json"
-            json_before = json_path.read_bytes()
+            database_before = LibraryDatabase.open(glyph.ziku_dir).load_data()
             existing_files = {
                 str(detail["变体ID"]): (
                     finished_dir / str(detail["成品文件"])
@@ -1342,7 +1456,10 @@ class AdjustmentServiceTests(unittest.TestCase):
                     )
 
             self.assertEqual(glyph.snapshot_state(), state_before)
-            self.assertEqual(json_path.read_bytes(), json_before)
+            self.assertEqual(
+                LibraryDatabase.open(glyph.ziku_dir).load_data(),
+                database_before,
+            )
             for variant_id, file_bytes in existing_files.items():
                 detail = glyph.get_variant(variant_id)
                 path = finished_dir / str(detail["成品文件"])

@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -37,7 +37,7 @@ from ui.pages.scripture_layout_page import (
     _PreviewCanvas,
     _TemplateSaveDialog,
 )
-from services.scripture_layout_service import GenerationProgress
+from services.scripture_layout_service import GenerationProgress, GenerationResult
 
 
 class _StackStub:
@@ -180,6 +180,42 @@ class ScriptureLayoutPageTests(unittest.TestCase):
                     "manageLayoutTemplateButton",
                 ):
                     self.assertIsNone(page.findChild(QWidget, removed_name))
+            finally:
+                page.shutdown()
+                page.deleteLater()
+
+    def test_generation_terminal_feedback_includes_elapsed_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template_path = str(Path(directory) / "排版模板.json")
+            with patch.object(config, "LAYOUT_TEMPLATE_FILE", template_path):
+                page = ScriptureLayoutPage()
+            try:
+                for result, dialog_name in (
+                    (GenerationResult((), False), "information"),
+                    (GenerationResult((), True), "information"),
+                    (object(), "warning"),
+                ):
+                    with self.subTest(result=result, dialog=dialog_name):
+                        worker = MagicMock()
+                        page._generation_worker = worker
+                        page._workers.add(worker)
+                        page._generation_started_at = 0.0
+                        with patch(
+                            f"ui.pages.scripture_layout_page.QMessageBox.{dialog_name}"
+                        ) as dialog:
+                            page._generation_finished(result, worker)
+                        self.assertIn("总耗时：", dialog.call_args.args[2])
+
+                worker = MagicMock()
+                page._generation_worker = worker
+                page._workers.add(worker)
+                page._generation_started_at = 0.0
+                with patch(
+                    "ui.pages.scripture_layout_page.QMessageBox.critical"
+                ) as critical:
+                    page._generation_failed("模拟生成异常", worker)
+                self.assertIn("模拟生成异常", critical.call_args.args[2])
+                self.assertIn("总耗时：", critical.call_args.args[2])
             finally:
                 page.shutdown()
                 page.deleteLater()

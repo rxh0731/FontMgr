@@ -947,6 +947,104 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 page._grid_host.rect().bottom() - margins.bottom(),
             )
 
+    def test_comparison_selection_loads_detail_in_background_and_keeps_latest_result(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            ordered_ids = [str(item["变体ID"]) for item in page._variants]
+            first_target, latest_target = ordered_ids[1:3]
+            started = threading.Event()
+            release = threading.Event()
+            original_load = page._adjustment_service.load_reviewed_source
+
+            def delayed_load(detail: dict[str, object]) -> object:
+                if str(detail.get("变体ID", "")) == first_target:
+                    started.set()
+                    release.wait(3.0)
+                return original_load(detail)
+
+            page._clear_detail_cache()
+            try:
+                with patch.object(
+                    page._adjustment_service,
+                    "load_reviewed_source",
+                    side_effect=delayed_load,
+                ):
+                    selected_at = time.perf_counter()
+                    page._select_variant_deferred(first_target)
+                    selection_elapsed = time.perf_counter() - selected_at
+                    self.assertEqual(page._selected_id, first_target)
+                    self.assertLess(selection_elapsed, 0.25)
+                    self.assertTrue(self._wait_until(started.is_set))
+                    self.assertNotEqual(page._loaded_detail_id, first_target)
+
+                    page._select_variant_deferred(latest_target)
+                    self.assertEqual(page._selected_id, latest_target)
+                    release.set()
+                    self.assertTrue(
+                        self._wait_until(
+                            lambda: page._loaded_detail_id == latest_target,
+                        )
+                    )
+                    self.assertEqual(page._loaded_detail_id, latest_target)
+            finally:
+                release.set()
+
+    def test_entering_detail_loads_selected_glyph_even_when_background_load_is_pending(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            target_id = str(page._variants[1]["变体ID"])
+            started = threading.Event()
+            release = threading.Event()
+            main_thread_id = threading.get_ident()
+            original_load = page._adjustment_service.load_reviewed_source
+
+            def delay_background_only(detail: dict[str, object]) -> object:
+                if threading.get_ident() != main_thread_id:
+                    started.set()
+                    release.wait(3.0)
+                return original_load(detail)
+
+            page._clear_detail_cache()
+            try:
+                with patch.object(
+                    page._adjustment_service,
+                    "load_reviewed_source",
+                    side_effect=delay_background_only,
+                ):
+                    page._select_variant_deferred(target_id)
+                    self.assertTrue(self._wait_until(started.is_set))
+                    page._enter_detail(target_id)
+                    self.assertEqual(page._loaded_detail_id, target_id)
+                    self.assertTrue(page._detail_canvas.has_image)
+                    self.assertIs(page._view_stack.currentWidget(), page._detail_view)
+            finally:
+                release.set()
+                self._wait_until(lambda: page._detail_worker is None)
+
+    def test_detail_source_lru_avoids_reloading_recent_glyph(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            ordered_ids = [str(item["变体ID"]) for item in page._variants]
+            first_target, second_target = ordered_ids[1:3]
+            main_thread_id = threading.get_ident()
+            loaded_on_main_thread: list[str] = []
+            original_load = page._adjustment_service.load_reviewed_source
+
+            def track_detail_load(detail: dict[str, object]) -> object:
+                if threading.get_ident() == main_thread_id:
+                    loaded_on_main_thread.append(str(detail.get("变体ID", "")))
+                return original_load(detail)
+
+            page._clear_detail_cache()
+            with patch.object(
+                page._adjustment_service,
+                "load_reviewed_source",
+                side_effect=track_detail_load,
+            ):
+                page._select_variant(first_target)
+                page._select_variant(second_target)
+                self.assertEqual(loaded_on_main_thread, [first_target, second_target])
+                page._select_variant(first_target)
+                self.assertEqual(loaded_on_main_thread, [first_target, second_target])
+                self.assertEqual(page._loaded_detail_id, first_target)
+
     def test_double_click_signal_enters_single_glyph_detail_mode(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1600, 900)
@@ -1165,14 +1263,22 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
 
             second_filename = str(page._variant_by_id[pending_id]["原始文件"])
             page._search_edit.setText(second_filename)
+            page._search_edit.setFocus()
             QTest.keyClick(page._search_edit, Qt.Key.Key_Return)
             self.app.processEvents()
             self.assertEqual(page._selected_id, pending_id)
             self.assertEqual(len(page._variants), 1)
+            self.assertIs(page._view_stack.currentWidget(), page._comparison_view)
 
             page._search_edit.clear()
             self.app.processEvents()
             self.assertGreater(len(page._variants), 1)
+
+            tree.setFocus()
+            QTest.keyClick(tree, Qt.Key.Key_Return)
+            self.app.processEvents()
+            self.assertIs(page._view_stack.currentWidget(), page._detail_view)
+            page._leave_detail()
 
             tree.itemDoubleClicked.emit(page._list_items_by_id[pending_id], 0)
             self.app.processEvents()
@@ -1613,6 +1719,97 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             )
             self.assertTrue(finished_path.is_file())
 
+    def test_save_button_uses_background_task_without_full_library_reload(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1600, 900)
+            page._filter_combo.setCurrentText("全部（本阶段）")
+            page_ids = [
+                str(detail["变体ID"])
+                for detail in page._page_variants()
+            ]
+
+            with (
+                patch.object(page, "_reload_variants", wraps=page._reload_variants) as reload_all,
+                patch.object(page, "_clear_preview_cache", wraps=page._clear_preview_cache) as clear_all,
+                patch.object(QMessageBox, "information") as information,
+            ):
+                page._save_action()
+                self.assertTrue(page._coordination_busy)
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: not page._coordination_busy,
+                        timeout=8.0,
+                    )
+                )
+
+            reload_all.assert_not_called()
+            clear_all.assert_not_called()
+            information.assert_called_once()
+            for variant_id in page_ids:
+                self.assertEqual(
+                    page._glyph.get_variant(variant_id)["状态"],
+                    config.STATUS_FINISHED,
+                )
+            self.assertEqual(page._page_index, 1)
+
+    def test_rebuilding_comparison_page_never_detaches_cards_as_windows(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1600, 900)
+            old_cards = list(page._cards.values())
+            self.assertTrue(old_cards)
+            self.assertTrue(all(not card.isWindow() for card in old_cards))
+
+            page._render_page()
+
+            self.assertTrue(all(not card.isVisible() for card in old_cards))
+            self.assertTrue(all(not card.isWindow() for card in old_cards))
+            top_level_widgets = set(QApplication.topLevelWidgets())
+            self.assertTrue(all(card not in top_level_widgets for card in old_cards))
+            self.assertTrue(all(not card.isWindow() for card in page._cards.values()))
+
+    def test_save_and_next_on_last_result_shows_end_notice(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1600, 900)
+            last_id = str(page._variants[-1]["变体ID"])
+            page._select_variant(last_id)
+            page._enter_detail(last_id)
+            self.app.processEvents()
+
+            with patch.object(QMessageBox, "information") as information:
+                page._save_and_next_async()
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: not page._coordination_busy,
+                        timeout=8.0,
+                    )
+                )
+
+            information.assert_called_once()
+            self.assertEqual(information.call_args.args[1], "整体协调")
+            self.assertIn("最后一条", information.call_args.args[2])
+            self.assertEqual(page._selected_id, last_id)
+
+    def test_saving_last_comparison_page_reports_last_page(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1600, 900)
+            page._change_page(1)
+            self.assertEqual(page._page_index, 1)
+
+            with patch.object(QMessageBox, "information") as information:
+                page._save_action()
+                self.assertTrue(
+                    self._wait_until(
+                        lambda: not page._coordination_busy,
+                        timeout=8.0,
+                    )
+                )
+
+            information.assert_called_once()
+            self.assertEqual(information.call_args.args[1], "保存本页")
+            self.assertIn("最后一页", information.call_args.args[2])
+            self.assertNotIn("总耗时：", information.call_args.args[2])
+            self.assertEqual(page._page_index, 1)
+
     def test_complete_coordination_runs_in_background_and_restores_after_failure(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
             self._show_at(page, 1100, 720)
@@ -1734,11 +1931,13 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 page._glyph.get_variant(selected_id)["整体协调参数"]["整体变换"]["移动X"],
                 7.0,
             )
-            information.assert_called_once_with(
-                page,
-                "完成整体协调",
-                "全库整体协调结果已生成。",
+            information.assert_called_once()
+            self.assertEqual(
+                information.call_args.args[:2],
+                (page, "完成整体协调"),
             )
+            self.assertIn("全库整体协调结果已生成。", information.call_args.args[2])
+            self.assertIn("总耗时：", information.call_args.args[2])
 
     def test_coordination_progress_resets_baseline_range_and_never_regresses(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
@@ -1807,6 +2006,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertIn("仍有 1 个待核对", page._task_detail_label.text())
             self.assertIn("待协调 1", page._summary_label.text())
             self.assertIn("墨色待确认 1 个", warning.call_args.args[2])
+            self.assertIn("总耗时：", warning.call_args.args[2])
             information.assert_not_called()
 
     def test_complete_coordination_only_submits_pending_admitted_records(self) -> None:
@@ -1896,6 +2096,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertTrue(all(action.isEnabled() for action in page._shortcut_actions))
             self.assertIn("页面重载失败", critical.call_args.args[2])
             self.assertIn("返回首页", critical.call_args.args[2])
+            self.assertIn("总耗时：", critical.call_args.args[2])
 
     def test_incomplete_rollback_is_reported_without_false_success_claim(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
@@ -1914,6 +2115,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertIn("回滚未完全完成", message)
             self.assertIn("可能存在未恢复文件", message)
             self.assertNotIn("未保留部分结果", message)
+            self.assertIn("总耗时：", message)
 
     def test_post_commit_snapshot_failure_emits_terminal_result_and_unlocks_page(
         self,
@@ -2111,6 +2313,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertTrue(all(page._glyph.get_variant(item)["状态"] == config.STATUS_REVIEWED for item in variant_ids))
             information.assert_called_once()
             self.assertIn("本批次未提交", information.call_args.args[2])
+            self.assertIn("总耗时：", information.call_args.args[2])
 
     def test_stop_confirmation_cannot_overwrite_a_task_that_finished_in_dialog(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):

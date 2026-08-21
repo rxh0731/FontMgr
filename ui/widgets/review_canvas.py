@@ -2516,21 +2516,40 @@ class ReviewCanvas(QWidget):
         height = image.height()
         sample_limit = 65_536
         step = max(1, math.ceil(math.sqrt(width * height / sample_limit)))
-        counts: dict[tuple[int, int, int], int] = {}
-        foreground_counts: dict[tuple[int, int, int], int] = {}
-        for y in range(0, height, step):
-            for x in range(0, width, step):
-                color = image.pixelColor(x, y)
-                if color.alpha() < 32:
-                    continue
-                key = (color.red(), color.green(), color.blue())
-                counts[key] = counts.get(key, 0) + 1
-                if math.dist(key, (255, 255, 255)) >= 24.0:
-                    foreground_counts[key] = foreground_counts.get(key, 0) + 1
-        if not counts:
+        converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        stride = converted.bytesPerLine()
+        pixels = np.frombuffer(
+            converted.constBits(),
+            dtype=np.uint8,
+            count=stride * height,
+        ).reshape(height, stride)[:, : width * 4].reshape(height, width, 4)
+        sampled = pixels[::step, ::step].reshape(-1, 4)
+        visible = sampled[sampled[:, 3] >= 32, :3]
+        if visible.size == 0:
             return QColor(0, 0, 0, 255)
-        candidates = foreground_counts or counts
-        red, green, blue = max(candidates.items(), key=lambda item: item[1])[0]
+
+        distance = visible.astype(np.int32) - 255
+        foreground = visible[
+            np.sum(distance * distance, axis=1) >= 24 * 24
+        ]
+        candidates = foreground if foreground.size else visible
+        packed = (
+            candidates[:, 0].astype(np.uint32) << 16
+            | candidates[:, 1].astype(np.uint32) << 8
+            | candidates[:, 2].astype(np.uint32)
+        )
+        colors, first_indices, counts = np.unique(
+            packed,
+            return_index=True,
+            return_counts=True,
+        )
+        highest_count = int(counts.max())
+        tied = np.flatnonzero(counts == highest_count)
+        selected = int(tied[np.argmin(first_indices[tied])])
+        color = int(colors[selected])
+        red = (color >> 16) & 0xFF
+        green = (color >> 8) & 0xFF
+        blue = color & 0xFF
         return QColor(red, green, blue, 255)
 
     @staticmethod

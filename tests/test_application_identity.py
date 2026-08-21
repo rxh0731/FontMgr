@@ -27,9 +27,17 @@ class ApplicationIdentityTests(unittest.TestCase):
 
     def test_window_icon_asset_can_be_loaded(self) -> None:
         self.assertTrue(os.path.isfile(config.WINDOW_ICON_FILE))
+        self.assertTrue(os.path.isfile(config.ICON_FILE))
         icon = load_application_icon()
         self.assertFalse(icon.isNull())
-        self.assertFalse(icon.pixmap(32, 32).isNull())
+        for size in (16, 24, 32, 48, 64, 128, 256):
+            self.assertFalse(icon.pixmap(size, size).isNull())
+
+    def test_windows_app_id_uses_fontmgr_product_identity(self) -> None:
+        self.assertEqual(
+            config.WINDOWS_APP_USER_MODEL_ID,
+            "RuanXiaohua.FontMgr",
+        )
 
     def test_windows_app_id_is_set_explicitly(self) -> None:
         setter = MagicMock(return_value=0)

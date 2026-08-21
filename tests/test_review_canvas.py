@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1055,6 +1056,20 @@ class ReviewCanvasTests(unittest.TestCase):
 
         self.assertEqual(self.canvas.brush_color(), QColor(36, 74, 108, 255))
         self.assertEqual(self.canvas.sample_ink_color(), QColor(36, 74, 108, 255))
+
+    def test_dominant_ink_color_sampling_stays_fast_for_working_image(self) -> None:
+        image = QImage(250, 250, QImage.Format.Format_ARGB32)
+        image.fill(QColor(42, 76, 108, 220))
+        self.canvas._dominant_ink_color(image)
+
+        durations: list[float] = []
+        for _ in range(3):
+            started_at = time.perf_counter()
+            color = self.canvas._dominant_ink_color(image)
+            durations.append(time.perf_counter() - started_at)
+
+        self.assertEqual(color, QColor(42, 76, 108, 255))
+        self.assertLess(min(durations), 0.05)
 
     def test_opaque_white_background_is_not_sampled_as_ink(self) -> None:
         image = QImage(30, 30, QImage.Format.Format_ARGB32)

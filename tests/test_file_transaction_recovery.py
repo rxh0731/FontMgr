@@ -22,7 +22,9 @@ from services.file_transaction_recovery import (
     ensure_file_transactions_ready,
     recover_file_transactions,
     recovery_full_state_snapshot,
+    recovery_variant_batch_state_snapshot,
 )
+import services.file_transaction_recovery as transaction_module
 from utils.file_utils import atomic_write_json
 
 
@@ -54,6 +56,29 @@ class FileTransactionRecoveryTests(unittest.TestCase):
             "整体协调": copy.deepcopy(self.old_state["整体协调"]),
         }
         atomic_write_json(self.data, str(self.json_path))
+
+    def test_live_transaction_hashes_old_target_only_once(self) -> None:
+        target = self.stage / "字.png"
+        temporary = self.stage / ".new.png"
+        target.write_bytes(b"old-content")
+        temporary.write_bytes(b"new-content")
+        new_md5 = hashlib.md5(b"new-content").hexdigest()
+
+        with patch.object(
+            transaction_module,
+            "_compute_md5",
+            wraps=transaction_module._compute_md5,
+        ) as digest:
+            transaction = FileTransaction.begin(
+                str(self.root),
+                [FileChange(str(target), str(temporary), new_md5)],
+                self.old_state,
+            )
+            transaction.backup_targets()
+            transaction.mark_rollforward(self.new_state)
+
+        self.assertEqual(digest.call_count, 1)
+        transaction.rollback()
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
@@ -183,6 +208,44 @@ class FileTransactionRecoveryTests(unittest.TestCase):
         self.assertEqual(self.data, new_full_state)
         with self.json_path.open("r", encoding="utf-8") as handle:
             self.assertEqual(json.load(handle), new_full_state)
+
+    def test_variant_batch_state_recovers_only_requested_variants(self) -> None:
+        change, target, _temporary = self._change("字.png", b"old", b"new")
+        self.data["变体详情"]["variant-2"] = {"状态": "保持不变"}
+        old_snapshots = [
+            {
+                **copy.deepcopy(self.old_state),
+                "变体ID": "variant-1",
+            }
+        ]
+        new_snapshots = [
+            {
+                **copy.deepcopy(self.new_state),
+                "变体ID": "variant-1",
+            }
+        ]
+        transaction = FileTransaction.begin(
+            str(self.root),
+            [change],
+            recovery_variant_batch_state_snapshot(old_snapshots),
+        )
+        transaction.backup_targets()
+        transaction.mark_rollforward(
+            recovery_variant_batch_state_snapshot(new_snapshots)
+        )
+        transaction.install_new_files()
+
+        self.assertTrue(self._recover())
+
+        self.assertEqual(target.read_bytes(), b"new")
+        self.assertEqual(
+            self.data["变体详情"]["variant-1"],
+            self.new_state["变体详情"],
+        )
+        self.assertEqual(
+            self.data["变体详情"]["variant-2"],
+            {"状态": "保持不变"},
+        )
 
     def test_mismatched_new_file_md5_rolls_back_old_file_and_state(self) -> None:
         change, target, _temporary = self._change("字.png", b"old", b"new")

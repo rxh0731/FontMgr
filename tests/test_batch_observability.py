@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from utils.batch_observability import BatchTiming, ProgressThrottle
+from utils.batch_observability import (
+    BatchTiming,
+    ProgressThrottle,
+    format_elapsed_time,
+)
 
 
 class _FakeClock:
@@ -94,6 +98,18 @@ class ProgressThrottleTests(unittest.TestCase):
 
 
 class BatchTimingTests(unittest.TestCase):
+    def test_formats_elapsed_time_for_user_feedback(self) -> None:
+        self.assertEqual(format_elapsed_time(0.346), "0.35 秒")
+        self.assertEqual(format_elapsed_time(83.45), "1 分 23.45 秒")
+        self.assertEqual(
+            format_elapsed_time(3723.45),
+            "1 小时 02 分 03.45 秒",
+        )
+        self.assertEqual(format_elapsed_time(3599.999), "1 小时 00 分 00.00 秒")
+        for invalid in (-1.0, float("inf"), float("nan")):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(format_elapsed_time(invalid), "0.00 秒")
+
     def test_accumulates_stages_and_formats_stable_chinese_summary(self) -> None:
         clock = _FakeClock()
         timing = BatchTiming(clock=clock)

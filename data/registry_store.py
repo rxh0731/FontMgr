@@ -3,6 +3,7 @@
 from typing import Any
 
 import config
+from data.application_database import ApplicationDatabase, resolve_application_database_path
 from utils.file_utils import safe_read_json
 
 
@@ -230,10 +231,19 @@ _BUILTIN_REGISTRY: dict[str, Any] = {
 
 
 def load_registry() -> dict[str, Any]:
-    """加载算法注册表，损坏时回退到内置注册表。"""
-    data = safe_read_json(config.REGISTRY_FILE)
+    """从程序数据库加载算法注册表，首次使用时导入原配置。"""
+    database = ApplicationDatabase(
+        resolve_application_database_path(config.REGISTRY_FILE)
+    )
+    data = database.read_document("算法注册表")
+    imported = data is None
+    if imported:
+        data = safe_read_json(config.REGISTRY_FILE)
     if isinstance(data, dict) and data.get("版本") == 3 and "分组" in data:
+        if imported:
+            database.write_document("算法注册表", data, version=3)
         return data
+    database.write_document("算法注册表", _BUILTIN_REGISTRY, version=3)
     return _BUILTIN_REGISTRY
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -121,6 +122,7 @@ from services.scripture_text_service import (
     scripture_document_filter,
 )
 from ui.workers import FunctionWorker
+from utils.batch_observability import format_elapsed_time
 from utils.file_utils import natural_key
 
 
@@ -998,6 +1000,7 @@ class ScriptureLayoutPage(QWidget):
         self._last_scripture_directory = config.SCRIPT_DIR
         self._generation_cancel: threading.Event | None = None
         self._generation_worker: FunctionWorker | None = None
+        self._generation_started_at: float | None = None
         self._preview_zoom = 0.0
         self._preview_image = QImage()
         self._preview_document_size = QSize()
@@ -3223,6 +3226,7 @@ class ScriptureLayoutPage(QWidget):
 
         worker = FunctionWorker(generate, with_progress=True)
         self._generation_worker = worker
+        self._generation_started_at = time.perf_counter()
         self._workers.add(worker)
         worker.signals.progress.connect(self._generation_progress)
         worker.signals.finished.connect(
@@ -3249,15 +3253,26 @@ class ScriptureLayoutPage(QWidget):
         self._progress_bar.setFormat(f"{value.message} · %p%")
 
     def _generation_finished(self, result: object, worker: FunctionWorker) -> None:
+        elapsed_text = self._generation_elapsed_text()
         self._finish_worker(worker)
         if not isinstance(result, GenerationResult):
-            QMessageBox.warning(self, "生成失败", "排版任务返回了无法识别的结果。")
+            QMessageBox.warning(
+                self,
+                "生成失败",
+                f"排版任务返回了无法识别的结果。\n\n{elapsed_text}",
+            )
             return
         if result.stopped:
             self._progress_bar.setRange(0, 1)
             self._progress_bar.setValue(0)
             self._progress_bar.setFormat("任务已停止；已完整生成的版面予以保留")
             self.status_message.emit("通用经文排版已停止")
+            QMessageBox.information(
+                self,
+                "通用经文排版已停止",
+                "生成任务已停止，已完整生成的版面予以保留。\n\n"
+                f"{elapsed_text}",
+            )
             return
         completed = sum(not board.skipped for board in result.boards)
         skipped = sum(board.skipped for board in result.boards)
@@ -3270,6 +3285,7 @@ class ScriptureLayoutPage(QWidget):
         detail = f"已生成 {completed} 个分层文件，跳过 {skipped} 个已有文件。"
         if missing:
             detail += f"\n\n其中 {missing} 处缺字单元格已按确认保留空白。"
+        detail += f"\n\n{elapsed_text}"
         QMessageBox.information(
             self,
             "通用经文排版完成",
@@ -3277,17 +3293,30 @@ class ScriptureLayoutPage(QWidget):
         )
 
     def _generation_failed(self, message: str, worker: FunctionWorker) -> None:
+        elapsed_text = self._generation_elapsed_text()
         self._finish_worker(worker)
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(0)
         self._progress_bar.setFormat("生成失败")
-        QMessageBox.critical(self, "通用经文排版失败", message)
+        QMessageBox.critical(
+            self,
+            "通用经文排版失败",
+            f"{message}\n\n{elapsed_text}",
+        )
+
+    def _generation_elapsed_text(self) -> str:
+        if self._generation_started_at is None:
+            elapsed = 0.0
+        else:
+            elapsed = max(0.0, time.perf_counter() - self._generation_started_at)
+        return f"总耗时：{format_elapsed_time(elapsed)}"
 
     def _finish_worker(self, worker: FunctionWorker) -> None:
         self._workers.discard(worker)
         if self._generation_worker is worker:
             self._generation_worker = None
             self._generation_cancel = None
+            self._generation_started_at = None
         self._set_running(False)
 
     def _stop_generation(self) -> None:

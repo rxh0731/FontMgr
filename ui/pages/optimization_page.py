@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import OrderedDict
 from threading import Event
 from typing import Any, Callable
@@ -60,6 +61,7 @@ from services.background_model_service import (
     build_candidate_cache_key,
 )
 from services.glyph_service import GlyphService
+from services.library_summary_service import summarize_glyph_service
 from services.file_transaction_recovery import FileTransactionCommitUncertainError
 from services.optimization_service import (
     CANDIDATE_TYPE_ALPHA_DENOISED,
@@ -86,7 +88,7 @@ from ui.widgets.two_line_status_delegate import (
     TwoLineStatusDelegate,
     set_two_line_status,
 )
-from utils.batch_observability import BatchTiming, ProgressThrottle
+from utils.batch_observability import BatchTiming, ProgressThrottle, format_elapsed_time
 from utils.file_utils import pinyin_natural_key
 
 
@@ -190,7 +192,7 @@ class _OptimizationBatchWorker(QRunnable):
                     BatchJournalUncertainError,
                     FileTransactionCommitUncertainError,
                 ):
-                    # 无法确认日志提交时必须终止整批，避免后续检查点或
+                    # 无法确认数据库提交时必须终止整批，避免后续检查点或
                     # 同字覆盖破坏仍待启动恢复裁决的图片与状态。
                     raise
                 except Exception as exc:
@@ -281,6 +283,7 @@ class _OptimizationBatchWorker(QRunnable):
             "失败详情": failures,
             "未处理": unprocessed_count,
             "待处理总数": total,
+            "总耗时秒": timing.finish(),
         }
 
     @staticmethod
@@ -382,6 +385,7 @@ class OptimizationPage(QWidget):
         self._thread_pool = QThreadPool.globalInstance()
         self._workers: set[FunctionWorker] = set()
         self._bulk_worker: _OptimizationBatchWorker | None = None
+        self._bulk_started_at: float | None = None
         self._build_ui()
         self._populate_engines()
         self._set_workspace_enabled(False)
@@ -1183,6 +1187,7 @@ class OptimizationPage(QWidget):
             skipped_count,
         )
         self._bulk_worker = worker
+        self._bulk_started_at = time.perf_counter()
         self._request_id += 1
         self._busy = True
         worker.signals.progress.connect(self._bulk_progress_changed)
@@ -1203,7 +1208,9 @@ class OptimizationPage(QWidget):
         try:
             self._thread_pool.start(worker)
         except Exception as exc:
+            elapsed = self._bulk_elapsed_seconds()
             self._bulk_worker = None
+            self._bulk_started_at = None
             self._busy = False
             self._bulk_progress.setVisible(False)
             self._set_bulk_stop_state(running=False)
@@ -1211,7 +1218,8 @@ class OptimizationPage(QWidget):
             QMessageBox.critical(
                 self,
                 "整库自动优化失败",
-                f"无法启动整库自动优化任务：{exc}",
+                f"无法启动整库自动优化任务：{exc}\n\n"
+                f"总耗时：{format_elapsed_time(elapsed)}",
             )
 
     def _confirm_bulk_optimization(self, pending_count: int, skipped_count: int) -> bool:
@@ -1298,13 +1306,15 @@ class OptimizationPage(QWidget):
     ) -> None:
         if worker is not self._bulk_worker:
             return
+        data = result if isinstance(result, dict) else {}
+        elapsed = self._bulk_elapsed_seconds(data)
         self._bulk_worker = None
+        self._bulk_started_at = None
         self._busy = False
         self._bulk_progress.setVisible(False)
         self._set_bulk_stop_state(running=False)
         # 先恢复导航，再解析结果和刷新列表；任何后续异常都不能遗留锁定。
         self._set_workspace_enabled(bool(self._candidates))
-        data = result if isinstance(result, dict) else {}
         stopped = bool(data.get("已停止", False))
         succeeded = int(data.get("成功", 0) or 0)
         skipped = int(data.get("跳过", 0) or 0)
@@ -1346,6 +1356,7 @@ class OptimizationPage(QWidget):
             f"成功 {succeeded}（已保存），其中结构需人工核对 {review_required}；"
             f"失败 {failed}，未处理 {unprocessed}，跳过 {skipped}。"
         )
+        elapsed_text = f"总耗时：{format_elapsed_time(elapsed)}"
         result_state = "已停止" if stopped else "完成"
         self._message_label.setText(f"整库自动优化{result_state}：{summary}")
         self.status_message.emit(f"整库自动优化{result_state}：{summary}")
@@ -1356,7 +1367,8 @@ class OptimizationPage(QWidget):
                 self,
                 "自动优化页面刷新失败",
                 f"整库自动优化已经结束，但页面刷新失败：{refresh_error}。\n"
-                "返回首页后重新进入即可读取最新结果。",
+                "返回首页后重新进入即可读取最新结果。\n\n"
+                f"总耗时：{format_elapsed_time(elapsed)}",
             )
         elif failed:
             details = data.get("失败详情", [])
@@ -1371,7 +1383,9 @@ class OptimizationPage(QWidget):
             QMessageBox.warning(
                 self,
                 f"自动优化{result_state}",
-                summary + (f"\n\n失败详情：\n{detail_text}" if detail_text else ""),
+                summary
+                + (f"\n\n失败详情：\n{detail_text}" if detail_text else "")
+                + f"\n\n{elapsed_text}",
             )
         elif review_required:
             details = data.get("需人工核对详情", [])
@@ -1388,10 +1402,15 @@ class OptimizationPage(QWidget):
                 f"自动优化{result_state}",
                 summary
                 + "\n\n这些结果已正常进入待审核阶段，请逐字核对笔画结构。"
-                + (f"\n\n核对详情：\n{detail_text}" if detail_text else ""),
+                + (f"\n\n核对详情：\n{detail_text}" if detail_text else "")
+                + f"\n\n{elapsed_text}",
             )
         else:
-            QMessageBox.information(self, f"自动优化{result_state}", summary)
+            QMessageBox.information(
+                self,
+                f"自动优化{result_state}",
+                f"{summary}\n\n{elapsed_text}",
+            )
 
     def _bulk_failed(
         self,
@@ -1400,7 +1419,9 @@ class OptimizationPage(QWidget):
     ) -> None:
         if worker is not self._bulk_worker:
             return
+        elapsed = self._bulk_elapsed_seconds()
         self._bulk_worker = None
+        self._bulk_started_at = None
         self._busy = False
         self._bulk_progress.setVisible(False)
         self._set_bulk_stop_state(running=False)
@@ -1408,7 +1429,23 @@ class OptimizationPage(QWidget):
         self._message_label.setText("整库自动优化异常中止。")
         if self._glyph_service is not None:
             self.summary_changed.emit(self._glyph_service)
-        QMessageBox.critical(self, "整库自动优化失败", message)
+        QMessageBox.critical(
+            self,
+            "整库自动优化失败",
+            f"{message}\n\n总耗时：{format_elapsed_time(elapsed)}",
+        )
+
+    def _bulk_elapsed_seconds(self, result: dict[str, Any] | None = None) -> float:
+        if result is not None:
+            try:
+                elapsed = float(result.get("总耗时秒", -1.0))
+            except (TypeError, ValueError):
+                elapsed = -1.0
+            if elapsed >= 0.0:
+                return elapsed
+        if self._bulk_started_at is None:
+            return 0.0
+        return max(0.0, time.perf_counter() - self._bulk_started_at)
 
     def open_library(self, library_path: str) -> None:
         """打开字库目录并选择首个字形。"""
@@ -1419,6 +1456,7 @@ class OptimizationPage(QWidget):
         """使用已有字形服务打开自动优化页面。"""
         self._request_id += 1
         self._glyph_service = glyph_service
+        summarize_glyph_service(glyph_service)
         self._service = OptimizationService(glyph_service)
         self._library_identity = os.path.normcase(os.path.abspath(glyph_service.ziku_dir))
         self._reoptimization_key = ""
@@ -2130,6 +2168,27 @@ class OptimizationPage(QWidget):
             self._message_label.setText(
                 "已保存为“自动优化稿”，该字形已提交手工审核。"
             )
+        if next_pending_key is None:
+            self._show_optimization_end_notice()
+
+    def _show_optimization_end_notice(self) -> None:
+        """说明当前搜索和筛选范围已经没有后继待优化字形。"""
+
+        pending_count = sum(
+            self._item_phase_status(item) == STAGE_PENDING_OPTIMIZATION
+            for item in self._visible_items
+        )
+        if pending_count:
+            detail = (
+                "当前字形已保存，已到当前搜索和筛选范围的最后一条。\n"
+                f"该范围内仍有 {pending_count} 个待优化字形，可从左侧列表重新选择。"
+            )
+        else:
+            detail = (
+                "当前字形已保存，已到当前搜索和筛选范围的最后一条。\n"
+                "该范围内的待优化字形已全部处理完成。"
+            )
+        QMessageBox.information(self, "自动优化", detail)
 
     def _task_failed(self, title: str, message: str) -> None:
         summary = message.strip() or "任务执行失败。"

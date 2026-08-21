@@ -6,7 +6,7 @@ import os
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from PIL import Image
@@ -49,7 +49,7 @@ import config
 from services.glyph_service import GlyphService
 from services.import_service import ImportService
 from services.traditional_chinese_service import identify_character
-from utils.batch_observability import ProgressThrottle
+from utils.batch_observability import ProgressThrottle, format_elapsed_time
 from utils.file_utils import (
     compute_file_md5,
     is_real_directory,
@@ -179,6 +179,7 @@ class ImportRunContext:
     target_directory: str
     cancel_event: threading.Event
     directory_created: threading.Event
+    started_at: float = field(default_factory=time.perf_counter)
 
 
 class TaskSignals(QObject):
@@ -1257,6 +1258,8 @@ class ImportPage(QWidget):
         if data.get("已取消"):
             action = "导入已取消，已完成的数据已安全保存"
             message = f"{action}。\n\n成功：{data.get('成功', 0)}\n跳过：{data.get('跳过', 0)}\n失败：{data.get('失败', 0)}"
+        elapsed = max(0.0, time.perf_counter() - context.started_at) if context else 0.0
+        message += f"\n\n总耗时：{format_elapsed_time(elapsed)}"
         QMessageBox.information(self, "导入完成", message)
         path = str(data.get("字库路径", ""))
         self.import_completed.emit(name, path, data)
@@ -1274,10 +1277,11 @@ class ImportPage(QWidget):
         return_home = self._return_home_after_import
         if context is not None:
             self._cleanup_failed_import_directory(context)
+        elapsed = max(0.0, time.perf_counter() - context.started_at) if context else 0.0
         self._active_import_token = None
         self._active_task_kind = None
         self._return_home_after_import = False
-        self._task_failed(message)
+        self._task_failed(f"{message}\n\n总耗时：{format_elapsed_time(elapsed)}")
         if return_home:
             self.home_requested.emit()
 

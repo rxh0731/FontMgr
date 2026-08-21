@@ -8,6 +8,21 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 
+def format_elapsed_time(seconds: float) -> str:
+    """将耗时格式化为适合用户反馈的简体中文文本。"""
+    elapsed = float(seconds)
+    if not math.isfinite(elapsed) or elapsed < 0.0:
+        elapsed = 0.0
+    elapsed = round(elapsed, 2)
+    hours, remainder = divmod(elapsed, 3600.0)
+    minutes, remaining_seconds = divmod(remainder, 60.0)
+    if hours >= 1.0:
+        return f"{int(hours)} 小时 {int(minutes):02d} 分 {remaining_seconds:05.2f} 秒"
+    if minutes >= 1.0:
+        return f"{int(minutes)} 分 {remaining_seconds:05.2f} 秒"
+    return f"{remaining_seconds:.2f} 秒"
+
+
 class ProgressThrottle:
     """限制高频进度通知，同时允许关键状态立即送达。"""
 

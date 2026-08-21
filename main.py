@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 import config
 from data.log_manager import LogManager
+from data.storage_initializer import initialize_application_storage
 from ui.main_window import MainWindow
 from ui.theme import apply_theme
 from utils.application_identity import (
@@ -39,6 +40,7 @@ def main() -> int:
     setup_crash_handler(config.LOG_FILE)
     log_manager.write("正在启动 PySide6 应用")
 
+    initialize_application_storage()
     app = create_application()
     window = MainWindow()
     window.showMaximized()

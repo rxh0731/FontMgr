@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +10,10 @@ from typing import Mapping
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from core.scripture_layout import LayoutParameters
+from data.application_database import (
+    ApplicationDatabase,
+    resolve_application_database_path,
+)
 from utils.file_utils import atomic_write_json, safe_read_json, safe_read_json_with_source
 
 
@@ -78,7 +81,9 @@ class LayoutTemplateStore:
     def __init__(self, file_path: str, *, legacy_file_path: str = "") -> None:
         self.file_path = file_path
         self.legacy_file_path = legacy_file_path
-        self._migrate_legacy_configuration()
+        self._database = ApplicationDatabase(
+            resolve_application_database_path(file_path)
+        )
         self._load_source = ""
         self._needs_repair = False
         self._user_templates = self._load()
@@ -86,32 +91,16 @@ class LayoutTemplateStore:
             self._repair_configuration()
 
     def _migrate_legacy_configuration(self) -> None:
-        if not self.legacy_file_path:
-            return
-        target = Path(self.file_path)
-        legacy = Path(self.legacy_file_path)
-        if target.exists() or not legacy.is_file() or legacy.is_symlink():
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.replace(legacy, target)
-        except OSError:
-            shutil.copy2(legacy, target)
-
-        legacy_backup = Path(f"{legacy}.bak")
-        target_backup = Path(f"{target}.bak")
-        if (
-            not target_backup.exists()
-            and legacy_backup.is_file()
-            and not legacy_backup.is_symlink()
-        ):
-            try:
-                os.replace(legacy_backup, target_backup)
-            except OSError:
-                shutil.copy2(legacy_backup, target_backup)
+        """旧入口保留为空操作；配置文件只读导入，不再移动。"""
 
     def _load(self) -> dict[str, LayoutTemplate]:
-        raw, source = safe_read_json_with_source(self.file_path, {})
+        raw = self._database.read_document("通用经文排版模板")
+        source = "数据库"
+        if raw is None:
+            raw, source = safe_read_json_with_source(self.file_path, {})
+            if not raw and self.legacy_file_path:
+                raw, source = safe_read_json_with_source(self.legacy_file_path, {})
+            self._needs_repair = True
         self._load_source = source
         if not raw:
             self._needs_repair = True
@@ -130,7 +119,7 @@ class LayoutTemplateStore:
         if version != TEMPLATE_DATA_VERSION:
             raise RuntimeError("排版模板数据版本不受支持。")
         result = self._load_current_templates(templates)
-        if os.path.abspath(source) != os.path.abspath(self.file_path):
+        if source != "数据库":
             self._needs_repair = True
         return result
 
@@ -410,12 +399,7 @@ class LayoutTemplateStore:
         return self.save(name, imported.parameters, imported.description)
 
     def _repair_configuration(self) -> None:
-        main_path = os.path.abspath(self.file_path)
-        source_path = os.path.abspath(self._load_source) if self._load_source else ""
-        if os.path.isfile(main_path) and source_path != main_path:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            archive_path = f"{main_path}.损坏-{stamp}"
-            shutil.copy2(main_path, archive_path)
+        """将有效模板写入数据库，不改动原配置文件。"""
         self._write(backup_existing=False)
 
     @staticmethod
@@ -441,13 +425,13 @@ class LayoutTemplateStore:
                 )
             }
         )
-        atomic_write_json(
+        self._database.write_document(
+            "通用经文排版模板",
             {
                 "数据版本": TEMPLATE_DATA_VERSION,
                 "用户模板": templates,
             },
-            self.file_path,
-            backup_existing=backup_existing,
+            version=TEMPLATE_DATA_VERSION,
         )
 
     @staticmethod

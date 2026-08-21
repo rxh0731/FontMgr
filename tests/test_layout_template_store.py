@@ -14,6 +14,7 @@ from core.scripture_layout import (
     LAYOUT_VERTICAL,
     LayoutParameters,
 )
+from data.application_database import ApplicationDatabase
 from data.layout_template_store import (
     DEFAULT_TEMPLATE_ID,
     DEFAULT_TEMPLATE_NAME,
@@ -24,21 +25,30 @@ from data.layout_template_store import (
 
 
 class LayoutTemplateStoreTests(unittest.TestCase):
-    def test_legacy_configuration_is_renamed_without_losing_templates(self) -> None:
+    def test_legacy_configuration_is_imported_without_modifying_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             legacy_path = Path(directory) / "排版模板.json"
             target_path = Path(directory) / "通用经文排版模板.json"
-            legacy_store = LayoutTemplateStore(str(legacy_path))
-            created = legacy_store.save("旧文件中的模板", LayoutParameters(rows=18))
+            legacy_path.write_text(
+                json.dumps(
+                    {
+                        "数据版本": 1,
+                        "用户模板": {"旧文件中的模板": {"rows": 18}},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
             migrated = LayoutTemplateStore(
                 str(target_path),
                 legacy_file_path=str(legacy_path),
             )
 
-            self.assertTrue(target_path.is_file())
-            self.assertFalse(legacy_path.exists())
-            self.assertEqual(migrated.get(created.template_id).parameters.rows, 18)
+            self.assertFalse(target_path.exists())
+            self.assertTrue(legacy_path.is_file())
+            self.assertTrue(target_path.with_suffix(".sqlite3").is_file())
+            self.assertEqual(migrated.get("旧文件中的模板").parameters.rows, 18)
 
     def test_missing_configuration_rebuilds_hardcoded_default_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -46,12 +56,14 @@ class LayoutTemplateStoreTests(unittest.TestCase):
 
             store = LayoutTemplateStore(str(path))
 
-            self.assertTrue(path.is_file())
+            self.assertFalse(path.exists())
             self.assertEqual(
                 store.get(DEFAULT_TEMPLATE_ID).parameters,
                 DEFAULT_TEMPLATE_PARAMETERS,
             )
-            stored = json.loads(path.read_text(encoding="utf-8"))
+            stored = ApplicationDatabase(str(path.with_suffix(".sqlite3"))).read_document(
+                "通用经文排版模板"
+            )
             self.assertEqual(stored["数据版本"], TEMPLATE_DATA_VERSION)
             self.assertIn(DEFAULT_TEMPLATE_ID, stored["用户模板"])
 
@@ -66,9 +78,12 @@ class LayoutTemplateStoreTests(unittest.TestCase):
                 store.get(DEFAULT_TEMPLATE_NAME).parameters,
                 DEFAULT_TEMPLATE_PARAMETERS,
             )
-            rebuilt = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(path.read_text(encoding="utf-8"), "{损坏")
+            rebuilt = ApplicationDatabase(str(path.with_suffix(".sqlite3"))).read_document(
+                "通用经文排版模板"
+            )
             self.assertEqual(rebuilt["数据版本"], TEMPLATE_DATA_VERSION)
-            self.assertEqual(len(list(Path(directory).glob("排版模板.json.损坏-*"))), 1)
+            self.assertEqual(len(list(Path(directory).glob("排版模板.json.损坏-*"))), 0)
 
     def test_file_cannot_override_hardcoded_default_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -167,7 +182,9 @@ class LayoutTemplateStoreTests(unittest.TestCase):
             self.assertFalse(legacy.parameters.include_punctuation)
 
             store.update(legacy.template_id, legacy.parameters)
-            migrated = json.loads(path.read_text(encoding="utf-8"))
+            migrated = ApplicationDatabase(str(path.with_suffix(".sqlite3"))).read_document(
+                "通用经文排版模板"
+            )
             self.assertEqual(migrated["数据版本"], TEMPLATE_DATA_VERSION)
             self.assertIn(legacy.template_id, migrated["用户模板"])
             self.assertEqual(

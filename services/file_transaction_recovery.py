@@ -84,6 +84,31 @@ def recovery_full_state_snapshot(snapshot: Any) -> dict[str, Any]:
     }
 
 
+def recovery_variant_batch_state_snapshot(
+    snapshots: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """封装只涉及若干字形的增量状态，避免事务清单复制整库。"""
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            raise TypeError("字形批次状态快照必须是字典。")
+        variant_id = str(snapshot.get("变体ID", "")).strip()
+        if not variant_id:
+            raise ValueError("字形批次状态快照缺少变体ID。")
+        if variant_id in seen:
+            raise ValueError(f"字形批次状态快照包含重复变体：{variant_id}")
+        seen.add(variant_id)
+        items.append(copy.deepcopy(snapshot))
+    if not items:
+        raise ValueError("字形批次状态快照不能为空。")
+    return {
+        "快照类型": "字形批次",
+        "字形状态": items,
+    }
+
+
 class FileTransaction:
     """管理一次跨多个字形图片的可恢复保存事务。"""
 
@@ -95,12 +120,14 @@ class FileTransaction:
         *,
         replace_func: _ReplaceFunction = os.replace,
         remove_func: _RemoveFunction = os.remove,
+        trusted_old_files: dict[str, tuple[int, int, int, int]] | None = None,
     ) -> None:
         self.root_dir = os.path.abspath(root_dir)
         self.manifest_path = manifest_path
         self._payload = payload
         self._replace = replace_func
         self._remove = remove_func
+        self._trusted_old_files = trusted_old_files or {}
 
     @classmethod
     def begin(
@@ -120,6 +147,7 @@ class FileTransaction:
         transaction_dir = os.path.join(root, TRANSACTION_DIRNAME)
         manifest_path = os.path.join(transaction_dir, f"{transaction_id}.json")
         operations: list[dict[str, Any]] = []
+        trusted_old_files: dict[str, tuple[int, int, int, int]] = {}
         seen_targets: set[str] = set()
         for index, change in enumerate(changes):
             target_path = _validate_absolute_member(
@@ -166,6 +194,8 @@ class FileTransaction:
                 raise FileExistsError(f"图片事务备份路径已存在：{backup_path}")
             target_existed = os.path.isfile(target_path)
             old_md5 = _compute_md5(target_path) if target_existed else ""
+            if target_existed:
+                trusted_old_files[target_key] = _file_identity(target_path)
             operations.append(
                 {
                     "目标文件": _relative_member(root, target_path),
@@ -196,6 +226,7 @@ class FileTransaction:
             payload,
             replace_func=replace_func,
             remove_func=remove_func,
+            trusted_old_files=trusted_old_files,
         )
 
     @property
@@ -206,11 +237,13 @@ class FileTransaction:
         """把事务开始时存在的全部旧目标移动到预定备份路径。"""
         if self.phase != PHASE_ROLLBACK:
             raise RuntimeError("只有回滚阶段可以备份旧文件。")
-        validation_errors = _rollback_validation_errors(
-            self.root_dir,
-            self._payload,
-            allow_target_with_backup=False,
-        )
+        validation_errors = self._live_backup_validation_errors()
+        if validation_errors is None:
+            validation_errors = _rollback_validation_errors(
+                self.root_dir,
+                self._payload,
+                allow_target_with_backup=False,
+            )
         if validation_errors:
             raise RuntimeError("图片事务旧文件校验失败：" + "；".join(validation_errors))
         for operation in self._payload["文件操作"]:
@@ -230,13 +263,39 @@ class FileTransaction:
             if operation["原目标存在"] and not os.path.isfile(backup_path):
                 raise RuntimeError(f"旧文件尚未完成备份：{target_path}")
             old_md5 = str(operation.get("旧文件MD5", ""))
-            if old_md5 and not _matches_md5(backup_path, old_md5):
+            trusted_identity = self._trusted_old_files.get(
+                os.path.normcase(target_path)
+            )
+            trusted_backup = (
+                trusted_identity is not None
+                and _try_file_identity(backup_path) == trusted_identity
+            )
+            if old_md5 and not trusted_backup and not _matches_md5(backup_path, old_md5):
                 raise RuntimeError(f"旧文件备份内容校验失败：{target_path}")
             if os.path.exists(target_path):
                 raise RuntimeError(f"目标路径尚未腾空：{target_path}")
         self._payload["新状态"] = copy.deepcopy(new_state)
         self._payload["阶段"] = PHASE_ROLLFORWARD
         _write_manifest(self.manifest_path, self._payload)
+
+    def _live_backup_validation_errors(self) -> list[str] | None:
+        """实时事务用文件标识确认旧目标；不确定时回退完整 MD5。"""
+
+        if not self._trusted_old_files:
+            return None
+        errors: list[str] = []
+        for operation in self._payload["文件操作"]:
+            target_path, _temporary_path, backup_path = self._operation_paths(operation)
+            if os.path.exists(backup_path):
+                return None
+            if not operation["原目标存在"]:
+                if os.path.exists(target_path):
+                    errors.append(f"事务开始后出现了意外目标文件：{target_path}")
+                continue
+            expected = self._trusted_old_files.get(os.path.normcase(target_path))
+            if expected is None or _try_file_identity(target_path) != expected:
+                return None
+        return errors
 
     def install_new_files(self) -> None:
         """安装全部临时新文件；空临时路径表示提交后目标应不存在。"""
@@ -334,7 +393,8 @@ def recover_file_transactions(
     data: dict[str, Any],
     *,
     ziku_dir: str,
-    json_path: str,
+    json_path: str | None = None,
+    persist_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     """恢复字库内全部未完成图片事务，并同步其单字状态。"""
     if not isinstance(data, dict):
@@ -390,7 +450,12 @@ def recover_file_transactions(
                     + "；".join(errors)
                 )
             _apply_variant_state(data, state)
-            atomic_write_json(data, json_path)
+            if persist_callback is not None:
+                persist_callback(data)
+            elif json_path:
+                atomic_write_json(data, json_path, indent=None)
+            else:
+                raise RuntimeError("图片事务恢复缺少状态持久化入口。")
             payload["阶段"] = PHASE_CLEANUP
             _write_manifest(manifest_path, payload)
             cleanup_errors = _cleanup_transaction(root, manifest_path, payload)
@@ -680,6 +745,18 @@ def _apply_variant_state(data: dict[str, Any], snapshot: dict[str, Any]) -> None
         data.clear()
         data.update(copy.deepcopy(full_state))
         return
+    if snapshot.get("快照类型") == "字形批次":
+        items = snapshot.get("字形状态")
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("图片事务的字形批次状态快照无效。")
+        for item in items:
+            if not isinstance(item, dict) or item.get("快照类型") in {
+                "完整字库",
+                "字形批次",
+            }:
+                raise RuntimeError("图片事务的字形批次成员无效。")
+            _apply_variant_state(data, item)
+        return
     variant_id = str(snapshot.get("变体ID", ""))
     if not variant_id:
         raise RuntimeError("图片事务状态快照缺少变体ID。")
@@ -756,7 +833,7 @@ def _write_manifest(path: str, payload: dict[str, Any]) -> None:
         "载荷": payload,
         "校验": _payload_checksum(payload),
     }
-    atomic_write_json(wrapper, path, backup_existing=False)
+    atomic_write_json(wrapper, path, indent=None, backup_existing=False)
 
 
 def _flush_file(path: str) -> None:
@@ -772,6 +849,23 @@ def _matches_md5(path: str, expected_md5: str) -> bool:
         return _compute_md5(path) == expected_md5
     except OSError:
         return False
+
+
+def _file_identity(path: str) -> tuple[int, int, int, int]:
+    stat = os.stat(path, follow_symlinks=False)
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def _try_file_identity(path: str) -> tuple[int, int, int, int] | None:
+    try:
+        return _file_identity(path)
+    except OSError:
+        return None
 
 
 def _compute_md5(path: str) -> str:

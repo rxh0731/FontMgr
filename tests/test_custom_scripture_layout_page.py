@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QLabel, QScrollArea
 
 import config
-from services.scripture_layout_service import GlyphIndex
+from services.scripture_layout_service import GenerationResult, GlyphIndex
 from ui.pages.custom_scripture_layout_page import CustomScriptureLayoutPage
 from ui.main_window import MainWindow
 
@@ -43,6 +43,28 @@ class CustomScriptureLayoutPageTests(unittest.TestCase):
                 self.assertEqual(page._output_name_edit.text(), "定制经文排版")
                 self.assertEqual(len(page._custom_board_parameters), 1)
                 self.assertEqual(page._template_combo.currentText(), "默认模板")
+            finally:
+                page.shutdown()
+                page.deleteLater()
+
+    def test_generation_completion_feedback_includes_elapsed_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = self._page(directory)
+            try:
+                worker = MagicMock()
+                page._generation_worker = worker
+                page._workers.add(worker)
+                page._generation_started_at = 0.0
+                with patch(
+                    "ui.pages.custom_scripture_layout_page.QMessageBox.information"
+                ) as information:
+                    page._generation_finished(GenerationResult((), False), worker)
+
+                self.assertEqual(
+                    information.call_args.args[1],
+                    "定制经文排版完成",
+                )
+                self.assertIn("总耗时：", information.call_args.args[2])
             finally:
                 page.shutdown()
                 page.deleteLater()

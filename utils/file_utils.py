@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 from pathlib import PureWindowsPath
 from typing import Any
 
@@ -167,7 +168,7 @@ def compute_file_md5(file_path: str, chunk_size: int = 1024 * 1024) -> str:
 def atomic_write_json(
     data: Any,
     file_path: str,
-    indent: int = 2,
+    indent: int | None = 2,
     *,
     backup_existing: bool = True,
 ) -> None:
@@ -187,10 +188,24 @@ def atomic_write_json(
             json.dump(data, fp, ensure_ascii=False, indent=indent)
             fp.flush()
             os.fsync(fp.fileno())
-        # 先写 .bak（如果已有文件），再原子替换
+        # 先写 .bak（如果已有文件），再原子替换。主文件较大时优先用
+        # 同盘硬链接建立旧版本快照，文件系统不支持时再回退完整复制。
         if backup_existing and os.path.exists(file_path):
             bak_path = file_path + ".bak"
-            shutil.copy2(file_path, bak_path)
+            link_path = os.path.join(
+                directory,
+                f".tmp_backup_{uuid.uuid4().hex}",
+            )
+            try:
+                os.link(file_path, link_path)
+                os.replace(link_path, bak_path)
+            except OSError:
+                if os.path.exists(link_path):
+                    try:
+                        os.unlink(link_path)
+                    except OSError:
+                        pass
+                shutil.copy2(file_path, bak_path)
         os.replace(tmp_path, file_path)
     except Exception:
         if os.path.exists(tmp_path):

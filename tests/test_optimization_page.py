@@ -762,9 +762,11 @@ class OptimizationPageTests(unittest.TestCase):
                 success(function())
 
             page._start_task = run_immediately  # type: ignore[method-assign]
-            page._save_selected()
+            with patch.object(page, "_show_optimization_end_notice") as end_notice:
+                page._save_selected()
 
             service.save_selection.assert_called_once()
+            end_notice.assert_called_once_with()
             self.assertIsNone(page._current_item)
             self.assertEqual(page._visible_items, [])
             self.assertTrue(page._original_preview.pixmap().isNull())
@@ -1581,6 +1583,7 @@ class OptimizationPageTests(unittest.TestCase):
         self.assertIn("跳过 1", summary)
         self.assertIn("失败 1", summary)
         self.assertIn("是-0001：模拟单字保存失败", summary)
+        self.assertIn("总耗时：", summary)
         page.close()
         page.deleteLater()
 
@@ -1640,6 +1643,7 @@ class OptimizationPageTests(unittest.TestCase):
         self.assertTrue(page._item_tree.isEnabled())
         self.assertFalse(page._candidate_list.isEnabled())
         information.assert_called_once()
+        self.assertIn("总耗时：", information.call_args.args[2])
         page.deleteLater()
 
     def test_batch_worker_counts_structure_risk_as_saved_not_failed(self) -> None:
@@ -1802,6 +1806,7 @@ class OptimizationPageTests(unittest.TestCase):
         information.assert_called_once()
         self.assertEqual(information.call_args.args[1], "自动优化已停止")
         summary = information.call_args.args[2]
+        self.assertIn("总耗时：", summary)
         self.assertIn("成功 0", summary)
         self.assertIn("失败 0", summary)
         self.assertIn("未处理 1", summary)
@@ -2015,11 +2020,10 @@ class OptimizationPageTests(unittest.TestCase):
         self.assertTrue(page._search_edit.isEnabled())
         self.assertTrue(page._item_tree.isEnabled())
         self.assertTrue(page._candidate_list.isEnabled())
-        critical.assert_called_once_with(
-            page,
-            "整库自动优化失败",
-            "模拟批量线程异常",
-        )
+        critical.assert_called_once()
+        self.assertEqual(critical.call_args.args[:2], (page, "整库自动优化失败"))
+        self.assertIn("模拟批量线程异常", critical.call_args.args[2])
+        self.assertIn("总耗时：", critical.call_args.args[2])
         page.deleteLater()
 
     def test_bulk_optimization_refresh_failure_restores_home_and_navigation(self) -> None:
@@ -2091,6 +2095,7 @@ class OptimizationPageTests(unittest.TestCase):
         self.assertTrue(page._search_edit.isEnabled())
         self.assertTrue(page._item_tree.isEnabled())
         self.assertIn("无法启动", critical.call_args.args[2])
+        self.assertIn("总耗时：", critical.call_args.args[2])
         page.deleteLater()
 
     def test_bulk_optimization_reports_missing_original_metadata_as_failure(self) -> None:

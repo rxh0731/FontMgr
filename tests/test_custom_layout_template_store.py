@@ -11,6 +11,7 @@ from core.custom_scripture_layout import (
     CustomBoardParameters,
     CustomLayoutTemplateParameters,
 )
+from data.application_database import ApplicationDatabase
 from data.custom_layout_template_store import (
     DEFAULT_CUSTOM_TEMPLATE_ID,
     CustomLayoutTemplateStore,
@@ -24,11 +25,13 @@ class CustomLayoutTemplateStoreTests(unittest.TestCase):
 
             store = CustomLayoutTemplateStore(str(path))
 
-            self.assertTrue(path.is_file())
+            self.assertFalse(path.exists())
             default = store.get(DEFAULT_CUSTOM_TEMPLATE_ID)
             self.assertTrue(default.builtin)
             self.assertEqual(len(default.parameters.boards), 1)
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = ApplicationDatabase(str(path.with_suffix(".sqlite3"))).read_document(
+                "定制经文排版模板"
+            )
             self.assertEqual(payload["数据版本"], 1)
 
     def test_multi_board_template_round_trip(self) -> None:

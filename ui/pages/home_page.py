@@ -28,13 +28,14 @@ from PySide6.QtWidgets import (
 )
 
 import config
+from data.library_database import LIBRARY_DATABASE_FILENAME
+from services.glyph_service import GlyphService
 from services.library_summary_service import build_library_summary
 from utils.batch_observability import ProgressThrottle
 from utils.file_utils import (
     is_real_directory,
     pinyin_natural_key,
     resolve_library_directory,
-    safe_read_json,
 )
 
 
@@ -61,8 +62,8 @@ class LibraryEntrySignature:
 
     name: str
     directory: DirectorySignature
-    primary_json: FileSignature
-    backup_json: FileSignature
+    database: FileSignature
+    database_wal: FileSignature
     stage_directories: tuple[tuple[str, DirectorySignature], ...]
 
 
@@ -149,7 +150,7 @@ def library_summary_signature() -> LibrarySummarySignature:
     libraries: list[LibraryEntrySignature] = []
     for library_name in _scan_library_names(root_path):
         library_path = os.path.join(root_path, library_name)
-        json_path = os.path.join(library_path, f"{library_name}.json")
+        database_path = os.path.join(library_path, LIBRARY_DATABASE_FILENAME)
         stage_directories = tuple(
             (
                 directory_name,
@@ -162,9 +163,10 @@ def library_summary_signature() -> LibrarySummarySignature:
         libraries.append(
             LibraryEntrySignature(
                 name=library_name,
-                directory=_directory_signature(library_path),
-                primary_json=_file_signature(json_path),
-                backup_json=_file_signature(f"{json_path}.bak"),
+                # SQLite 打开 WAL 时会改变目录时间，目录自身只记录存在性。
+                directory=DirectorySignature(os.path.isdir(library_path)),
+                database=_file_signature(database_path),
+                database_wal=_file_signature(f"{database_path}-wal"),
                 stage_directories=stage_directories,
             )
         )
@@ -265,11 +267,9 @@ def scan_library_summaries(
             ),
             force=True,
         )
-        data = safe_read_json(
-            os.path.join(entry.path, f"{entry.name}.json"),
-            default=None,
-        )
-        if not isinstance(data, dict):
+        try:
+            glyph_service = GlyphService.open(entry.name, entry.path)
+        except Exception as exc:
             summaries.append(
                 {
                     "name": entry.name,
@@ -277,7 +277,7 @@ def scan_library_summaries(
                     "characters": 0,
                     "variants": 0,
                     "metadata": {},
-                    "data_error": "字库主数据和备份均缺失或损坏",
+                    "data_error": str(exc),
                 }
             )
             report(
@@ -306,10 +306,10 @@ def scan_library_summaries(
             build_library_summary(
                 entry.name,
                 entry.path,
-                data.get("变体详情"),
-                data.get("字形组索引"),
-                data.get("元数据"),
-                data.get("整体协调"),
+                glyph_service.get_variants(),
+                glyph_service.get_glyph_groups(),
+                glyph_service.get_metadata(),
+                glyph_service.get_coordination_summary(),
                 verify_files=True,
                 progress_callback=report_glyph_progress,
             )

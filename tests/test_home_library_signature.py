@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import config
+from services.glyph_service import GlyphService
 from ui.pages.home_page import (
     library_summary_signature,
     scan_library_names,
@@ -67,22 +68,17 @@ class HomeLibrarySignatureTests(unittest.TestCase):
             self.assertEqual(first.libraries, ())
             self.assertEqual(names, [])
 
-    def test_json_backup_and_library_directory_changes_invalidate_signature(self) -> None:
+    def test_database_and_library_directory_changes_invalidate_signature(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             library = root / "甲字库"
             library.mkdir()
-            json_path = library / "甲字库.json"
-            backup_path = library / "甲字库.json.bak"
-            json_path.write_text("{}", encoding="utf-8")
+            service = GlyphService.open("甲字库", str(library))
             with patch.object(config, "ZIKU_ROOT", str(root)):
                 initial = library_summary_signature()
 
-                json_path.write_text('{"版本": 2}', encoding="utf-8")
-                json_changed = library_summary_signature()
-
-                backup_path.write_text("{}", encoding="utf-8")
-                backup_added = library_summary_signature()
+                service.save_session("甲")
+                database_changed = library_summary_signature()
 
                 added_library = root / "乙字库"
                 added_library.mkdir()
@@ -91,9 +87,8 @@ class HomeLibrarySignatureTests(unittest.TestCase):
                 added_library.rename(root / "丙字库")
                 library_renamed = library_summary_signature()
 
-            self.assertNotEqual(initial, json_changed)
-            self.assertNotEqual(json_changed, backup_added)
-            self.assertNotEqual(backup_added, library_added)
+            self.assertNotEqual(initial, database_changed)
+            self.assertNotEqual(database_changed, library_added)
             self.assertNotEqual(library_added, library_renamed)
 
     def test_current_and_legacy_stage_directories_invalidate_signature(self) -> None:

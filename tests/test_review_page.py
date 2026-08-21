@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 import config
+from data.library_database import LibraryDatabase
 from services.batch_persistence import (
     JOURNAL_FILENAME,
     BatchJournalUncertainError,
@@ -85,6 +86,13 @@ class ReviewPageTests(unittest.TestCase):
         self.assertAlmostEqual(page._canvas.minimum_pressure_ratio, 0.2)
         self.assertEqual(page._save_button.text(), "保存修改稿")
         self.assertEqual(page._approve_button.text(), "保存并审核通过")
+        self.assertEqual(page._previous_button.text(), "上一条")
+        self.assertEqual(page._next_button.text(), "下一条")
+        for button in (page._previous_button, page._next_button):
+            self.assertGreaterEqual(
+                button.width(),
+                button.fontMetrics().horizontalAdvance(button.text()) + 42,
+            )
         self.assertEqual(page._complete_button.text(), "批量手工审核")
         self.assertFalse(page._complete_button.isEnabled())
         self.assertTrue(page._batch_progress_widget.isHidden())
@@ -172,6 +180,7 @@ class ReviewPageTests(unittest.TestCase):
             warning.assert_called_once()
             self.assertIn("成功 1 个，跳过 0 个，失败 1 个", warning.call_args.args[2])
             self.assertIn(str(variants["missing_preview"]), warning.call_args.args[2])
+            self.assertIn("总耗时：", warning.call_args.args[2])
             information.assert_not_called()
             page.deleteLater()
 
@@ -205,6 +214,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertTrue(all(action.isEnabled() for action in page._shortcut_actions))
             self.assertTrue(page._batch_progress_widget.isHidden())
             information.assert_called_once()
+            self.assertIn("总耗时：", information.call_args.args[2])
             warning.assert_not_called()
             critical.assert_not_called()
             page.deleteLater()
@@ -281,6 +291,7 @@ class ReviewPageTests(unittest.TestCase):
             information.assert_called_once()
             self.assertEqual(information.call_args.args[1], "手工审核已停止")
             self.assertIn("未处理 1 个", information.call_args.args[2])
+            self.assertIn("总耗时：", information.call_args.args[2])
             reloaded = GlyphService(service.ziku_name, service.ziku_dir)
             self.assertEqual(
                 reloaded.get_variant(pending_id)["状态"],
@@ -366,7 +377,7 @@ class ReviewPageTests(unittest.TestCase):
                 config.STATUS_PENDING_MANUAL_REVIEW,
             )
 
-    def test_bulk_review_groups_full_json_saves(self) -> None:
+    def test_bulk_review_commits_each_variant_to_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, variant_ids = self._build_large_library(
                 Path(directory),
@@ -403,12 +414,9 @@ class ReviewPageTests(unittest.TestCase):
 
             self.assertEqual(result["成功"], len(variant_ids))
             self.assertEqual(result["失败"], 0)
-            self.assertEqual(save_calls, [service.ziku_name])
-            self.assertLess(len(save_calls), len(variant_ids))
+            self.assertEqual(save_calls, [service.ziku_name] * len(variant_ids))
             self.assertFalse((Path(service.ziku_dir) / JOURNAL_FILENAME).exists())
-            saved = safe_read_json(
-                str(Path(service.ziku_dir) / f"{service.ziku_name}.json")
-            )
+            saved = LibraryDatabase.open(service.ziku_dir).load_data()
             self.assertTrue(
                 all(
                     saved["变体详情"][variant_id]["状态"]
@@ -417,11 +425,10 @@ class ReviewPageTests(unittest.TestCase):
                 )
             )
 
-    def test_uncheckpointed_review_journal_recovers_on_next_open(self) -> None:
+    def test_review_batch_commits_without_json_journal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, variants = self._build_library(Path(directory))
             variant_id = str(variants["pending"])
-            json_path = Path(service.ziku_dir) / f"{service.ziku_name}.json"
             journal_path = Path(service.ziku_dir) / JOURNAL_FILENAME
             session = BatchPersistenceSession(
                 service,
@@ -436,11 +443,6 @@ class ReviewPageTests(unittest.TestCase):
                         "snapshot_state",
                         side_effect=AssertionError("批量单字不应复制整库状态"),
                     ),
-                    patch.object(
-                        service,
-                        "save",
-                        side_effect=AssertionError("记录恢复日志时不应保存整库 JSON"),
-                    ),
                 ):
                     review_page_module._save_and_approve_review(
                         service,
@@ -452,14 +454,14 @@ class ReviewPageTests(unittest.TestCase):
             finally:
                 session.leave_for_recovery()
 
-            self.assertTrue(journal_path.is_file())
+            self.assertFalse(journal_path.exists())
             self.assertEqual(
                 service.get_variant(variant_id)["状态"],
                 config.STATUS_REVIEWED,
             )
             self.assertEqual(
-                safe_read_json(str(json_path))["变体详情"][variant_id]["状态"],
-                config.STATUS_PENDING_MANUAL_REVIEW,
+                LibraryDatabase.open(service.ziku_dir).load_data()["变体详情"][variant_id]["状态"],
+                config.STATUS_REVIEWED,
             )
             self.assertFalse(
                 (Path(service.ziku_dir) / ".fonteditor_file_transactions").exists()
@@ -594,11 +596,10 @@ class ReviewPageTests(unittest.TestCase):
                 ).exists()
             )
 
-    def test_bulk_checkpoint_failure_keeps_journal_without_retrying_save(self) -> None:
+    def test_bulk_database_failure_keeps_image_transaction_for_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, variants = self._build_library(Path(directory))
             variant_id = str(variants["pending"])
-            json_path = Path(service.ziku_dir) / f"{service.ziku_name}.json"
             journal_path = Path(service.ziku_dir) / JOURNAL_FILENAME
             save_calls: list[str] = []
 
@@ -620,7 +621,7 @@ class ReviewPageTests(unittest.TestCase):
                     side_effect=create_persistence,
                 ),
                 patch.object(GlyphService, "save", new=fail_checkpoint),
-                self.assertRaisesRegex(OSError, "模拟批量检查点保存失败"),
+                self.assertRaisesRegex(BatchJournalUncertainError, "数据库提交结果无法确认"),
             ):
                 review_page_module._run_bulk_review(
                     service.ziku_name,
@@ -630,9 +631,9 @@ class ReviewPageTests(unittest.TestCase):
                 )
 
             self.assertEqual(save_calls, [service.ziku_name])
-            self.assertTrue(journal_path.is_file())
+            self.assertFalse(journal_path.exists())
             self.assertEqual(
-                safe_read_json(str(json_path))["变体详情"][variant_id]["状态"],
+                LibraryDatabase.open(service.ziku_dir).load_data()["变体详情"][variant_id]["状态"],
                 config.STATUS_PENDING_MANUAL_REVIEW,
             )
 
@@ -669,11 +670,10 @@ class ReviewPageTests(unittest.TestCase):
             retry_session = BatchPersistenceSession(service)
             retry_session.finish()
 
-    def test_bulk_finish_failure_keeps_journal_without_retrying_save(self) -> None:
+    def test_bulk_database_failure_is_recovered_on_next_open(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, variants = self._build_library(Path(directory))
             variant_id = str(variants["pending"])
-            json_path = Path(service.ziku_dir) / f"{service.ziku_name}.json"
             journal_path = Path(service.ziku_dir) / JOURNAL_FILENAME
             save_calls: list[str] = []
 
@@ -695,7 +695,7 @@ class ReviewPageTests(unittest.TestCase):
                     side_effect=create_persistence,
                 ),
                 patch.object(GlyphService, "save", new=fail_finish),
-                self.assertRaisesRegex(OSError, "模拟批量结束保存失败"),
+                self.assertRaisesRegex(BatchJournalUncertainError, "数据库提交结果无法确认"),
             ):
                 review_page_module._run_bulk_review(
                     service.ziku_name,
@@ -705,9 +705,9 @@ class ReviewPageTests(unittest.TestCase):
                 )
 
             self.assertEqual(save_calls, [service.ziku_name])
-            self.assertTrue(journal_path.is_file())
+            self.assertFalse(journal_path.exists())
             self.assertEqual(
-                safe_read_json(str(json_path))["变体详情"][variant_id]["状态"],
+                LibraryDatabase.open(service.ziku_dir).load_data()["变体详情"][variant_id]["状态"],
                 config.STATUS_PENDING_MANUAL_REVIEW,
             )
 
@@ -782,6 +782,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertTrue(page._batch_progress_widget.isHidden())
             critical.assert_called_once()
             self.assertIn("模拟工作线程异常", critical.call_args.args[2])
+            self.assertIn("总耗时：", critical.call_args.args[2])
             page.deleteLater()
 
     def test_bulk_review_refresh_exception_cannot_leave_page_locked(self) -> None:
@@ -823,6 +824,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertTrue(page._batch_progress_widget.isHidden())
             critical.assert_called_once()
             self.assertIn("模拟页面刷新异常", critical.call_args.args[2])
+            self.assertIn("总耗时：", critical.call_args.args[2])
             page.deleteLater()
 
     def test_pending_review_ids_include_detail_missing_from_group_index(self) -> None:
@@ -1199,8 +1201,7 @@ class ReviewPageTests(unittest.TestCase):
             variant_id = str(variants["pending"])
             detail_reference = service.get_variant(variant_id)
             state_before = service.snapshot_state()
-            json_path = Path(service.ziku_dir) / f"{service.ziku_name}.json"
-            json_before = json_path.read_bytes()
+            database_before = LibraryDatabase.open(service.ziku_dir).load_data()
             review_dir = Path(service.get_workflow_dirs()["手工审核"])
             output_path = review_dir / "何-0001.png"
             self.assertFalse(output_path.exists())
@@ -1224,7 +1225,10 @@ class ReviewPageTests(unittest.TestCase):
                 detail_reference,
                 state_before["变体详情"][variant_id],
             )
-            self.assertEqual(json_path.read_bytes(), json_before)
+            self.assertEqual(
+                LibraryDatabase.open(service.ziku_dir).load_data(),
+                database_before,
+            )
             self.assertFalse(output_path.exists())
             self.assertFalse(list(review_dir.glob(".fonteditor_review_*")))
 
@@ -1798,12 +1802,16 @@ class ReviewPageTests(unittest.TestCase):
                 dialogs = page.findChildren(QMessageBox)
                 self.assertTrue(dialogs)
                 dialog = dialogs[-1]
+                save_button = dialog.button(QMessageBox.StandardButton.Save)
                 discard_button = dialog.button(QMessageBox.StandardButton.Discard)
                 cancel_button = dialog.button(QMessageBox.StandardButton.Cancel)
+                self.assertIsNotNone(save_button)
                 self.assertIsNotNone(discard_button)
                 self.assertIsNotNone(cancel_button)
+                self.assertEqual(save_button.text(), "保存修改")
                 self.assertEqual(discard_button.text(), "放弃修改")
                 self.assertEqual(cancel_button.text(), "取消")
+                self.assertIs(dialog.defaultButton(), save_button)
                 self.assertIs(dialog.escapeButton(), cancel_button)
 
                 self.assertIs(stack.currentWidget(), home_page)
@@ -1827,6 +1835,67 @@ class ReviewPageTests(unittest.TestCase):
             self.assertIs(stack.currentWidget(), page)
             self.assertFalse(page._canvas.is_dirty)
             stack.deleteLater()
+
+    def test_save_unsaved_review_before_switching_glyph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            page = ReviewPage()
+            current_id = str(variants["pending"])
+            next_id = str(variants["reviewed"])
+            self.assertTrue(page.open_library(service.ziku_dir, current_id))
+            page._canvas.set_transform(x=9)
+            self.assertTrue(page._canvas.is_dirty)
+
+            with (
+                patch.object(
+                    QMessageBox,
+                    "exec",
+                    return_value=QMessageBox.StandardButton.Save.value,
+                ),
+                patch.object(page, "save_current", wraps=page.save_current) as save,
+            ):
+                page._item_tree.setCurrentItem(page._node_for_variant(next_id))
+                self.app.processEvents()
+
+            save.assert_called_once_with()
+            self.assertEqual(page._current_variant_id, next_id)
+            reloaded = GlyphService(service.ziku_name, service.ziku_dir)
+            saved_detail = reloaded.get_variant(current_id)
+            self.assertTrue(saved_detail.get("审核文件"))
+            self.assertEqual(
+                saved_detail["变换参数"]["偏移X"],
+                0,
+            )
+            page.deleteLater()
+
+    def test_failed_save_keeps_current_glyph_and_unsaved_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            page = ReviewPage()
+            current_id = str(variants["pending"])
+            next_id = str(variants["reviewed"])
+            self.assertTrue(page.open_library(service.ziku_dir, current_id))
+            page._canvas.set_transform(x=9)
+
+            with (
+                patch.object(
+                    QMessageBox,
+                    "exec",
+                    return_value=QMessageBox.StandardButton.Save.value,
+                ),
+                patch.object(page, "save_current", return_value=False) as save,
+            ):
+                page._item_tree.setCurrentItem(page._node_for_variant(next_id))
+                self.app.processEvents()
+
+            save.assert_called_once_with()
+            self.assertEqual(page._current_variant_id, current_id)
+            self.assertIs(
+                page._item_tree.currentItem(),
+                page._node_for_variant(current_id),
+            )
+            self.assertTrue(page._canvas.is_dirty)
+            page.deleteLater()
 
     def test_cancel_home_keeps_unsaved_review_draft(self) -> None:
         """取消返回首页时必须保留当前人工稿及撤销历史。"""
@@ -2498,7 +2567,14 @@ class ReviewPageTests(unittest.TestCase):
                 distort=[2.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -2.0],
             )
 
-            with patch.object(page, "_populate_variants") as populate:
+            with (
+                patch.object(page, "_populate_variants") as populate,
+                patch.object(
+                    page,
+                    "_advance_after_review_approval",
+                    wraps=page._advance_after_review_approval,
+                ) as advance,
+            ):
                 page.approve_current()
 
             reloaded = GlyphService(service.ziku_name, service.ziku_dir)
@@ -2518,7 +2594,161 @@ class ReviewPageTests(unittest.TestCase):
                 page._draft_status_label.text(),
                 STATUS_REVIEWED,
             )
-            populate.assert_called_once()
+            populate.assert_not_called()
+            advance.assert_called_once()
+            page.deleteLater()
+
+    def test_save_button_path_runs_in_background_and_merges_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            variant_id = variants["eligible"][0]
+            page = ReviewPage()
+            self.assertTrue(page.open_library(service.ziku_dir, variant_id))
+            page._canvas.set_transform(x=6)
+
+            page._start_save_current()
+            deadline = time.monotonic() + 10
+            while page._save_running and time.monotonic() < deadline:
+                self.app.processEvents()
+                QTest.qWait(10)
+
+            self.assertFalse(page._save_running)
+            reloaded = GlyphService(service.ziku_name, service.ziku_dir)
+            detail = reloaded.get_variant(variant_id)
+            reviewed_path = (
+                Path(reloaded.get_workflow_dirs()["手工审核"])
+                / str(detail["审核文件"])
+            )
+            self.assertTrue(reviewed_path.is_file())
+            self.assertEqual(page._source_stage, "手工审核稿")
+            self.assertFalse(page._canvas.is_dirty)
+            page.deleteLater()
+
+    def test_worker_reuse_path_holds_library_lock_while_saving_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            variant_id = str(variants["eligible"][0])
+            page = ReviewPage()
+            self.assertTrue(page.open_library(service.ziku_dir, variant_id))
+            self.assertTrue(page.save_current())
+            reusable = page._reusable_review_file()
+            self.assertIsNotNone(reusable)
+            if reusable is None:
+                self.fail("测试准备失败：审核稿不符合复用条件")
+            detail = page._service.get_variant(variant_id) if page._service else None
+            filename = str(detail.get("审核文件", "")) if detail else ""
+            lock = MagicMock()
+
+            with patch.object(
+                review_page_module,
+                "acquire_batch_library_lock",
+                return_value=lock,
+            ) as acquire:
+                result = review_page_module._save_interactive_review_in_worker(
+                    service.ziku_name,
+                    service.ziku_dir,
+                    variant_id,
+                    page._canvas.image().copy(),
+                    filename,
+                    (0, 0),
+                    300,
+                    approve=True,
+                    reusable=(reusable[0], reusable[1], True),
+                )
+
+            acquire.assert_called_once_with(os.path.abspath(service.ziku_dir))
+            lock.release.assert_called_once_with()
+            self.assertTrue(result["审核通过"])
+            self.assertEqual(
+                result["字形状态"]["变体详情"]["状态"],
+                config.STATUS_REVIEWED,
+            )
+            page.deleteLater()
+
+    def test_approving_last_search_result_shows_end_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            variant_id = str(variants["pending"])
+            page = ReviewPage()
+            self.assertTrue(page.open_library(service.ziku_dir, variant_id))
+            page._search_edit.setText("何")
+            page._execute_search()
+            self.assertEqual(page._variant_ids, [variant_id])
+
+            with patch.object(QMessageBox, "information") as information:
+                page.approve_current()
+
+            information.assert_called_once()
+            self.assertEqual(information.call_args.args[1], "手工审核")
+            self.assertIn("最后一条", information.call_args.args[2])
+            self.assertIn("全部处理完成", information.call_args.args[2])
+            page.deleteLater()
+
+    def test_approve_reuses_only_compliant_review_file_and_saves_state_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            variant_id = str(variants["pending"])
+            page = ReviewPage()
+            self.assertTrue(page.open_library(service.ziku_dir, variant_id))
+            self.assertTrue(page.save_current())
+            if page._service is None:
+                self.fail("手工审核页面应已载入字库服务")
+            page._service.get_variant(variant_id)["手工编辑"] = "旧版异常值"
+
+            with (
+                patch.object(page, "_save_current_image", wraps=page._save_current_image) as image_save,
+                patch.object(page._service, "save", wraps=page._service.save) as state_save,
+            ):
+                page.approve_current()
+
+            image_save.assert_not_called()
+            state_save.assert_called_once()
+            self.assertEqual(
+                page._service.get_variant(variant_id)["状态"],
+                config.STATUS_REVIEWED,
+            )
+            page.deleteLater()
+
+    def test_approve_regenerates_review_file_when_canvas_contract_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, variants = self._build_library(Path(directory))
+            variant_id = str(variants["pending"])
+            page = ReviewPage()
+            self.assertTrue(page.open_library(service.ziku_dir, variant_id))
+            self.assertTrue(page.save_current())
+            if page._service is None:
+                self.fail("手工审核页面应已载入字库服务")
+            detail = page._service.get_variant(variant_id)
+            review_path = (
+                Path(page._service.get_workflow_dirs()["手工审核"])
+                / str(detail["审核文件"])
+            )
+            wrong_size = QImage(QSize(32, 32), QImage.Format.Format_ARGB32)
+            wrong_size.fill(QColor(0, 0, 0, 0))
+            painter = QPainter(wrong_size)
+            painter.fillRect(8, 5, 16, 22, QColor("#111111"))
+            painter.end()
+            wrong_size.setDotsPerMeterX(round(300 / 0.0254))
+            wrong_size.setDotsPerMeterY(round(300 / 0.0254))
+            self.assertTrue(wrong_size.save(str(review_path), "PNG"))
+            detail["审核MD5"] = review_page_module._file_md5(str(review_path))
+
+            with patch.object(
+                page,
+                "_save_current_image",
+                wraps=page._save_current_image,
+            ) as image_save:
+                page.approve_current()
+
+            image_save.assert_called_once_with(approve=True)
+            reloaded = GlyphService(service.ziku_name, service.ziku_dir)
+            saved_detail = reloaded.get_variant(variant_id)
+            saved_path = (
+                Path(reloaded.get_workflow_dirs()["手工审核"])
+                / str(saved_detail["审核文件"])
+            )
+            self.assertEqual(QImage(str(saved_path)).size(), QSize(64, 64))
+            self.assertEqual(saved_detail["状态"], config.STATUS_REVIEWED)
             page.deleteLater()
 
     def test_save_failure_restores_review_file_finished_file_and_library_state(self) -> None:
@@ -2556,8 +2786,7 @@ class ReviewPageTests(unittest.TestCase):
             if page._service is None:
                 self.fail("手工审核页面应已载入字库服务")
             state_before = page._service.snapshot_state()
-            json_path = Path(service.ziku_dir) / f"{service.ziku_name}.json"
-            json_before = json_path.read_bytes()
+            database_before = LibraryDatabase.open(service.ziku_dir).load_data()
             reviewed_before = reviewed_path.read_bytes()
             finished_before = finished_path.read_bytes()
 
@@ -2571,7 +2800,10 @@ class ReviewPageTests(unittest.TestCase):
             critical.assert_called_once()
             self.assertTrue(page._canvas.is_dirty)
             self.assertEqual(page._service.snapshot_state(), state_before)
-            self.assertEqual(json_path.read_bytes(), json_before)
+            self.assertEqual(
+                LibraryDatabase.open(service.ziku_dir).load_data(),
+                database_before,
+            )
             self.assertEqual(reviewed_path.read_bytes(), reviewed_before)
             self.assertEqual(finished_path.read_bytes(), finished_before)
             self.assertFalse(

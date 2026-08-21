@@ -8,7 +8,11 @@ import os
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from utils.file_utils import atomic_write_json, safe_read_json
+from data.application_database import (
+    ApplicationDatabase,
+    resolve_application_database_path,
+)
+from utils.file_utils import safe_read_json
 from utils.file_utils import resolve_library_directory
 
 
@@ -20,6 +24,9 @@ class LibrarySummaryStore:
     def __init__(self, file_path: str, library_root: str) -> None:
         self._file_path = file_path
         self._library_root = os.path.normcase(os.path.abspath(library_root))
+        self._database = ApplicationDatabase(
+            resolve_application_database_path(file_path)
+        )
 
     @staticmethod
     def signature_fingerprint(signature: object) -> str:
@@ -34,7 +41,15 @@ class LibrarySummaryStore:
         return hashlib.sha256(payload).hexdigest()
 
     def load(self, signature: object) -> list[dict[str, Any]] | None:
-        payload = safe_read_json(self._file_path, default={})
+        payload = self._database.read_document("字库状态索引")
+        if payload is None:
+            payload = safe_read_json(self._file_path, default={})
+            if isinstance(payload, dict) and payload:
+                self._database.write_document(
+                    "字库状态索引",
+                    payload,
+                    version=self.VERSION,
+                )
         if not isinstance(payload, dict):
             return None
         if payload.get("版本") != self.VERSION:
@@ -72,4 +87,8 @@ class LibrarySummaryStore:
             "文件系统签名": self.signature_fingerprint(signature),
             "字库摘要": summaries,
         }
-        atomic_write_json(payload, self._file_path)
+        self._database.write_document(
+            "字库状态索引",
+            payload,
+            version=self.VERSION,
+        )

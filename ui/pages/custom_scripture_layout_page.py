@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 
@@ -977,6 +978,7 @@ class CustomScriptureLayoutPage(ScriptureLayoutPage):
 
         worker = FunctionWorker(generate, with_progress=True)
         self._generation_worker = worker
+        self._generation_started_at = time.perf_counter()
         self._workers.add(worker)
         worker.signals.progress.connect(self._generation_progress)
         worker.signals.finished.connect(
@@ -991,15 +993,26 @@ class CustomScriptureLayoutPage(ScriptureLayoutPage):
         self._thread_pool.start(worker)
 
     def _generation_finished(self, result: object, worker: FunctionWorker) -> None:
+        elapsed_text = self._generation_elapsed_text()
         self._finish_worker(worker)
         if not isinstance(result, GenerationResult):
-            QMessageBox.warning(self, "生成失败", "排版任务返回了无法识别的结果。")
+            QMessageBox.warning(
+                self,
+                "生成失败",
+                f"排版任务返回了无法识别的结果。\n\n{elapsed_text}",
+            )
             return
         if result.stopped:
             self._progress_bar.setRange(0, 1)
             self._progress_bar.setValue(0)
             self._progress_bar.setFormat("任务已停止；已完整生成的版面予以保留")
             self.status_message.emit("定制经文排版已停止")
+            QMessageBox.information(
+                self,
+                "定制经文排版已停止",
+                "生成任务已停止，已完整生成的版面予以保留。\n\n"
+                f"{elapsed_text}",
+            )
             return
         completed = sum(not board.skipped for board in result.boards)
         skipped = sum(board.skipped for board in result.boards)
@@ -1012,15 +1025,21 @@ class CustomScriptureLayoutPage(ScriptureLayoutPage):
         QMessageBox.information(
             self,
             "定制经文排版完成",
-            f"已生成 {completed} 个分层文件，跳过 {skipped} 个已有文件。",
+            f"已生成 {completed} 个分层文件，跳过 {skipped} 个已有文件。\n\n"
+            f"{elapsed_text}",
         )
 
     def _generation_failed(self, message: str, worker: FunctionWorker) -> None:
+        elapsed_text = self._generation_elapsed_text()
         self._finish_worker(worker)
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(0)
         self._progress_bar.setFormat("生成失败")
-        QMessageBox.critical(self, "定制经文排版失败", message)
+        QMessageBox.critical(
+            self,
+            "定制经文排版失败",
+            f"{message}\n\n{elapsed_text}",
+        )
 
     def _set_running(self, running: bool) -> None:
         super()._set_running(running)

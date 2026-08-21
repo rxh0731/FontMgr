@@ -103,12 +103,21 @@ class HomePageTests(unittest.TestCase):
                     "成品文件": "../目录外.png",
                 },
                 "unknown": {"状态": "未知状态"},
-                "broken": "不是详情字典",
+                "broken": {"状态": ""},
             }
+            groups: dict[str, list[str]] = {}
+            for index, (variant_id, detail) in enumerate(details.items()):
+                char = chr(ord("甲") + index)
+                detail["变体ID"] = variant_id
+                detail["归属字"] = char
+                groups[char] = [variant_id]
             library_data = {
+                "数据版本": 3,
+                "库名": "阶段统计字库",
                 "变体详情": details,
-                "字形组索引": {"甲": ["pending"], "乙": ["optimized"]},
+                "字形组索引": groups,
                 "元数据": {"DPI": 300, "画布宽": 250, "画布高": 250},
+                "会话": {},
                 "整体协调": {
                     "墨色统一启用": True,
                     "墨色基准": 215.0,
@@ -159,14 +168,19 @@ class HomePageTests(unittest.TestCase):
                 library_dir.mkdir()
                 details = {
                     f"variant-{index}": {
+                        "变体ID": f"variant-{index}",
+                        "归属字": library_name[0],
                         "状态": config.STATUS_PENDING_OPTIMIZATION,
                     }
                     for index in range(glyph_count)
                 }
                 data = {
+                    "数据版本": 3,
+                    "库名": library_name,
                     "变体详情": details,
-                    "字形组索引": {},
+                    "字形组索引": {library_name[0]: list(details)},
                     "元数据": {},
+                    "会话": {},
                     "整体协调": {},
                 }
                 (library_dir / f"{library_name}.json").write_text(

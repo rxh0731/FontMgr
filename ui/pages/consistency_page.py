@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from collections import OrderedDict
 from copy import deepcopy
 from threading import Event, Lock
@@ -75,6 +76,7 @@ from PySide6.QtWidgets import (
 import config
 from services.adjustment_service import AdjustmentService, CoordinationCancelled
 from services.glyph_service import GlyphService
+from services.library_summary_service import summarize_glyph_service
 from services.workflow_status_service import (
     COORDINATION_STATUS_FILTERS,
     INK_STATUS_ACHIEVED,
@@ -104,6 +106,7 @@ from ui.widgets.two_line_status_delegate import (
     TwoLineStatusDelegate,
     set_two_line_status,
 )
+from utils.batch_observability import format_elapsed_time
 from utils.file_utils import natural_key, pinyin_natural_key
 
 
@@ -166,11 +169,13 @@ class _CoordinationTask(QRunnable):
         self,
         ziku_name: str,
         ziku_dir: str,
-        glyph_snapshot: dict[str, Any],
+        glyph_snapshot: dict[str, Any] | None,
         variant_ids: list[str],
         adjustments: dict[str, dict[str, Any]],
         ink_config: dict[str, Any],
         coordination_baseline: dict[str, Any],
+        *,
+        return_full_state: bool = True,
     ) -> None:
         super().__init__()
         self._ziku_name = ziku_name
@@ -180,6 +185,7 @@ class _CoordinationTask(QRunnable):
         self._adjustments = adjustments
         self._ink_config = ink_config
         self._coordination_baseline = coordination_baseline
+        self._return_full_state = bool(return_full_state)
         self._cancel_event = Event()
         self._commit_lock = Lock()
         self._commit_started = False
@@ -212,7 +218,8 @@ class _CoordinationTask(QRunnable):
     def run(self) -> None:
         try:
             worker_glyph = GlyphService.open(self._ziku_name, self._ziku_dir)
-            worker_glyph.restore_state(self._glyph_snapshot)
+            if self._glyph_snapshot is not None:
+                worker_glyph.restore_state(self._glyph_snapshot)
             variants: list[dict[str, Any]] = []
             for variant_id in self._variant_ids:
                 detail = worker_glyph.get_variant(variant_id)
@@ -252,7 +259,13 @@ class _CoordinationTask(QRunnable):
         else:
             payload: dict[str, Any] = {"结果": result}
             try:
-                payload["字库状态"] = worker_glyph.snapshot_state()
+                if self._return_full_state:
+                    payload["字库状态"] = worker_glyph.snapshot_state()
+                else:
+                    payload["字形状态"] = [
+                        worker_glyph.snapshot_variant_state(variant_id)
+                        for variant_id in self._variant_ids
+                    ]
             except Exception as exc:
                 payload["已提交"] = True
                 payload["字库状态错误"] = str(exc) or type(exc).__name__
@@ -984,6 +997,7 @@ class ConsistencyPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self._glyph = glyph_service
+        summarize_glyph_service(glyph_service)
         self._adjustment_service = AdjustmentService(glyph_service)
         self._on_back = on_back
         saved_summary = self._glyph.get_coordination_summary()
@@ -1027,6 +1041,19 @@ class ConsistencyPage(QWidget):
         self._saved_ink_signatures: dict[str, tuple[Any, ...]] = {}
         self._ink_modes: dict[str, str] = {}
         self._content_sizes: dict[str, tuple[int, int]] = {}
+        self._detail_cache: OrderedDict[
+            tuple[Any, ...],
+            tuple[QImage, QImage, tuple[int, int], str],
+        ] = OrderedDict()
+        self._detail_cache_bytes = 0
+        self._detail_cache_max_bytes = 64 * 1024 * 1024
+        self._detail_cache_max_items = 64
+        self._detail_generation = 0
+        self._detail_worker: FunctionWorker | None = None
+        self._loaded_detail_id = ""
+        self._detail_pool = QThreadPool(self)
+        self._detail_pool.setMaxThreadCount(1)
+        self._detail_pool.setExpiryTimeout(15_000)
         self._preview_cache: OrderedDict[tuple[Any, ...], QImage] = OrderedDict()
         self._preview_bounds_cache: dict[
             tuple[Any, ...],
@@ -1037,7 +1064,7 @@ class ConsistencyPage(QWidget):
         self._preview_cache_max_items = 96
         self._preview_workers: dict[str, tuple[tuple[Any, ...], FunctionWorker]] = {}
         self._preview_pool = QThreadPool(self)
-        self._preview_pool.setMaxThreadCount(2)
+        self._preview_pool.setMaxThreadCount(1)
         self._preview_pool.setExpiryTimeout(15_000)
         self._list_thumbnail_cache: OrderedDict[
             tuple[Any, ...],
@@ -1076,6 +1103,7 @@ class ConsistencyPage(QWidget):
         self._coordination_task: _CoordinationTask | None = None
         self._coordination_task_total = 0
         self._coordination_task_ink: dict[str, Any] = {}
+        self._coordination_task_context: dict[str, Any] = {}
         self._baseline_task: _BaselineAnalysisTask | None = None
         self._coordination_pool = QThreadPool(self)
         self._coordination_pool.setMaxThreadCount(1)
@@ -1749,7 +1777,7 @@ class ConsistencyPage(QWidget):
         self._save_button.clicked.connect(self._save_action)
         action_layout.addWidget(self._save_button)
         self._save_next_button = QPushButton("保存并下一字")
-        self._save_next_button.clicked.connect(self._save_and_next)
+        self._save_next_button.clicked.connect(self._save_and_next_async)
         self._save_next_button.hide()
         action_layout.addWidget(self._save_next_button)
         layout.addWidget(self._action_footer)
@@ -1991,7 +2019,6 @@ class ConsistencyPage(QWidget):
             (QKeySequence.StandardKey.Save, self._save_action),
             (QKeySequence.StandardKey.Undo, self._detail_canvas_undo),
             (QKeySequence.StandardKey.Redo, self._detail_canvas_redo),
-            (QKeySequence(Qt.Key.Key_Return), lambda: self._enter_detail(self._selected_id)),
         ):
             action = QAction(self)
             action.setShortcut(sequence)
@@ -2006,6 +2033,17 @@ class ConsistencyPage(QWidget):
             application.installEventFilter(self)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(event, QKeyEvent)
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and self._glyph_list_owns_event_target(watched)
+            and not self._coordination_busy
+            and not self._baseline_analysis_pending
+        ):
+            self._open_current_list_item()
+            event.accept()
+            return True
         if (
             isinstance(event, QKeyEvent)
             and event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
@@ -2033,6 +2071,11 @@ class ConsistencyPage(QWidget):
     def _canvas_owns_event_target(self, watched: QObject) -> bool:
         return watched is self._detail_canvas or (
             isinstance(watched, QWidget) and self._detail_canvas.isAncestorOf(watched)
+        )
+
+    def _glyph_list_owns_event_target(self, watched: QObject) -> bool:
+        return watched is self._glyph_list or (
+            isinstance(watched, QWidget) and self._glyph_list.isAncestorOf(watched)
         )
 
     @staticmethod
@@ -2513,13 +2556,16 @@ class ConsistencyPage(QWidget):
         return self._variants[start:start + self._page_size()]
 
     def _render_page(self) -> None:
+        self._discard_queued_card_previews()
         tracked_columns = max(self._grid.columnCount(), self._grid_columns)
         tracked_rows = max(self._grid.rowCount(), self._grid_rows)
         while self._grid.count():
             item = self._grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
+                # 保留比较墙父级直至延迟销毁。可见控件一旦 setParent(None)，
+                # Windows 会在 deleteLater 生效前把它短暂注册为独立任务栏窗口。
+                widget.hide()
                 widget.deleteLater()
         # QGridLayout 会保留曾经出现过的行列轨道；缩为紧凑模式时必须显式
         # 清零旧轨道，否则隐藏的第 5 列和第 3 行仍会分走可用空间。
@@ -2535,6 +2581,11 @@ class ConsistencyPage(QWidget):
         total_pages = math.ceil(len(self._variants) / self._page_size()) if self._variants else 0
         self._page_index = max(0, min(self._page_index, max(0, total_pages - 1)))
         page = self._page_variants()
+        page_ids = {
+            str(detail.get("变体ID", ""))
+            for detail in page
+            if detail.get("变体ID")
+        }
         for index in range(self._page_size()):
             if index < len(page):
                 detail = page[index]
@@ -2544,7 +2595,7 @@ class ConsistencyPage(QWidget):
                     (self._canvas_width, self._canvas_height),
                 )
                 card = slot
-                card.selected.connect(self._select_variant)
+                card.selected.connect(self._select_variant_deferred)
                 card.edit_requested.connect(self._enter_detail)
                 card.transform_started.connect(self._begin_comparison_transform)
                 card.transform_changed.connect(self._apply_comparison_transform)
@@ -2561,10 +2612,7 @@ class ConsistencyPage(QWidget):
                     self._detail_canvas.transform_cursor_for_hit,
                 )
                 self._cards[variant_id] = card
-                self._update_card(
-                    variant_id,
-                    render_sync=variant_id == self._selected_id,
-                )
+                self._update_card_metadata(variant_id)
             else:
                 slot = QWidget()
                 slot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -2573,6 +2621,11 @@ class ConsistencyPage(QWidget):
             slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._grid_slots.append(slot)
             self._grid.addWidget(slot, index // self._grid_columns, index % self._grid_columns)
+        if self._selected_id in page_ids:
+            self._update_card(self._selected_id, render_sync=False)
+        for variant_id in page_ids:
+            if variant_id != self._selected_id:
+                self._update_card(variant_id, render_sync=False)
         for column in range(self._grid_columns):
             self._grid.setColumnStretch(column, 1)
         for row in range(self._grid_rows):
@@ -2588,6 +2641,35 @@ class ConsistencyPage(QWidget):
         )
         self._status_label.setText(f"本页 {len(page)} 字　未保存调整 {dirty} 字")
         self._refresh_selection()
+
+    def _discard_queued_card_previews(self) -> None:
+        """翻页时丢弃尚未开始的旧预览；运行中的迟到结果由身份检查忽略。"""
+        self._preview_pool.clear()
+        self._preview_workers.clear()
+
+    def _update_card_metadata(self, variant_id: str) -> None:
+        card = self._cards.get(variant_id)
+        detail = self._variant_by_id.get(variant_id)
+        if card is None or detail is None:
+            return
+        adjustment = self._get_adjustment(variant_id)
+        card.set_transform(
+            {
+                "x": adjustment.get("移动X", 0.0),
+                "y": adjustment.get("移动Y", 0.0),
+                "scale": adjustment.get("等比缩放", 1.0),
+                "rotation": adjustment.get("旋转", 0.0),
+                "stretch_w": adjustment.get("水平拉伸", 1.0),
+                "stretch_h": adjustment.get("垂直拉伸", 1.0),
+                "distort": adjustment.get("扭曲", [0.0] * 8),
+            }
+        )
+        card.set_metadata(
+            str(detail.get("归属字", "")),
+            str(detail.get("原始文件", "")),
+            self._coordination_status(detail),
+        )
+        card.set_selected(variant_id == self._selected_id)
 
     def _update_card(self, variant_id: str, *, render_sync: bool = True) -> None:
         card = self._cards.get(variant_id)
@@ -2619,24 +2701,7 @@ class ConsistencyPage(QWidget):
         if image is not None:
             card.set_preview(image, bounds)
             self._set_list_thumbnail_from_preview(variant_id, image)
-        adjustment = self._get_adjustment(variant_id)
-        card.set_transform(
-            {
-                "x": adjustment.get("移动X", 0.0),
-                "y": adjustment.get("移动Y", 0.0),
-                "scale": adjustment.get("等比缩放", 1.0),
-                "rotation": adjustment.get("旋转", 0.0),
-                "stretch_w": adjustment.get("水平拉伸", 1.0),
-                "stretch_h": adjustment.get("垂直拉伸", 1.0),
-                "distort": adjustment.get("扭曲", [0.0] * 8),
-            }
-        )
-        card.set_metadata(
-            str(detail.get("归属字", "")),
-            str(detail.get("原始文件", "")),
-            self._coordination_status(detail),
-        )
-        card.set_selected(variant_id == self._selected_id)
+        self._update_card_metadata(variant_id)
         if variant_id == self._selected_id:
             self._sync_selected_card_controls(
                 live=self._comparison_transform_active,
@@ -2682,7 +2747,10 @@ class ConsistencyPage(QWidget):
             )
         )
         self._preview_workers[variant_id] = (cache_key, worker)
-        self._preview_pool.start(worker)
+        self._preview_pool.start(
+            worker,
+            10 if variant_id == self._selected_id else 0,
+        )
 
     def _card_preview_finished(
         self,
@@ -2709,6 +2777,12 @@ class ConsistencyPage(QWidget):
         if card is not None:
             card.set_preview(image, bounds)
             self._set_list_thumbnail_from_preview(variant_id, image)
+        if (
+            variant_id == self._reference_variant_id
+            and self._reference_overlay_check.isChecked()
+        ):
+            self._detail_canvas.set_reference_image(image, opacity=0.35)
+            self._detail_canvas.set_reference_visible(True)
 
     def _card_preview_failed(
         self,
@@ -2720,7 +2794,12 @@ class ConsistencyPage(QWidget):
         if pending is not None and pending == (cache_key, worker):
             self._preview_workers.pop(variant_id, None)
 
-    def _select_variant(self, variant_id: str) -> None:
+    def _select_variant(
+        self,
+        variant_id: str,
+        *,
+        load_detail: bool = True,
+    ) -> None:
         if not variant_id or variant_id not in self._variant_by_id:
             return
         if variant_id != self._selected_id:
@@ -2744,9 +2823,22 @@ class ConsistencyPage(QWidget):
         if not self._reference_pin_button.isChecked() and self._reference_variant_id == variant_id:
             self._reference_variant_id = ""
             self._populate_reference_combo()
-        if selection_changed or not self._detail_canvas.has_image:
+        if load_detail and (
+            selection_changed
+            or not self._detail_canvas.has_image
+            or self._loaded_detail_id != variant_id
+        ):
             self._load_detail_canvas(variant_id)
         self._refresh_selection()
+
+    def _select_variant_deferred(self, variant_id: str) -> None:
+        """先完成选择反馈，再在后台准备精调画布。"""
+        if not variant_id or variant_id not in self._variant_by_id:
+            return
+        selection_changed = variant_id != self._selected_id
+        self._select_variant(variant_id, load_detail=False)
+        if selection_changed or self._loaded_detail_id != variant_id:
+            self._request_detail_canvas(variant_id)
 
     def _select_list_item(
         self,
@@ -2766,7 +2858,7 @@ class ConsistencyPage(QWidget):
                 )
                 self._schedule_list_thumbnail_loads()
                 return
-            self._select_variant(variant_id)
+            self._select_variant_deferred(variant_id)
             self._schedule_list_thumbnail_loads()
             return
 
@@ -2789,7 +2881,7 @@ class ConsistencyPage(QWidget):
             self._glyph_list.setCurrentItem(fallback)
             current.setExpanded(group_was_expanded)
         if fallback_id and fallback_id != self._selected_id:
-            self._select_variant(fallback_id)
+            self._select_variant_deferred(fallback_id)
 
     def _show_glyph_context_menu(self, position: object) -> None:
         node = self._glyph_list.itemAt(position)
@@ -2842,6 +2934,11 @@ class ConsistencyPage(QWidget):
         if variant_id in self._variant_by_id:
             self._enter_detail(variant_id)
 
+    def _open_current_list_item(self) -> None:
+        item = self._glyph_list.currentItem()
+        if item is not None:
+            self._open_list_item(item, 0)
+
     def _refresh_selection(self) -> None:
         for variant_id, card in self._cards.items():
             card.set_selected(variant_id == self._selected_id)
@@ -2857,7 +2954,10 @@ class ConsistencyPage(QWidget):
         card = self._cards.get(self._selected_id)
         if card is None:
             return
-        if not self._detail_canvas.has_image:
+        if (
+            not self._detail_canvas.has_image
+            or self._loaded_detail_id != self._selected_id
+        ):
             card.set_control_polygon(None)
             return
         polygon, _handles, _rotate = self._detail_canvas.transform_controls_in_view(
@@ -2879,6 +2979,7 @@ class ConsistencyPage(QWidget):
         if (
             card.variant_id != self._selected_id
             or not self._detail_canvas.has_image
+            or self._loaded_detail_id != self._selected_id
         ):
             return ""
         origin, scale = card.transform_view()
@@ -2895,8 +2996,11 @@ class ConsistencyPage(QWidget):
             self._comparison_mode_button.setChecked(True)
             return
         if variant_id != self._selected_id:
-            self._select_variant(variant_id)
-        elif not self._detail_canvas.has_image:
+            self._select_variant(variant_id, load_detail=True)
+        elif (
+            not self._detail_canvas.has_image
+            or self._loaded_detail_id != variant_id
+        ):
             self._load_detail_canvas(variant_id)
         self._view_stack.setCurrentWidget(self._detail_view)
         self._detail_mode_button.setChecked(True)
@@ -2916,6 +3020,15 @@ class ConsistencyPage(QWidget):
         self._schedule_capacity_update()
 
     def _load_detail_canvas(self, variant_id: str) -> None:
+        self._detail_generation += 1
+        self._detail_pool.clear()
+        self._detail_worker = None
+        cache_key = self._detail_cache_key(variant_id)
+        cached = self._detail_cache.get(cache_key)
+        if cached is not None:
+            self._detail_cache.move_to_end(cache_key)
+            self._apply_detail_canvas_data(variant_id, cached)
+            return
         detail = self._variant_by_id.get(variant_id)
         if detail is None:
             self._clear_detail()
@@ -2925,16 +3038,141 @@ class ConsistencyPage(QWidget):
             self._clear_detail()
             self._detail_source_label.setText("来源：审核图像无法读取")
             return
-        ink_config = self._current_ink_config(variant_id)
-        working = self._adjustment_service.prepare_ink_working_copy(
-            source,
-            ink_config,
+        working: Image.Image | None = None
+        try:
+            working = self._adjustment_service.prepare_ink_working_copy(
+                source,
+                self._current_ink_config(variant_id),
+            )
+            bounding_box = working.getchannel("A").getbbox()
+            content_size = (
+                max(1, bounding_box[2] - bounding_box[0]),
+                max(1, bounding_box[3] - bounding_box[1]),
+            ) if bounding_box else (1, 1)
+            data = (
+                self._pil_to_qimage(source),
+                self._pil_to_qimage(working),
+                content_size,
+                path,
+            )
+        finally:
+            if working is not None:
+                working.close()
+            source.close()
+        self._store_detail_cache(cache_key, data)
+        self._apply_detail_canvas_data(variant_id, data)
+
+    def _request_detail_canvas(self, variant_id: str) -> None:
+        self._detail_generation += 1
+        generation = self._detail_generation
+        self._detail_pool.clear()
+        self._detail_worker = None
+        cache_key = self._detail_cache_key(variant_id)
+        cached = self._detail_cache.get(cache_key)
+        if cached is not None:
+            self._detail_cache.move_to_end(cache_key)
+            self._apply_detail_canvas_data(variant_id, cached)
+            return
+        detail = deepcopy(self._variant_by_id.get(variant_id, {}))
+        ink_config = deepcopy(self._current_ink_config(variant_id))
+        if not detail:
+            return
+        self._loaded_detail_id = ""
+        self._sync_selected_card_controls(live=False)
+        self._detail_source_label.setText("来源：正在载入审核图像…")
+
+        def load() -> object:
+            source, path = self._adjustment_service.load_reviewed_source(detail)
+            if source is None:
+                return None
+            working: Image.Image | None = None
+            try:
+                working = self._adjustment_service.prepare_ink_working_copy(
+                    source,
+                    ink_config,
+                )
+                bounding_box = working.getchannel("A").getbbox()
+                content_size = (
+                    (
+                        max(1, bounding_box[2] - bounding_box[0]),
+                        max(1, bounding_box[3] - bounding_box[1]),
+                    )
+                    if bounding_box
+                    else (1, 1)
+                )
+                return (
+                    self._pil_to_qimage(source),
+                    self._pil_to_qimage(working),
+                    content_size,
+                    path,
+                )
+            finally:
+                if working is not None:
+                    working.close()
+                source.close()
+
+        worker = FunctionWorker(load)
+        worker.setAutoDelete(False)
+        worker.signals.finished.connect(
+            lambda result, token=generation, target=variant_id, key=cache_key, task=worker: (
+                self._detail_canvas_ready(token, target, key, result, task)
+            )
         )
-        bounding_box = working.getchannel("A").getbbox()
-        content_size = (
-            max(1, bounding_box[2] - bounding_box[0]),
-            max(1, bounding_box[3] - bounding_box[1]),
-        ) if bounding_box else (1, 1)
+        worker.signals.failed.connect(
+            lambda message, token=generation, target=variant_id, task=worker: (
+                self._detail_canvas_failed(token, target, message, task)
+            )
+        )
+        self._detail_worker = worker
+        self._detail_pool.start(worker)
+
+    def _detail_canvas_ready(
+        self,
+        generation: int,
+        variant_id: str,
+        cache_key: tuple[Any, ...],
+        result: object,
+        worker: FunctionWorker,
+    ) -> None:
+        if self._detail_worker is worker:
+            self._detail_worker = None
+        if generation != self._detail_generation or variant_id != self._selected_id:
+            return
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 4
+            or not isinstance(result[0], QImage)
+            or not isinstance(result[1], QImage)
+        ):
+            self._clear_detail()
+            self._detail_source_label.setText("来源：审核图像无法读取")
+            return
+        data = (result[0], result[1], result[2], str(result[3]))
+        self._store_detail_cache(cache_key, data)
+        self._apply_detail_canvas_data(variant_id, data)
+
+    def _detail_canvas_failed(
+        self,
+        generation: int,
+        variant_id: str,
+        _message: str,
+        worker: FunctionWorker,
+    ) -> None:
+        if self._detail_worker is worker:
+            self._detail_worker = None
+        if generation != self._detail_generation or variant_id != self._selected_id:
+            return
+        self._clear_detail()
+        self._detail_source_label.setText("来源：审核图像无法读取")
+
+    def _apply_detail_canvas_data(
+        self,
+        variant_id: str,
+        data: tuple[QImage, QImage, tuple[int, int], str],
+    ) -> None:
+        if variant_id != self._selected_id:
+            return
+        source_image, working_image, content_size, path = data
         self._content_sizes[variant_id] = content_size
 
         saved = deepcopy(self._saved_adjustments.get(variant_id, self._default_adjustment()))
@@ -2948,14 +3186,17 @@ class ConsistencyPage(QWidget):
         self._adjustments[variant_id] = deepcopy(canonical_current)
 
         self._loading_detail = True
+        self._loaded_detail_id = variant_id
         try:
-            source_image = self._pil_to_qimage(source)
             self._detail_canvas.set_image(
-                self._pil_to_qimage(working),
+                working_image,
                 (self._canvas_width, self._canvas_height),
                 source_preview=source_image,
             )
-            self._set_detail_ink_postprocessor(variant_id, ink_config)
+            self._set_detail_ink_postprocessor(
+                variant_id,
+                self._current_ink_config(variant_id),
+            )
             self._detail_canvas.set_tool(ReviewCanvas.TOOL_TRANSFORM)
             if saved_canvas != self._identity_canvas_transform():
                 self._detail_canvas.set_transform(**saved_canvas)
@@ -2964,8 +3205,6 @@ class ConsistencyPage(QWidget):
                 self._detail_canvas.set_transform(**current_canvas)
         finally:
             self._loading_detail = False
-            working.close()
-            source.close()
         self._sync_transform_controls(self._detail_canvas.transform())
         self._sync_selected_card_controls(live=False)
         self._update_reference_overlay()
@@ -2974,6 +3213,7 @@ class ConsistencyPage(QWidget):
         self._refresh_current_labels()
 
     def _clear_detail(self) -> None:
+        self._loaded_detail_id = ""
         self._loading_detail = True
         try:
             self._detail_canvas.clear_image()
@@ -3294,17 +3534,14 @@ class ConsistencyPage(QWidget):
             if not self._reference_variant_id:
                 self._detail_canvas.set_reference_image(None)
             return
-        detail = self._variant_by_id[self._reference_variant_id]
-        preview = self._adjustment_service.preview_coordinated(
-            detail,
-            self._get_adjustment(self._reference_variant_id),
-            self.WORK_RATIO,
-            self._current_ink_config(self._reference_variant_id),
-        )
-        if preview is None:
-            self._detail_canvas.set_reference_image(None)
+        cache_key = self._coordinated_preview_cache_key(self._reference_variant_id)
+        image = self._preview_cache.get(cache_key)
+        if image is None:
+            self._detail_canvas.set_reference_visible(False)
+            self._request_card_preview(self._reference_variant_id, cache_key)
             return
-        self._detail_canvas.set_reference_image(self._pil_to_qimage(preview[0]), opacity=0.35)
+        self._preview_cache.move_to_end(cache_key)
+        self._detail_canvas.set_reference_image(image, opacity=0.35)
         self._detail_canvas.set_reference_visible(True)
 
     def _ink_mode_changed(self, _checked: bool) -> None:
@@ -3406,9 +3643,31 @@ class ConsistencyPage(QWidget):
 
     def _save_action(self) -> None:
         if self._view_stack.currentWidget() is self._detail_view:
-            self._save_selected()
+            detail = self._variant_by_id.get(self._selected_id)
+            if detail is not None:
+                self._start_interactive_save(
+                    [detail],
+                    title="保存本字",
+                    show_success=True,
+                    navigation="stay",
+                )
         else:
-            self._save_current_page()
+            saved_page_index = self._page_index
+            page_variants = self._page_variants()
+            next_page_start = (saved_page_index + 1) * self._page_size()
+            next_variant_id = (
+                str(self._variants[next_page_start].get("变体ID", ""))
+                if next_page_start < len(self._variants)
+                else ""
+            )
+            self._start_interactive_save(
+                page_variants,
+                title="保存本页",
+                show_success=True,
+                navigation="page",
+                saved_page_index=saved_page_index,
+                next_variant_id=next_variant_id,
+            )
 
     def _save_selected(self, show_success: bool = True) -> bool:
         detail = self._variant_by_id.get(self._selected_id)
@@ -3432,27 +3691,33 @@ class ConsistencyPage(QWidget):
         )
         if not saved:
             return False
+        self._advance_after_page_save(saved_page_index, next_variant_id)
+        return saved
 
+    def _advance_after_page_save(
+        self,
+        saved_page_index: int,
+        next_variant_id: str,
+    ) -> None:
         next_variant_index = self._variant_index(next_variant_id)
         if next_variant_index >= 0:
             self._select_variant(next_variant_id)
-            return True
+            return
 
-        if self._variants:
-            last_page_index = math.ceil(len(self._variants) / self._page_size()) - 1
-            target_page_index = min(saved_page_index, last_page_index)
-            selected_index = self._variant_index(self._selected_id)
-            selected_page_index = (
-                selected_index // self._page_size() if selected_index >= 0 else -1
-            )
-            if selected_page_index != target_page_index:
-                target_index = target_page_index * self._page_size()
-                target_variant_id = str(
-                    self._variants[target_index].get("变体ID", "")
-                )
-                if target_variant_id:
-                    self._select_variant(target_variant_id)
-        return saved
+        if not self._variants:
+            return
+        last_page_index = math.ceil(len(self._variants) / self._page_size()) - 1
+        target_page_index = min(saved_page_index, last_page_index)
+        selected_index = self._variant_index(self._selected_id)
+        selected_page_index = (
+            selected_index // self._page_size() if selected_index >= 0 else -1
+        )
+        if selected_page_index == target_page_index:
+            return
+        target_index = target_page_index * self._page_size()
+        target_variant_id = str(self._variants[target_index].get("变体ID", ""))
+        if target_variant_id:
+            self._select_variant(target_variant_id)
 
     def _save_variants(
         self,
@@ -3511,8 +3776,7 @@ class ConsistencyPage(QWidget):
         ):
             self._detail_canvas.set_saved_baseline(bake=False)
 
-        self._clear_preview_cache()
-        self._reload_variants()
+        self._refresh_after_saved_variants(successful_ids)
 
         if result["失败"]:
             details = "\n".join(
@@ -3534,6 +3798,136 @@ class ConsistencyPage(QWidget):
             )
         return True
 
+    def _refresh_after_saved_variants(self, variant_ids: list[str]) -> None:
+        """局部刷新已保存字形，避免每次保存后重新读取和重建整库。"""
+
+        saved_ids = {variant_id for variant_id in variant_ids if variant_id}
+        if not saved_ids:
+            return
+        self._workflow_summary = self._glyph.get_coordination_summary()
+        self._workflow_status_cache.clear()
+        for variant_id in saved_ids:
+            self._clear_variant_preview_cache(variant_id)
+            thumbnail_key = self._list_thumbnail_key_by_variant.pop(
+                variant_id,
+                None,
+            )
+            if thumbnail_key is not None:
+                self._list_thumbnail_cache.pop(thumbnail_key, None)
+            self._list_thumbnail_failures = {
+                key
+                for key in self._list_thumbnail_failures
+                if not key or str(key[0]) != variant_id
+            }
+
+        # 非“全部”筛选下，保存可能使字形进入或离开当前结果集，必须重算成员。
+        if self._filter_combo.currentText() != PHASE_FILTER_ALL:
+            self._refresh_filtered_view(
+                preserve_selection=True,
+                reload_detail=self._selected_id in saved_ids,
+            )
+            return
+
+        self._refresh_saved_list_items(saved_ids)
+        self._render_page()
+        if self._selected_id:
+            if (
+                self._selected_id in saved_ids
+                and self._view_stack.currentWidget() is self._detail_view
+            ):
+                self._load_detail_canvas(self._selected_id)
+            else:
+                self._refresh_current_labels()
+        if self._reference_variant_id in saved_ids:
+            self._update_reference_overlay()
+        self._refresh_statistics()
+        self._schedule_list_thumbnail_loads()
+
+    def _refresh_saved_list_items(self, variant_ids: set[str]) -> None:
+        """原位更新保存结果对应的列表行和分组统计。"""
+
+        affected_chars: set[str] = set()
+        group_positions: dict[str, int] = {}
+        variant_positions: dict[str, int] = {}
+        for detail in self._list_variants:
+            char = str(detail.get("归属字", "")) or "?"
+            group_positions[char] = group_positions.get(char, 0) + 1
+            variant_positions[str(detail.get("变体ID", ""))] = group_positions[char]
+
+        for variant_id in variant_ids:
+            detail = self._list_variant_by_id.get(variant_id)
+            item = self._list_items_by_id.get(variant_id)
+            if detail is None or item is None:
+                continue
+            char = str(detail.get("归属字", "")) or "?"
+            filename = str(detail.get("原始文件", ""))
+            position = variant_positions.get(variant_id, 1)
+            projection = self._stage_projection(detail)
+            status = projection.status
+            markers = self._marker_text(projection)
+            item.setIcon(0, self._glyph_thumbnail(detail))
+            item.setToolTip(
+                0,
+                f"{char} · 字形{position}\n文件：{filename}\n"
+                f"整体协调：{status}\n提示：{markers}\n"
+                "协调：可编辑\n"
+                f"{self._ink_result_text(detail)}\n{variant_id}",
+            )
+            set_two_line_status(
+                item,
+                1,
+                status,
+                markers,
+                self._coordination_status_color(status),
+                self._marker_color(projection),
+            )
+            affected_chars.add(char)
+
+        for char in affected_chars:
+            group_items = [
+                detail
+                for detail in self._list_variants
+                if (str(detail.get("归属字", "")) or "?") == char
+            ]
+            visible_children = [
+                self._list_items_by_id.get(str(detail.get("变体ID", "")))
+                for detail in group_items
+            ]
+            parent = next(
+                (
+                    child.parent()
+                    for child in visible_children
+                    if child is not None and child.parent() is not None
+                ),
+                None,
+            )
+            if parent is None:
+                continue
+            projections = [self._stage_projection(detail) for detail in group_items]
+            coordinated_count = sum(projection.completed for projection in projections)
+            problem_count = sum(
+                self._is_problem_status(projection) for projection in projections
+            )
+            set_two_line_status(
+                parent,
+                1,
+                f"已协调 {coordinated_count}/{len(group_items)}",
+                f"问题 {problem_count}",
+                self._coordination_status_color(
+                    STATUS_COORDINATED
+                    if coordinated_count == len(group_items)
+                    else STAGE_PENDING_COORDINATION
+                ),
+                QColor("#F2B84B" if problem_count else "#A6B0BE"),
+            )
+            parent.setToolTip(
+                0,
+                f"{char}：共 {len(group_items)} 个字形，当前显示 {parent.childCount()} 个\n"
+                f"已协调 {coordinated_count}，待协调 "
+                f"{len(group_items) - coordinated_count}\n"
+                f"有问题 {problem_count}",
+            )
+
     def _save_and_next(self) -> None:
         if not self._selected_id:
             return
@@ -3545,6 +3939,94 @@ class ConsistencyPage(QWidget):
         if target_id in self._variant_by_id:
             self._select_variant(target_id)
             self._enter_detail(target_id)
+
+    def _save_and_next_async(self) -> None:
+        if not self._selected_id:
+            return
+        current_id = self._selected_id
+        next_id = self._next_navigation_id(current_id)
+        detail = self._variant_by_id.get(current_id)
+        if detail is None:
+            return
+        self._start_interactive_save(
+            [detail],
+            title="保存本字",
+            show_success=False,
+            navigation="next",
+            current_variant_id=current_id,
+            next_variant_id=next_id,
+        )
+
+    def _start_interactive_save(
+        self,
+        variants: list[dict[str, Any]],
+        *,
+        title: str,
+        show_success: bool,
+        navigation: str,
+        saved_page_index: int = 0,
+        current_variant_id: str = "",
+        next_variant_id: str = "",
+    ) -> None:
+        """在后台保存本字或本页，完成后再刷新和执行导航。"""
+
+        if self._coordination_busy:
+            return
+        self._finish_pending_comparison_transform()
+        if not variants:
+            return
+        variant_ids = [
+            str(detail.get("变体ID", ""))
+            for detail in variants
+            if str(detail.get("变体ID", ""))
+        ]
+        if not variant_ids:
+            return
+        requested_ids = set(variant_ids)
+        task = _CoordinationTask(
+            self._glyph.ziku_name,
+            self._glyph.ziku_dir,
+            None,
+            variant_ids,
+            {
+                variant_id: deepcopy(self._get_adjustment(variant_id))
+                for variant_id in variant_ids
+            },
+            deepcopy(self._current_ink_config(variant_ids=requested_ids)),
+            deepcopy(self._coordination_baseline),
+            return_full_state=False,
+        )
+        self._coordination_task = task
+        self._coordination_task_total = len(variant_ids)
+        self._coordination_task_context = {
+            "类型": "交互保存",
+            "标题": title,
+            "显示成功": bool(show_success),
+            "导航": navigation,
+            "字形ID": variant_ids,
+            "保存页": int(saved_page_index),
+            "当前字形": current_variant_id,
+            "下一字形": next_variant_id,
+        }
+        task.signals.progress.connect(self._coordination_progress_changed)
+        task.signals.finished.connect(self._coordination_finished)
+        task.signals.failed.connect(self._coordination_failed)
+
+        self._preview_timer.stop()
+        self._list_thumbnail_timer.stop()
+        self._task_progress_panel.show()
+        self._task_stage_label.setText(f"{title}：准备")
+        self._task_progress_bar.setRange(0, 100)
+        self._task_progress_bar.setValue(0)
+        self._task_progress_bar.setFormat(f"{title} %p%")
+        self._task_detail_label.setText(f"0 / {len(variant_ids)} · 正在核对保存内容")
+        self._task_detail_label.setToolTip("")
+        self._set_coordination_busy(True)
+        self._set_coordination_stop_state(running=True)
+        try:
+            self._coordination_pool.start(task)
+        except Exception as exc:
+            self._coordination_failed(str(exc))
 
     def _complete_coordination(self) -> None:
         self._finish_pending_comparison_transform()
@@ -3592,6 +4074,10 @@ class ConsistencyPage(QWidget):
         self._coordination_task = task
         self._coordination_task_total = len(variant_ids)
         self._coordination_task_ink = ink_config
+        self._coordination_task_context = {
+            "类型": "批量协调",
+            "开始时间": time.perf_counter(),
+        }
         task.signals.progress.connect(self._coordination_progress_changed)
         task.signals.finished.connect(self._coordination_finished)
         task.signals.failed.connect(self._coordination_failed)
@@ -3776,6 +4262,10 @@ class ConsistencyPage(QWidget):
 
     def _coordination_finished(self, result: object) -> None:
         payload = result if isinstance(result, dict) else {}
+        if self._coordination_task_context.get("类型") == "交互保存":
+            self._interactive_save_finished(payload)
+            return
+        elapsed_text = self._coordination_elapsed_text()
         raw_data = payload.get("结果")
         data = raw_data if isinstance(raw_data, dict) else {}
         if bool(payload.get("已停止")) or bool(data.get("已停止")):
@@ -3788,7 +4278,7 @@ class ConsistencyPage(QWidget):
                 self,
                 "整体协调已停止",
                 "已停止，本批次未提交任何成品或字库索引。"
-                "已有成品和页面草稿保持不变。",
+                f"已有成品和页面草稿保持不变。\n\n{elapsed_text}",
             )
             return
         failed = self._result_count(data.get("失败"))
@@ -3804,6 +4294,7 @@ class ConsistencyPage(QWidget):
                 message += f"\n\n失败详情：\n{details}"
             if reload_error:
                 message += f"\n\n页面刷新失败：{reload_error}。可返回首页后重新进入。"
+            message += f"\n\n{elapsed_text}"
             QMessageBox.critical(self, "完成整体协调失败", message)
             return
 
@@ -3817,7 +4308,8 @@ class ConsistencyPage(QWidget):
                 self,
                 "整体协调页面刷新失败",
                 f"全库成品已经提交，但后台状态快照失败：{state_error}。\n"
-                "页面已经解锁，请返回首页后重新进入以读取最新结果。",
+                "页面已经解锁，请返回首页后重新进入以读取最新结果。\n\n"
+                f"{elapsed_text}",
             )
             return
         try:
@@ -3894,7 +4386,7 @@ class ConsistencyPage(QWidget):
                 self,
                 "整体协调页面刷新失败",
                 f"全库成品已经提交，但页面刷新失败：{exc}。\n"
-                "返回首页后重新进入即可读取最新结果。",
+                f"返回首页后重新进入即可读取最新结果。\n\n{elapsed_text}",
             )
             return
 
@@ -3944,7 +4436,7 @@ class ConsistencyPage(QWidget):
                 f"当前已协调 {coordinated_count} 个，仍有 {remaining_count} 个待协调："
                 f"{reason_text}。\n\n"
                 "请在字形列表中核对这些字形；确认可接受的墨色例外后，"
-                "再完成其协调状态。",
+                f"再完成其协调状态。\n\n{elapsed_text}",
             )
             return
 
@@ -3953,9 +4445,149 @@ class ConsistencyPage(QWidget):
             f"{success} / {self._coordination_task_total} · 批次提交完成",
         )
         self.summary_changed.emit(self._glyph)
-        QMessageBox.information(self, "完成整体协调", "全库整体协调结果已生成。")
+        QMessageBox.information(
+            self,
+            "完成整体协调",
+            f"全库整体协调结果已生成。\n\n{elapsed_text}",
+        )
+
+    def _interactive_save_finished(self, payload: dict[str, Any]) -> None:
+        """接收本字或本页后台保存结果，并只更新涉及的字形。"""
+
+        context = dict(self._coordination_task_context)
+        title = str(context.get("标题", "保存整体协调结果"))
+        raw_data = payload.get("结果")
+        data = raw_data if isinstance(raw_data, dict) else {}
+        if bool(payload.get("已停止")) or bool(data.get("已停止")):
+            self._finish_coordination_task(
+                False,
+                "已停止，本次保存未提交",
+                stopped=True,
+            )
+            QMessageBox.information(
+                self,
+                f"{title}已停止",
+                "本次保存已停止，未提交任何成品或字库索引。",
+            )
+            return
+
+        failed = self._result_count(data.get("失败"))
+        success = self._result_count(data.get("成功"))
+        expected = self._coordination_task_total
+        if failed or success != expected:
+            if not failed:
+                failed = max(1, expected - success)
+            reload_error = self._try_reload_after_coordination()
+            self._finish_coordination_task(False, f"失败 {failed} 个")
+            details = self._coordination_failure_text(data.get("失败详情"))
+            message = f"本次保存未提交任何成品。\n成功 {success} 个，失败 {failed} 个。"
+            if details:
+                message += f"\n\n失败详情：\n{details}"
+            if reload_error:
+                message += f"\n\n页面刷新失败：{reload_error}。可返回首页后重新进入。"
+            QMessageBox.critical(self, f"{title}失败", message)
+            return
+
+        snapshots = payload.get("字形状态")
+        if not isinstance(snapshots, list) or len(snapshots) != expected:
+            state_error = str(
+                payload.get("字库状态错误") or "后台任务未返回有效字形状态"
+            )
+            self._finish_coordination_task(False, "成品已提交，页面刷新失败")
+            QMessageBox.critical(
+                self,
+                f"{title}后页面刷新失败",
+                f"成品已经提交，但后台状态快照失败：{state_error}。\n"
+                "请返回首页后重新进入以读取最新结果。",
+            )
+            return
+
+        try:
+            for snapshot in snapshots:
+                if not isinstance(snapshot, dict):
+                    raise TypeError("后台返回了无效的字形状态")
+                self._glyph.restore_variant_state(snapshot)
+            successful_ids = [str(value) for value in context.get("字形ID", [])]
+            for variant_id in successful_ids:
+                detail = self._glyph.get_variant(variant_id)
+                if detail is None:
+                    raise KeyError(f"保存后找不到字形：{variant_id}")
+                saved = self._adjustment_service.load_saved_coordination_adjustments(
+                    detail
+                )
+                self._adjustments[variant_id] = deepcopy(saved)
+                self._saved_adjustments[variant_id] = deepcopy(saved)
+                self._saved_signatures[variant_id] = self._adjustment_signature(saved)
+                self._ink_modes[variant_id] = self._stored_ink_mode(detail)
+                self._saved_ink_signatures[variant_id] = self._stored_ink_signature(
+                    detail
+                )
+            self._initial_ink_enabled = self._ink_check.isChecked()
+            self._refresh_after_saved_variants(successful_ids)
+        except Exception as exc:
+            self._finish_coordination_task(False, "成品已提交，页面刷新失败")
+            QMessageBox.critical(
+                self,
+                f"{title}后页面刷新失败",
+                f"成品已经提交，但页面刷新失败：{exc}。\n"
+                "返回首页后重新进入即可读取最新结果。",
+            )
+            return
+
+        navigation = str(context.get("导航", "stay"))
+        reached_end = False
+        if navigation == "next":
+            current_id = str(context.get("当前字形", ""))
+            next_id = str(context.get("下一字形", ""))
+            next_index = self._variant_index(next_id)
+            reached_end = next_index < 0
+            target_id = next_id if next_index >= 0 else current_id
+            if target_id in self._variant_by_id:
+                self._select_variant(target_id)
+                self._enter_detail(target_id)
+        elif navigation == "page":
+            next_id = str(context.get("下一字形", ""))
+            reached_end = self._variant_index(next_id) < 0
+            self._advance_after_page_save(
+                int(context.get("保存页", 0) or 0),
+                next_id,
+            )
+
+        self._finish_coordination_task(True, f"{success} / {expected} · 保存完成")
+        self.summary_changed.emit(self._glyph)
+        if bool(context.get("显示成功", False)):
+            suffix = "\n当前已是最后一页。" if navigation == "page" and reached_end else ""
+            QMessageBox.information(
+                self,
+                title,
+                f"已保存 {success} 个字形。{suffix}",
+            )
+        elif navigation == "next" and reached_end:
+            QMessageBox.information(
+                self,
+                "整体协调",
+                "当前字形已保存，已到当前搜索和筛选范围的最后一条。",
+            )
 
     def _coordination_failed(self, message: str) -> None:
+        if self._coordination_task_context.get("类型") == "交互保存":
+            title = str(self._coordination_task_context.get("标题", "保存整体协调结果"))
+            reload_error = self._try_reload_after_coordination()
+            rollback_incomplete = "回滚未完全完成" in message
+            self._finish_coordination_task(
+                False,
+                "回滚未完全完成" if rollback_incomplete else "事务已回滚",
+            )
+            detail = (
+                f"保存失败，且回滚未完全完成：{message}"
+                if rollback_incomplete
+                else f"保存失败，未保留部分结果：{message}"
+            )
+            if reload_error:
+                detail += f"\n\n页面刷新失败：{reload_error}。可返回首页后重新进入。"
+            QMessageBox.critical(self, f"{title}失败", detail)
+            return
+        elapsed_text = self._coordination_elapsed_text()
         reload_error = self._try_reload_after_coordination()
         rollback_incomplete = "回滚未完全完成" in message
         if rollback_incomplete:
@@ -3969,11 +4601,20 @@ class ConsistencyPage(QWidget):
             detail = f"整体协调批次执行失败，未保留部分结果：{message}"
         if reload_error:
             detail += f"\n\n页面刷新失败：{reload_error}。可返回首页后重新进入。"
+        detail += f"\n\n{elapsed_text}"
         QMessageBox.critical(
             self,
             "完成整体协调失败",
             detail,
         )
+
+    def _coordination_elapsed_text(self) -> str:
+        try:
+            started_at = float(self._coordination_task_context.get("开始时间", 0.0))
+        except (TypeError, ValueError):
+            started_at = 0.0
+        elapsed = max(0.0, time.perf_counter() - started_at) if started_at > 0.0 else 0.0
+        return f"总耗时：{format_elapsed_time(elapsed)}"
 
     def _try_reload_after_coordination(self) -> str:
         """批次失败后尽力刷新；失败也不能阻断控件解锁。"""
@@ -4012,6 +4653,7 @@ class ConsistencyPage(QWidget):
         self._task_detail_label.setToolTip(detail)
         self._coordination_task_total = 0
         self._coordination_task_ink = {}
+        self._coordination_task_context = {}
         self._task_progress_panel.hide()
         self._schedule_list_thumbnail_loads()
 
@@ -4270,7 +4912,10 @@ class ConsistencyPage(QWidget):
         if self._is_dirty(self._selected_id):
             result_text += "\n当前设置尚未保存，保存后会重新实测。"
         self._ink_result_label.setText(result_text)
-        self._set_transform_controls_enabled(self._detail_canvas.has_image)
+        self._set_transform_controls_enabled(
+            self._detail_canvas.has_image
+            and self._loaded_detail_id == self._selected_id
+        )
 
     def _coordination_status(self, detail: dict[str, Any]) -> str:
         return self._stage_projection(detail).status
@@ -4349,6 +4994,58 @@ class ConsistencyPage(QWidget):
             self._ink_signature(self._current_ink_config(variant_id)),
         )
 
+    def _detail_cache_key(self, variant_id: str) -> tuple[Any, ...]:
+        """生成精调源图缓存键；源文件或墨色配置变化后自动失效。"""
+
+        detail = self._variant_by_id.get(variant_id, {})
+        return (
+            variant_id,
+            str(detail.get("审核文件", "")),
+            str(detail.get("审核MD5", "")),
+            str(detail.get("中间文件", "")),
+            str(detail.get("中间MD5", "")),
+            self._ink_signature(self._current_ink_config(variant_id)),
+        )
+
+    def _store_detail_cache(
+        self,
+        cache_key: tuple[Any, ...],
+        data: tuple[QImage, QImage, tuple[int, int], str],
+    ) -> None:
+        """按图像字节数维护精调源图 LRU。"""
+
+        previous = self._detail_cache.pop(cache_key, None)
+        if previous is not None:
+            self._detail_cache_bytes = max(
+                0,
+                self._detail_cache_bytes
+                - max(0, int(previous[0].sizeInBytes()))
+                - max(0, int(previous[1].sizeInBytes())),
+            )
+        self._detail_cache[cache_key] = data
+        self._detail_cache_bytes += (
+            max(0, int(data[0].sizeInBytes()))
+            + max(0, int(data[1].sizeInBytes()))
+        )
+        while self._detail_cache and (
+            len(self._detail_cache) > self._detail_cache_max_items
+            or self._detail_cache_bytes > self._detail_cache_max_bytes
+        ):
+            oldest_key = next(iter(self._detail_cache))
+            if oldest_key == cache_key and len(self._detail_cache) == 1:
+                break
+            expired = self._detail_cache.pop(oldest_key)
+            self._detail_cache_bytes = max(
+                0,
+                self._detail_cache_bytes
+                - max(0, int(expired[0].sizeInBytes()))
+                - max(0, int(expired[1].sizeInBytes())),
+            )
+
+    def _clear_detail_cache(self) -> None:
+        self._detail_cache.clear()
+        self._detail_cache_bytes = 0
+
     def _store_preview(
         self,
         variant_id: str,
@@ -4392,6 +5089,7 @@ class ConsistencyPage(QWidget):
         self._preview_cache.clear()
         self._preview_bounds_cache.clear()
         self._preview_cache_bytes = 0
+        self._clear_detail_cache()
 
     def _clear_variant_preview_cache(self, variant_id: str) -> None:
         for key in [key for key in self._preview_cache if key and key[0] == variant_id]:
@@ -4773,10 +5471,13 @@ class ConsistencyPage(QWidget):
         self._preview_timer.stop()
         self._comparison_wheel_timer.stop()
         self._list_thumbnail_timer.stop()
+        self._detail_generation += 1
+        self._detail_pool.clear()
         self._preview_pool.clear()
         self._list_thumbnail_pool.clear()
         self._coordination_pool.clear()
         self._preview_workers.clear()
+        self._detail_worker = None
         self._list_thumbnail_workers.clear()
         self._clear_preview_cache()
         self._list_thumbnail_cache.clear()

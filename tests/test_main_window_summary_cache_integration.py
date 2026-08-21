@@ -33,13 +33,17 @@ class MainWindowSummaryCacheIntegrationTests(unittest.TestCase):
             (library_dir / "空字库.json").write_text(
                 json.dumps(
                     {
+                        "数据版本": 3,
+                        "库名": "空字库",
                         "变体详情": {},
                         "字形组索引": {},
+                        "会话": {},
                         "元数据": {
                             "DPI": 300,
                             "画布宽": 250,
                             "画布高": 250,
                         },
+                        "整体协调": {},
                     },
                     ensure_ascii=False,
                 ),
@@ -59,13 +63,14 @@ class MainWindowSummaryCacheIntegrationTests(unittest.TestCase):
                 self.assertFalse(first_window.windowIcon().isNull())
                 self.assertTrue(first_window._library_scan_active)
                 self.assertEqual(first_window._library_scan_generation, 1)
-                self.assertTrue(QThreadPool.globalInstance().waitForDone(5000))
-                for _ in range(3):
-                    self.app.processEvents()
+                for _ in range(2):
+                    self.assertTrue(QThreadPool.globalInstance().waitForDone(5000))
+                    for _event in range(3):
+                        self.app.processEvents()
 
                 self.assertFalse(first_window._library_scan_active)
                 self.assertTrue(first_window._library_cache_ready)
-                self.assertTrue(cache_file.is_file())
+                self.assertTrue(cache_file.with_suffix(".sqlite3").is_file())
                 first_window.close()
                 first_window.deleteLater()
                 self.app.processEvents()

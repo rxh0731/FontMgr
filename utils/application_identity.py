@@ -26,12 +26,11 @@ def configure_windows_app_identity() -> bool:
 
 
 def load_application_icon() -> QIcon:
-    """优先载入 Qt 稳定支持的 PNG，缺失时回退到 EXE 使用的 ICO。"""
+    """组合 PNG 与多尺寸 ICO，统一窗口、任务栏和对话框图标。"""
 
+    icon = QIcon()
     for path in (config.WINDOW_ICON_FILE, config.ICON_FILE):
         if not os.path.isfile(path):
             continue
-        icon = QIcon(path)
-        if not icon.isNull():
-            return icon
-    return QIcon()
+        icon.addFile(path)
+    return icon

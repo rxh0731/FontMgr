@@ -1,8 +1,12 @@
 # adjustment_service.py — 字库整体协调与成品生成
 
+import hashlib
+import json
 import math
 import os
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -27,10 +31,15 @@ from services.file_transaction_recovery import (
     FileChange,
     FileTransaction,
     ensure_file_transactions_ready,
-    recovery_full_state_snapshot,
+    recovery_variant_batch_state_snapshot,
 )
+from utils.batch_observability import BatchTiming
 from services.workflow_status_service import resolve_safe_stage_file
-from utils.file_utils import compute_file_md5, pinyin_natural_key
+from utils.file_utils import (
+    compute_file_md5,
+    is_safe_windows_filename,
+    pinyin_natural_key,
+)
 
 
 class CoordinationCancelled(RuntimeError):
@@ -71,6 +80,7 @@ class AdjustmentService:
     COORDINATION_DISTORT_LIMIT = 8_192.0
     COORDINATION_MAX_DIMENSION = 16_384
     COORDINATION_MAX_PIXELS = 64 * 1024 * 1024
+    COORDINATION_RENDER_VERSION = 1
 
     def __init__(self, glyph_service: GlyphService) -> None:
         self._glyph = glyph_service
@@ -386,6 +396,8 @@ class AdjustmentService:
         if not variants:
             return {"成功": 0, "失败": 0, "失败详情": []}
         total = len(variants)
+        timing = BatchTiming()
+        preparation_started = time.perf_counter()
         self._raise_if_coordination_cancelled(cancel_check)
         self._report_coordination_progress(
             progress_callback,
@@ -469,137 +481,178 @@ class AdjustmentService:
             self._raise_if_coordination_cancelled(cancel_check)
 
         if preparation_failures:
+            timing.add("准备", time.perf_counter() - preparation_started)
+            write_log(
+                timing.format_summary(
+                    "整体协调保存",
+                    {"请求": total, "成功": 0, "失败": len(preparation_failures)},
+                )
+            )
             return self._coordination_batch_failure_result(
                 variants,
                 preparation_failures,
             )
 
+        timing.add("准备", time.perf_counter() - preparation_started)
+        rendering_started = time.perf_counter()
+        render_requests: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
         for index, detail in enumerate(variants):
             self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
             label = self._coordination_progress_label(detail)
-            self._report_coordination_progress(
-                progress_callback,
-                "渲染",
-                10 + round(index * 75 / total),
-                index + 1,
-                total,
-                label,
-            )
             self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
             plan = plans.get(index)
             if plan is None:
                 continue
             variant_id = str(plan["variant_id"])
             try:
-                source = self._load_reviewed_image(detail)
-                if source is None:
-                    raise FileNotFoundError("找不到审核通过的文字图片")
-                if not self._has_visible_ink(source):
-                    raise ValueError("审核通过的文字图片没有有效文字前景")
-                variant_ink = self._ink_config_for_variant(normalized_ink, variant_id)
-                variant_ink["像素类型"] = self._classify_ink_pixels(source)
-                upstream_issue = self._upstream_ink_issue(source)
-                if (
-                    upstream_issue
-                    and variant_ink["启用"]
-                    and variant_ink["模式"] == self.INK_MODE_FOLLOW
-                ):
-                    raise ValueError(
-                        f"前序图像异常：{upstream_issue}；"
-                        "请重新自动优化并完成手工审核后再整体协调"
-                    )
-                source = self.prepare_ink_working_copy(source, variant_ink)
-                source_left = (canvas_width - source.width) // 2
-                source_top = (canvas_height - source.height) // 2
-                bounding_box = self._ink_bounding_box(source)
-                if not bounding_box:
-                    raise ValueError("审核通过的文字图片没有有效文字前景")
-                glyph = source.crop(bounding_box)
-                center_x = source_left + (bounding_box[0] + bounding_box[2]) / 2.0
-                center_y = source_top + (bounding_box[1] + bounding_box[3]) / 2.0
-                applied = self._normalized_coordination(adjustments_by_id.get(variant_id))
-                glyph, content_origin, _control_polygon = self._render_coordination_glyph(
-                    glyph,
+                applied = self._normalized_coordination(
+                    adjustments_by_id.get(variant_id)
+                )
+                variant_ink = self._ink_config_for_variant(
+                    normalized_ink,
+                    variant_id,
+                )
+                generation_signature = self._coordination_generation_signature(
+                    detail,
                     applied,
-                    (center_x, center_y),
-                )
-                rendered = compose_rgba_on_canvas(
-                    np.asarray(glyph, dtype=np.uint8),
-                    content_origin,
-                    (canvas_width, canvas_height),
-                    expand_symmetric=True,
-                    limits=self._coordination_limits(),
-                )
-                finished = Image.fromarray(rendered.pixels, "RGBA")
-                finished, ink_record = self._apply_ink_coordination(
-                    finished,
                     variant_ink,
+                    (canvas_width, canvas_height),
+                    target_dpi,
                 )
-                expand_x, expand_y = rendered.geometry.grid_origin
-                temporary_path = self._save_coordination_temp_png(
-                    finished,
+                if self._reusable_coordination_output(
+                    detail,
                     str(plan["target_path"]),
-                    (target_dpi, target_dpi),
+                    str(plan["filename"]),
+                    generation_signature,
+                ):
+                    prepared.append(
+                        {
+                            "detail": detail,
+                            "variant_id": variant_id,
+                            "filename": str(plan["filename"]),
+                            "target_path": str(plan["target_path"]),
+                            "temporary_path": "",
+                            "md5": str(detail.get("成品MD5", "")),
+                            "parameters": detail.get("整体协调参数", {}),
+                            "label": label,
+                            "reused": True,
+                        }
+                    )
+                    continue
+                render_requests.append(
+                    (
+                        index,
+                        detail,
+                        plan,
+                        applied,
+                        variant_ink,
+                        generation_signature,
+                    )
                 )
-                temporary_paths.append(temporary_path)
-                saved = self._open_rgba(temporary_path)
-                if saved is None:
-                    raise OSError("临时成品 PNG 写入后无法重新解码")
-                try:
-                    self._record_saved_ink_verification(ink_record, saved)
-                finally:
-                    saved.close()
-                parameters = {
-                    "标准画布": [canvas_width, canvas_height],
-                    "实际画布": list(finished.size),
-                    "对称扩展X": expand_x,
-                    "对称扩展Y": expand_y,
-                    "整体变换": applied,
-                    "原包围盒": list(bounding_box) if bounding_box else None,
-                    "墨色协调": ink_record,
-                }
-                prepared.append({
-                    "detail": detail,
-                    "variant_id": variant_id,
-                    "filename": str(plan["filename"]),
-                    "target_path": str(plan["target_path"]),
-                    "temporary_path": temporary_path,
-                    "md5": compute_file_md5(temporary_path),
-                    "parameters": parameters,
-                    "label": label,
-                })
             except Exception as exc:
                 preparation_failures[index] = str(exc)
             self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
+            self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
+
+        completed_renders = 0
+        reused_count = len(prepared)
+        render_cancelled = False
+        if reused_count:
             self._report_coordination_progress(
                 progress_callback,
                 "渲染",
-                10 + round((index + 1) * 75 / total),
-                index + 1,
+                10 + round(reused_count * 75 / total),
+                reused_count,
                 total,
-                label,
+                "正在复用未变化成品",
             )
-            self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
+        if render_requests and not preparation_failures:
+            worker_count = min(2, len(render_requests))
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="整体协调渲染",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._render_coordination_item,
+                        detail,
+                        plan,
+                        applied,
+                        variant_ink,
+                        generation_signature,
+                        (canvas_width, canvas_height),
+                        target_dpi,
+                    ): (index, str(plan["label"]))
+                    for (
+                        index,
+                        detail,
+                        plan,
+                        applied,
+                        variant_ink,
+                        generation_signature,
+                    ) in render_requests
+                }
+                for future in as_completed(futures):
+                    index, label = futures[future]
+                    if future.cancelled():
+                        continue
+                    try:
+                        item = future.result()
+                        prepared.append(item)
+                        temporary_paths.append(str(item["temporary_path"]))
+                    except Exception as exc:
+                        preparation_failures[index] = str(exc)
+                    completed_renders += 1
+                    self._report_coordination_progress(
+                        progress_callback,
+                        "渲染",
+                        10 + round(
+                            (reused_count + completed_renders) * 75 / total
+                        ),
+                        reused_count + completed_renders,
+                        total,
+                        label,
+                    )
+                    if cancel_check is not None and cancel_check():
+                        render_cancelled = True
+                        for pending in futures:
+                            pending.cancel()
+        if render_cancelled:
+            self._remove_paths(temporary_paths)
+            raise CoordinationCancelled("已停止，本批次未提交")
+        plan_order = {
+            str(plan["variant_id"]): index for index, plan in plans.items()
+        }
+        prepared.sort(key=lambda item: plan_order[str(item["variant_id"])])
 
         if preparation_failures:
+            timing.add("渲染编码", time.perf_counter() - rendering_started)
             self._remove_paths(temporary_paths)
+            write_log(
+                timing.format_summary(
+                    "整体协调保存",
+                    {"请求": total, "成功": 0, "失败": len(preparation_failures)},
+                )
+            )
             return self._coordination_batch_failure_result(
                 variants,
                 preparation_failures,
             )
 
+        timing.add("渲染编码", time.perf_counter() - rendering_started)
+        changed_items = [item for item in prepared if not item.get("reused")]
+        transaction_preparation_started = time.perf_counter()
         try:
             baseline = (
                 dict(coordination_baseline)
                 if coordination_baseline is not None
                 else self.analyze()
             )
-            state_backup = self._glyph.snapshot_state()
+            state_backups = [
+                self._glyph.snapshot_variant_state(str(item["variant_id"]))
+                for item in changed_items
+            ]
             self._raise_if_coordination_cancelled(cancel_check)
-            detail_backups: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            for detail in variants:
-                self._raise_if_coordination_cancelled(cancel_check)
-                detail_backups.append((detail, deepcopy(detail)))
             # 快照准备完成后再原子关闭取消窗口。通过后必须完整提交或完整回滚，
             # 不再观察取消标志，避免把成品文件和 JSON 留在半提交状态。
             if commit_gate is not None:
@@ -610,8 +663,29 @@ class AdjustmentService:
         except Exception:
             self._remove_paths(temporary_paths)
             raise
+        timing.add(
+            "事务准备",
+            time.perf_counter() - transaction_preparation_started,
+        )
+        if not changed_items:
+            self._report_coordination_progress(
+                progress_callback,
+                "提交",
+                100,
+                total,
+                total,
+                "成品未变化，已直接复用",
+            )
+            write_log(
+                timing.format_summary(
+                    "整体协调保存",
+                    {"请求": total, "成功": total, "复用": total, "失败": 0},
+                )
+            )
+            return {"成功": total, "失败": 0, "失败详情": []}
         transaction: FileTransaction | None = None
         state_persisted = False
+        commit_started = time.perf_counter()
         try:
             self._report_coordination_progress(
                 progress_callback,
@@ -630,13 +704,13 @@ class AdjustmentService:
                         new_md5=str(item["md5"]),
                         backup_prefix=".fonteditor_coordination_rollback_",
                     )
-                    for item in prepared
+                    for item in changed_items
                 ],
-                recovery_full_state_snapshot(state_backup),
+                recovery_variant_batch_state_snapshot(state_backups),
             )
             transaction.backup_targets()
 
-            for index, item in enumerate(prepared):
+            for index, item in enumerate(changed_items):
                 self._glyph.mark_finished(
                     str(item["variant_id"]),
                     str(item["filename"]),
@@ -651,14 +725,24 @@ class AdjustmentService:
                     total,
                     str(item["label"]),
                 )
+            self._refresh_coordination_summary(
+                baseline,
+                normalized_ink,
+                verify_variant_ids={
+                    str(item["variant_id"]) for item in changed_items
+                },
+                pending_finished_paths={
+                    os.path.normcase(os.path.abspath(str(item["target_path"])))
+                    for item in changed_items
+                },
+            )
             transaction.mark_rollforward(
-                recovery_full_state_snapshot(self._glyph.snapshot_state())
+                recovery_variant_batch_state_snapshot(
+                    self._glyph.snapshot_variant_state(str(item["variant_id"]))
+                    for item in changed_items
+                )
             )
             transaction.install_new_files()
-            self._refresh_coordination_summary(baseline, normalized_ink)
-            transaction.update_rollforward_state(
-                recovery_full_state_snapshot(self._glyph.snapshot_state())
-            )
             self._report_coordination_progress(
                 progress_callback,
                 "提交",
@@ -678,10 +762,8 @@ class AdjustmentService:
         except Exception as exc:
             if state_persisted:
                 raise
-            self._glyph.restore_state(state_backup)
-            for detail, backup in detail_backups:
-                detail.clear()
-                detail.update(deepcopy(backup))
+            for snapshot in state_backups:
+                self._glyph.restore_variant_state(snapshot)
             rollback_errors = transaction.rollback() if transaction is not None else []
             if rollback_errors:
                 details = "；".join(rollback_errors)
@@ -691,6 +773,7 @@ class AdjustmentService:
             raise
         finally:
             self._remove_paths(temporary_paths)
+        timing.add("事务提交", time.perf_counter() - commit_started)
 
         self._report_coordination_progress(
             progress_callback,
@@ -699,6 +782,17 @@ class AdjustmentService:
             total,
             total,
             "批次提交完成",
+        )
+        write_log(
+            timing.format_summary(
+                "整体协调保存",
+                {
+                    "请求": total,
+                    "成功": len(prepared),
+                    "复用": len(prepared) - len(changed_items),
+                    "失败": 0,
+                },
+            )
         )
         return {"成功": len(prepared), "失败": 0, "失败详情": []}
 
@@ -788,6 +882,177 @@ class AdjustmentService:
                 os.remove(temporary_path)
             raise
         return temporary_path
+
+    def _render_coordination_item(
+        self,
+        detail: dict[str, Any],
+        plan: dict[str, Any],
+        applied: dict[str, Any],
+        variant_ink: dict[str, Any],
+        generation_signature: str,
+        canvas_size: tuple[int, int],
+        target_dpi: float,
+    ) -> dict[str, Any]:
+        """渲染并验证一个临时成品，不修改字库状态。"""
+
+        temporary_path = ""
+        try:
+            canvas_width, canvas_height = canvas_size
+            source = self._load_reviewed_image(detail)
+            if source is None:
+                raise FileNotFoundError("找不到审核通过的文字图片")
+            if not self._has_visible_ink(source):
+                raise ValueError("审核通过的文字图片没有有效文字前景")
+            variant_ink = dict(variant_ink)
+            variant_ink["像素类型"] = self._classify_ink_pixels(source)
+            upstream_issue = self._upstream_ink_issue(source)
+            if (
+                upstream_issue
+                and variant_ink["启用"]
+                and variant_ink["模式"] == self.INK_MODE_FOLLOW
+            ):
+                raise ValueError(
+                    f"前序图像异常：{upstream_issue}；"
+                    "请重新自动优化并完成手工审核后再整体协调"
+                )
+            source = self.prepare_ink_working_copy(source, variant_ink)
+            source_left = (canvas_width - source.width) // 2
+            source_top = (canvas_height - source.height) // 2
+            bounding_box = self._ink_bounding_box(source)
+            if not bounding_box:
+                raise ValueError("审核通过的文字图片没有有效文字前景")
+            glyph = source.crop(bounding_box)
+            center_x = source_left + (bounding_box[0] + bounding_box[2]) / 2.0
+            center_y = source_top + (bounding_box[1] + bounding_box[3]) / 2.0
+            glyph, content_origin, _control_polygon = self._render_coordination_glyph(
+                glyph,
+                applied,
+                (center_x, center_y),
+            )
+            rendered = compose_rgba_on_canvas(
+                np.asarray(glyph, dtype=np.uint8),
+                content_origin,
+                canvas_size,
+                expand_symmetric=True,
+                limits=self._coordination_limits(),
+            )
+            finished = Image.fromarray(rendered.pixels, "RGBA")
+            finished, ink_record = self._apply_ink_coordination(
+                finished,
+                variant_ink,
+            )
+            expand_x, expand_y = rendered.geometry.grid_origin
+            temporary_path = self._save_coordination_temp_png(
+                finished,
+                str(plan["target_path"]),
+                (target_dpi, target_dpi),
+            )
+            saved = self._open_rgba(temporary_path)
+            if saved is None:
+                raise OSError("临时成品 PNG 写入后无法重新解码")
+            try:
+                self._record_saved_ink_verification(ink_record, saved)
+            finally:
+                saved.close()
+            parameters = {
+                "标准画布": [canvas_width, canvas_height],
+                "实际画布": list(finished.size),
+                "对称扩展X": expand_x,
+                "对称扩展Y": expand_y,
+                "整体变换": applied,
+                "原包围盒": list(bounding_box),
+                "墨色协调": ink_record,
+                "生成签名": generation_signature,
+            }
+            return {
+                "detail": detail,
+                "variant_id": str(plan["variant_id"]),
+                "filename": str(plan["filename"]),
+                "target_path": str(plan["target_path"]),
+                "temporary_path": temporary_path,
+                "md5": compute_file_md5(temporary_path),
+                "parameters": parameters,
+                "label": str(plan["label"]),
+                "reused": False,
+            }
+        except Exception:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+            raise
+
+    def _coordination_generation_signature(
+        self,
+        detail: dict[str, Any],
+        adjustments: dict[str, Any],
+        ink_config: dict[str, Any],
+        canvas_size: tuple[int, int],
+        dpi: float,
+    ) -> str:
+        reviewed_filename = str(detail.get("审核文件", "") or "")
+        workflow_dirs = self._glyph.get_workflow_dirs()
+        source_path = resolve_safe_stage_file(
+            workflow_dirs["手工审核" if reviewed_filename else "优化预览"],
+            reviewed_filename or detail.get("中间文件"),
+        )
+        if not source_path:
+            return ""
+        source_md5 = str(
+            detail.get("审核MD5" if reviewed_filename else "中间MD5", "")
+            or ""
+        ).lower()
+        if not source_md5:
+            source_md5 = compute_file_md5(source_path)
+        if not source_md5:
+            return ""
+        profile = self._normalized_ink_config(ink_config)
+        payload = {
+            "版本": self.COORDINATION_RENDER_VERSION,
+            "源图MD5": source_md5,
+            "画布": [int(canvas_size[0]), int(canvas_size[1])],
+            "DPI": round(float(dpi), 4),
+            "整体变换": self._normalized_coordination(adjustments),
+            "墨色": {
+                key: profile.get(key)
+                for key in (
+                    "启用",
+                    "基准",
+                    "方法",
+                    "方法版本",
+                    "前景阈值",
+                    "容差",
+                    "模式",
+                )
+            },
+        }
+        packed = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(packed).hexdigest()
+
+    @staticmethod
+    def _reusable_coordination_output(
+        detail: dict[str, Any],
+        target_path: str,
+        filename: str,
+        generation_signature: str,
+    ) -> bool:
+        parameters = detail.get("整体协调参数")
+        return bool(
+            generation_signature
+            and str(detail.get("状态", "")) == config.STATUS_FINISHED
+            and str(detail.get("成品文件", "")) == filename
+            and str(detail.get("成品MD5", ""))
+            and isinstance(parameters, dict)
+            and parameters.get("生成签名") == generation_signature
+            and os.path.isfile(target_path)
+            and os.path.getsize(target_path) > 0
+        )
 
     @staticmethod
     def _reserve_coordination_backup(target_path: str) -> str:
@@ -1275,18 +1540,40 @@ class AdjustmentService:
         self,
         baseline: dict[str, Any],
         ink_config: dict[str, Any],
+        *,
+        verify_variant_ids: set[str] | None = None,
+        pending_finished_paths: set[str] | None = None,
     ) -> None:
-        """仅在全部审核字形都有真实成品和匹配记录时标记完成。"""
+        """刷新协调摘要；普通保存只深查本次变化的成品。"""
         profile = self._normalized_ink_config(ink_config)
         variants = self.load_reviewed_variants(pinyin_order=False)
         finished_dir = self._glyph.get_workflow_dirs()["成品"]
+        verify_ids = verify_variant_ids
+        pending_paths = pending_finished_paths or set()
         geometry_completed = bool(variants)
         counts = {"总数": len(variants), "已达标": 0, "待确认": 0, "人工例外": 0}
         for detail in variants:
             filename = str(detail.get("成品文件", ""))
+            variant_id = str(detail.get("变体ID", ""))
+            expected_path = (
+                os.path.normcase(
+                    os.path.abspath(os.path.join(finished_dir, filename))
+                )
+                if is_safe_windows_filename(filename)
+                else ""
+            )
+            if verify_ids is None or variant_id in verify_ids:
+                valid_finished_reference = bool(
+                    expected_path in pending_paths
+                    or resolve_safe_stage_file(finished_dir, filename)
+                )
+            else:
+                # 页面内保存期间字库持有独占锁，页外文件未发生变化；
+                # 外部修改由“重新核对字库数据”执行深度审计。
+                valid_finished_reference = bool(expected_path)
             has_finished = (
                 str(detail.get("状态", "")) == config.STATUS_FINISHED
-                and bool(resolve_safe_stage_file(finished_dir, filename))
+                and valid_finished_reference
             )
             geometry_completed = geometry_completed and has_finished
             parameters = detail.get("整体协调参数", {})

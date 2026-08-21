@@ -10,6 +10,7 @@ else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     RESOURCE_DIR = SCRIPT_DIR
 CONFIG_DIR: str = os.path.join(SCRIPT_DIR, "配置")
+APP_DATABASE_FILE: str = os.path.join(CONFIG_DIR, "fontmgr.sqlite3")
 REGISTRY_FILE: str = os.path.join(CONFIG_DIR, "算法注册表.json")
 TEMPLATE_FILE: str = os.path.join(CONFIG_DIR, "优化模板.json")
 GLOBAL_CONFIG_FILE: str = os.path.join(CONFIG_DIR, "用户设置.json")
@@ -69,4 +70,4 @@ WINDOW_ICON_FILE: str = os.path.join(
     "assets",
     "font_editor_icon_color_blocks.png",
 )
-WINDOWS_APP_USER_MODEL_ID: str = "RuanXiaohua.FontEditor.PySide6"
+WINDOWS_APP_USER_MODEL_ID: str = "RuanXiaohua.FontMgr"

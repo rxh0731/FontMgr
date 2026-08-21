@@ -19,6 +19,7 @@ __pycache__/
 # 本地配置：用户专属设置与环境变量
 配置/用户设置.json
 配置/字库状态索引.json
+配置/fontmgr.sqlite3*
 .env
 
 # 运行数据：本地字库与测试输出
@@ -38,6 +39,7 @@ restore_language_tokens.py
 build/
 dist/
 *.spec
+!FontMgr.spec
 
 # 操作系统：自动生成的元数据文件
 Thumbs.db

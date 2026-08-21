@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 import tempfile
+import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Event
@@ -91,6 +92,7 @@ from services.file_transaction_recovery import (
     recovery_state_snapshot,
 )
 from services.glyph_service import GlyphService
+from services.library_summary_service import summarize_glyph_service
 from services.workflow_status_service import (
     INK_STATUS_NOT_APPLICABLE,
     MARKER_STRUCTURE_REVIEW,
@@ -118,7 +120,7 @@ from ui.widgets.two_line_status_delegate import (
     set_two_line_status,
 )
 from ui.widgets.review_canvas import ReviewCanvas
-from utils.batch_observability import BatchTiming, ProgressThrottle
+from utils.batch_observability import BatchTiming, ProgressThrottle, format_elapsed_time
 from utils.file_utils import ensure_dir, natural_key, pinyin_natural_key
 
 
@@ -649,13 +651,8 @@ def _save_and_approve_review_locked(
                     backup_prefix=".fonteditor_finished_rollback_",
                 )
             )
-        # 只有批量首次生成且 JSON 没有旧审核稿或成品引用时允许直装。
-        # 交互保存及任何旧引用（即使文件已丢失）都使用完整图片事务。
-        requires_transaction = bool(
-            persistence is None
-            or finished_path
-            or (apply_transform and reviewed_name)
-        )
+        # SQLite 逐字提交失败时必须依靠独立清单恢复，所有图片变更都进入事务。
+        requires_transaction = bool(changes)
         if changes and requires_transaction:
             transaction = FileTransaction.begin(
                 library_root_from_paths(service, directories.values()),
@@ -712,7 +709,7 @@ def _save_and_approve_review_locked(
             try:
                 persistence.record_variant(variant_id)
             except BatchJournalUncertainError:
-                # 日志可能已经完整落盘，不能再回滚其引用的新审核稿。
+                # 数据库提交结果未知，保留图片和清单，由启动恢复统一裁决。
                 state_persisted = True
                 raise
         state_persisted = True
@@ -763,9 +760,12 @@ def _save_interactive_review(
     filename: str,
     output_origin: tuple[int, int],
     dpi: int,
+    *,
+    approve: bool = False,
 ) -> str:
-    """以持久图片事务保存交互修改稿，但不自动推进审核通过状态。"""
+    """以持久图片事务保存交互修改稿，并可在同次事务中审核通过。"""
 
+    timing = BatchTiming()
     directories = service.get_workflow_dirs()
     root = library_root_from_paths(service, directories.values())
     library_lock = acquire_batch_library_lock(root)
@@ -793,9 +793,13 @@ def _save_interactive_review(
         os.close(descriptor)
         output_image.setDotsPerMeterX(round(dpi / 0.0254))
         output_image.setDotsPerMeterY(round(dpi / 0.0254))
+        stage_started = time.perf_counter()
         if not output_image.save(temporary_path, "PNG"):
             raise OSError("无法写入临时人工修订稿。")
+        timing.add("PNG编码", time.perf_counter() - stage_started)
+        stage_started = time.perf_counter()
         md5_value = _file_md5(temporary_path)
+        timing.add("文件摘要", time.perf_counter() - stage_started)
 
         changes = [
             FileChange(
@@ -813,6 +817,7 @@ def _save_interactive_review(
                     backup_prefix=".fonteditor_finished_rollback_",
                 )
             )
+        stage_started = time.perf_counter()
         transaction = FileTransaction.begin(root, changes, old_state)
         transaction.backup_targets()
 
@@ -821,6 +826,8 @@ def _save_interactive_review(
         params = service.default_transform_params()
         params["图像原点"] = [int(output_origin[0]), int(output_origin[1])]
         saved_detail["变换参数"] = params
+        if approve and not service.approve_manual_review(variant_id):
+            raise RuntimeError("人工审核稿保存后仍无法审核通过")
         new_state = recovery_state_snapshot(
             service.snapshot_variant_state(variant_id),
             variant_id,
@@ -829,14 +836,25 @@ def _save_interactive_review(
         transaction.mark_rollforward(new_state)
         transaction.install_new_files()
         temporary_path = ""
+        timing.add("图片事务", time.perf_counter() - stage_started)
+        stage_started = time.perf_counter()
         service.save()
+        timing.add("字库索引", time.perf_counter() - stage_started)
         state_persisted = True
+        stage_started = time.perf_counter()
         cleanup_errors = transaction.finalize()
+        timing.add("事务清理", time.perf_counter() - stage_started)
         if cleanup_errors:
             write_log(
                 "手工审核图片事务已提交，清理将于下次打开继续｜"
                 + "；".join(cleanup_errors)
             )
+        write_log(
+            timing.format_summary(
+                "手工审核保存",
+                {"字形": 1, "审核通过": int(approve)},
+            )
+        )
         return output_path
     except Exception:
         if not state_persisted:
@@ -859,6 +877,78 @@ def _save_interactive_review(
             except OSError:
                 pass
         library_lock.release()
+
+
+def _save_interactive_review_in_worker(
+    library_name: str,
+    library_path: str,
+    variant_id: str,
+    output_image: QImage,
+    filename: str,
+    output_origin: tuple[int, int],
+    dpi: int,
+    *,
+    approve: bool,
+    reusable: tuple[str, str, bool] | None = None,
+) -> dict[str, Any]:
+    """在线程中保存单字，并返回供页面合并的局部状态。"""
+
+    if reusable is None:
+        service = GlyphService.open(library_name, library_path)
+        output_path = _save_interactive_review(
+            service,
+            variant_id,
+            output_image,
+            filename,
+            output_origin,
+            dpi,
+            approve=approve,
+        )
+    else:
+        library_lock = acquire_batch_library_lock(os.path.abspath(library_path))
+        try:
+            ensure_file_transactions_ready(os.path.abspath(library_path))
+            # 必须在取得独占锁后重新读取数据库，避免使用等待锁期间过期的状态。
+            service = GlyphService.open(library_name, library_path)
+            reusable_path, expected_md5, edited = reusable
+            detail = service.get_variant(variant_id)
+            reviewed_path = resolve_safe_stage_file(
+                service.get_workflow_dirs()["手工审核"],
+                filename,
+            )
+            if (
+                not detail
+                or not reviewed_path
+                or os.path.normcase(reviewed_path) != os.path.normcase(reusable_path)
+                or _file_md5(reviewed_path) != expected_md5
+            ):
+                raise RuntimeError("原审核稿已变化，请重新载入后再审核")
+            timing = BatchTiming()
+            with timing.measure("状态提交"):
+                service.mark_manual_saved(
+                    variant_id,
+                    filename,
+                    expected_md5,
+                    edited=edited,
+                )
+                if approve and not service.approve_manual_review(variant_id):
+                    raise RuntimeError("当前审核稿无法审核通过")
+                service.save()
+            write_log(
+                timing.format_summary(
+                    "手工审核复用",
+                    {"字形": 1, "复用PNG": 1},
+                )
+            )
+            output_path = reviewed_path
+        finally:
+            library_lock.release()
+    return {
+        "字形状态": service.snapshot_variant_state(variant_id),
+        "输出路径": output_path,
+        "文件名": filename,
+        "审核通过": approve,
+    }
 
 
 def _run_bulk_review(
@@ -934,8 +1024,8 @@ def _run_bulk_review(
                     BatchJournalUncertainError,
                     FileTransactionCommitUncertainError,
                 ):
-                    # 当前记录需要在下次打开时由恢复日志裁决，后续字形
-                    # 不得继续处理或触发完整 JSON 检查点。
+                    # 当前记录需要在下次打开时由图片事务裁决，后续字形
+                    # 不得继续处理或触发数据库提交。
                     raise
                 except Exception as exc:
                     reason = str(exc) or exc.__class__.__name__
@@ -963,7 +1053,7 @@ def _run_bulk_review(
                 result["已停止"] = True
                 break
     except BaseException:
-        # 循环或检查点异常时不重试整库保存，避免掩盖原异常；日志留待重开恢复。
+        # 循环或提交异常时不重试保存，避免掩盖原异常；图片事务留待重开恢复。
         try:
             persistence.leave_for_recovery()
         except Exception:
@@ -986,7 +1076,7 @@ def _run_bulk_review(
         with timing.measure("状态提交"):
             persistence.finish()
     except BaseException:
-        # finish 失败时会保留日志；清理异常不得替换真正的保存异常。
+        # finish 清理异常不得替换真正的保存异常。
         try:
             persistence.leave_for_recovery()
         except Exception:
@@ -1018,6 +1108,7 @@ def _run_bulk_review(
             stopped=result["已停止"],
         )
     )
+    result["总耗时秒"] = timing.finish()
     return result
 
 
@@ -1097,9 +1188,15 @@ class ReviewPage(QWidget):
         self._canvas_height = 250
         self._batch_running = False
         self._batch_worker: _BulkReviewWorker | None = None
+        self._batch_started_at: float | None = None
         self._batch_pool = QThreadPool(self)
         self._batch_pool.setMaxThreadCount(1)
         self._batch_pool.setExpiryTimeout(15_000)
+        self._save_running = False
+        self._save_worker: FunctionWorker | None = None
+        self._save_pool = QThreadPool(self)
+        self._save_pool.setMaxThreadCount(1)
+        self._save_pool.setExpiryTimeout(15_000)
         self._build_ui()
         self._set_tool(ReviewCanvas.TOOL_TRANSFORM)
         self._setup_shortcuts()
@@ -1327,12 +1424,14 @@ class ReviewPage(QWidget):
         self._status_label = QLabel("")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         info_row.addWidget(self._status_label)
-        self._previous_button = self._toolbar_button("‹", "上一字形")
-        self._previous_button.setAccessibleName("上一字形")
+        self._previous_button = self._toolbar_button("上一条", "上一字形")
+        self._previous_button.setAccessibleName("上一条")
+        self._fit_navigation_button(self._previous_button)
         self._previous_button.clicked.connect(lambda: self._move_selection(-1))
         info_row.addWidget(self._previous_button)
-        self._next_button = self._toolbar_button("›", "下一字形")
-        self._next_button.setAccessibleName("下一字形")
+        self._next_button = self._toolbar_button("下一条", "下一字形")
+        self._next_button.setAccessibleName("下一条")
+        self._fit_navigation_button(self._next_button)
         self._next_button.clicked.connect(lambda: self._move_selection(1))
         info_row.addWidget(self._next_button)
         layout.addWidget(info_widget)
@@ -1477,11 +1576,11 @@ class ReviewPage(QWidget):
         self._restore_button.clicked.connect(self._canvas_reset)
         action_layout.addWidget(self._restore_button)
         self._save_button = QPushButton("保存修改稿")
-        self._save_button.clicked.connect(self.save_current)
+        self._save_button.clicked.connect(self._start_save_current)
         action_layout.addWidget(self._save_button)
         self._approve_button = QPushButton("保存并审核通过")
         self._approve_button.setProperty("role", "primary")
-        self._approve_button.clicked.connect(self.approve_current)
+        self._approve_button.clicked.connect(self._start_approve_current)
         action_layout.addWidget(self._approve_button)
         layout.addWidget(actions)
         return panel
@@ -1710,7 +1809,7 @@ class ReviewPage(QWidget):
     def _setup_shortcuts(self) -> None:
         self._shortcut_actions: list[QAction] = []
         for shortcut, callback in (
-            (QKeySequence.StandardKey.Save, self.save_current),
+            (QKeySequence.StandardKey.Save, self._start_save_current),
             (QKeySequence.StandardKey.Undo, self._canvas.undo),
             (QKeySequence.StandardKey.Redo, self._canvas.redo),
             (QKeySequence("["), lambda: self._canvas.adjust_brush_size(-1)),
@@ -1787,13 +1886,14 @@ class ReviewPage(QWidget):
         return self._canvas.rect().contains(position)
 
     def open_library(self, library_path: str, variant_id: str = "") -> bool:
-        if self._batch_running:
+        if self._batch_running or self._save_running:
             self.status_message.emit("正在完成手工审核，请等待任务结束。")
             return False
         if self._canvas.is_dirty and not self._confirm_discard():
             return False
         name = os.path.basename(os.path.normpath(library_path))
         self._service = GlyphService.open(name, library_path)
+        summarize_glyph_service(self._service)
         self._list_thumbnail_timer.stop()
         self._list_thumbnail_generation += 1
         self._list_thumbnail_cache.clear()
@@ -1820,7 +1920,168 @@ class ReviewPage(QWidget):
         return True
 
     def save_current(self) -> bool:
-        if self._batch_running:
+        return self._save_current_image(approve=False)
+
+    def _start_save_current(self) -> None:
+        self._start_interactive_save(approve=False)
+
+    def _start_approve_current(self) -> None:
+        self._start_interactive_save(approve=True)
+
+    def _start_interactive_save(self, *, approve: bool) -> None:
+        """从界面按钮启动后台单字保存，避免阻塞 Qt 主线程。"""
+
+        if self._save_running or self._batch_running:
+            return
+        if not self._service or not self._current_variant_id:
+            return
+        if not self._current_record_is_editable() or not self._canvas.has_image:
+            self.status_message.emit("当前字形还不能保存。")
+            return
+        output_image = self._canvas.image().copy()
+        if not _has_visible_ink(output_image):
+            QMessageBox.warning(
+                self,
+                "无法保存",
+                "当前稿件没有有效文字前景，请保留文字内容后再保存。",
+            )
+            return
+        output_dir = self._service.get_workflow_dirs()["手工审核"]
+        try:
+            ensure_dir(output_dir)
+        except OSError as exc:
+            QMessageBox.critical(self, "保存失败", f"无法创建手工审核目录：{exc}")
+            return
+        variant_id = self._current_variant_id
+        filename = Path(self._source_path).stem + ".png"
+        output_origin = self._canvas.output_origin()
+        origin = (-int(output_origin.x()), -int(output_origin.y()))
+        dpi = self._positive_int(self._service.get_metadata().get("DPI"), 300)
+        current_index = (
+            self._variant_ids.index(variant_id)
+            if variant_id in self._variant_ids
+            else -1
+        )
+        next_variant = (
+            self._variant_ids[current_index + 1]
+            if approve and 0 <= current_index < len(self._variant_ids) - 1
+            else ""
+        )
+        reusable_payload: tuple[str, str, bool] | None = None
+        reusable = self._reusable_review_file() if approve else None
+        if reusable is not None:
+            detail = self._service.get_variant(variant_id)
+            manual_edit = detail.get("手工编辑", {}) if detail else {}
+            edited = (
+                bool(manual_edit.get("已编辑", True))
+                if isinstance(manual_edit, dict)
+                else True
+            )
+            reusable_payload = (reusable[0], reusable[1], edited)
+        context = {
+            "字形ID": variant_id,
+            "下一字形": next_variant,
+            "图像": output_image,
+            "文件名": filename,
+            "审核通过": approve,
+        }
+        library_name = self._service.ziku_name
+        library_path = self._service.ziku_dir
+        worker = FunctionWorker(
+            lambda: _save_interactive_review_in_worker(
+                library_name,
+                library_path,
+                variant_id,
+                output_image,
+                filename,
+                origin,
+                dpi,
+                approve=approve,
+                reusable=reusable_payload,
+            )
+        )
+        worker.signals.finished.connect(
+            lambda result, task=worker, state=context: self._interactive_save_finished(
+                task,
+                state,
+                result,
+            )
+        )
+        worker.signals.failed.connect(
+            lambda message, task=worker: self._interactive_save_failed(task, message)
+        )
+        self._save_worker = worker
+        self._set_single_save_running(True, approve=approve)
+        self._save_pool.start(worker)
+
+    def _interactive_save_finished(
+        self,
+        worker: FunctionWorker,
+        context: dict[str, Any],
+        result: object,
+    ) -> None:
+        if worker is not self._save_worker:
+            return
+        self._save_worker = None
+        self._set_single_save_running(False)
+        if not self._service or not isinstance(result, dict):
+            QMessageBox.critical(self, "保存失败", "后台保存没有返回有效结果。")
+            return
+        try:
+            snapshot = result.get("字形状态")
+            if not isinstance(snapshot, dict):
+                raise TypeError("后台保存没有返回字形状态")
+            self._service.restore_variant_state(snapshot)
+            output_path = str(result.get("输出路径", ""))
+            filename = str(context["文件名"])
+            approve = bool(context["审核通过"])
+            self._apply_saved_review_ui(
+                context["图像"],
+                output_path,
+                filename,
+                approve=approve,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "保存后刷新失败",
+                f"稿件已经保存，但页面状态刷新失败：{exc}\n请重新进入手工审核。",
+            )
+            return
+        if approve:
+            variant_id = str(context["字形ID"])
+            next_variant = str(context["下一字形"])
+            self.summary_changed.emit(self._service)
+            self.status_message.emit(f"已审核通过：{variant_id}")
+            self._advance_after_review_approval(variant_id, next_variant)
+            if not next_variant:
+                self._show_review_end_notice()
+
+    def _interactive_save_failed(
+        self,
+        worker: FunctionWorker,
+        message: str,
+    ) -> None:
+        if worker is not self._save_worker:
+            return
+        self._save_worker = None
+        self._set_single_save_running(False)
+        QMessageBox.critical(self, "保存失败", f"无法保存手工审核图像：{message}")
+
+    def _set_single_save_running(self, running: bool, *, approve: bool = False) -> None:
+        self._save_running = bool(running)
+        self._main_splitter.setEnabled(not running)
+        self._home_button.setEnabled(not running)
+        self._complete_button.setEnabled(not running and self._service is not None)
+        for action in self._shortcut_actions:
+            action.setEnabled(not running)
+        if running:
+            self.status_message.emit(
+                "正在后台保存并审核通过…" if approve else "正在后台保存修改稿…"
+            )
+
+    def _save_current_image(self, *, approve: bool) -> bool:
+        if self._batch_running or self._save_running:
             self.status_message.emit("正在完成手工审核，暂时不能保存单字。")
             return False
         if not self._service or not self._current_variant_id:
@@ -1856,6 +2117,7 @@ class ReviewPage(QWidget):
                 filename,
                 (-int(output_origin.x()), -int(output_origin.y())),
                 dpi,
+                approve=approve,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             QMessageBox.critical(
@@ -1865,29 +2127,104 @@ class ReviewPage(QWidget):
             )
             return False
 
+        self._apply_saved_review_ui(
+            output_image,
+            output_path,
+            filename,
+            approve=approve,
+        )
+        return True
+
+    def _apply_saved_review_ui(
+        self,
+        output_image: QImage,
+        output_path: str,
+        filename: str,
+        *,
+        approve: bool,
+    ) -> None:
+        """把已成功提交的单字结果合并到当前页面。"""
+
         self._canvas.set_image(output_image, (self._canvas_width, self._canvas_height))
         self._canvas.mark_saved()
         self._source_path = output_path
         self._source_stage = "手工审核稿"
-        self._current_status = config.STATUS_PENDING_MANUAL_REVIEW
+        self._current_status = (
+            config.STATUS_REVIEWED
+            if approve
+            else config.STATUS_PENDING_MANUAL_REVIEW
+        )
         self._source_label.setText(f"来源：手工审核稿 · {filename}")
         self._draft_source_label.setText("手工审核稿")
         self._draft_file_label.setText(filename)
-        self._draft_status_label.setText(STAGE_PENDING_REVIEW)
-        self._status_label.setText(STAGE_PENDING_REVIEW)
+        phase_status = STATUS_REVIEWED if approve else STAGE_PENDING_REVIEW
+        self._draft_status_label.setText(phase_status)
+        self._status_label.setText(phase_status)
         self._status_label.setStyleSheet(
-            f"color: {PHASE_STATUS_COLORS[STAGE_PENDING_REVIEW]};"
+            f"color: {PHASE_STATUS_COLORS[phase_status]};"
         )
         self._file_label.setText(f"{filename} · {self._current_variant_id}")
-        self._update_current_list_item(config.STATUS_PENDING_MANUAL_REVIEW, filename)
-        self._refresh_progress()
-        if self._service is not None:
+        self._update_current_list_item(self._current_status, filename)
+        self._refresh_progress(list(self._records_by_id.values()))
+        if self._service is not None and not approve:
             self.summary_changed.emit(self._service)
-        self.status_message.emit(f"已保存手工修改：{filename}")
-        return True
+        if not approve:
+            self.status_message.emit(f"已保存手工修改：{filename}")
+
+    def _reusable_review_file(self) -> tuple[str, str] | None:
+        """返回已符合当前字库尺寸契约的审核稿及摘要。"""
+
+        if (
+            not self._service
+            or not self._current_variant_id
+            or self._canvas.is_dirty
+            or self._source_stage != "手工审核稿"
+        ):
+            return None
+        detail = self._service.get_variant(self._current_variant_id)
+        if not detail or str(detail.get("成品文件", "") or ""):
+            return None
+        filename = str(detail.get("审核文件", "") or "")
+        path = resolve_safe_stage_file(
+            self._service.get_workflow_dirs()["手工审核"],
+            filename,
+        )
+        if not path or os.path.normcase(path) != os.path.normcase(self._source_path):
+            return None
+        expected_md5 = str(detail.get("审核MD5", "") or "").lower()
+        if not expected_md5 or _file_md5(path) != expected_md5:
+            return None
+        parameters = detail.get("变换参数", {})
+        origin = parameters.get("图像原点") if isinstance(parameters, dict) else None
+        if not isinstance(origin, (list, tuple)) or len(origin) != 2:
+            return None
+        try:
+            origin_x = int(origin[0])
+            origin_y = int(origin[1])
+        except (TypeError, ValueError):
+            return None
+        if origin_x > 0 or origin_y > 0:
+            return None
+        image = QImage(path)
+        if image.isNull():
+            return None
+        expected_size = QSize(
+            self._canvas_width - origin_x * 2,
+            self._canvas_height - origin_y * 2,
+        )
+        if image.size() != expected_size:
+            return None
+        dpi = self._positive_int(self._service.get_metadata().get("DPI"), 300)
+        target_dpm = round(dpi / 0.0254)
+        if (
+            abs(image.dotsPerMeterX() - target_dpm) > 2
+            or abs(image.dotsPerMeterY() - target_dpm) > 2
+        ):
+            return None
+        return path, expected_md5
 
     def approve_current(self) -> None:
-        if self._batch_running:
+        if self._batch_running or self._save_running:
             self.status_message.emit("正在完成手工审核，暂时不能审核单字。")
             return
         if not self._service or not self._current_variant_id:
@@ -1895,22 +2232,41 @@ class ReviewPage(QWidget):
         if not self._current_record_is_editable():
             self.status_message.emit("当前字形仍在待优化阶段，请先完成自动优化。")
             return
-        if not self.save_current():
-            return
-        saved_state = self._service.snapshot_state()
         current_index = self._variant_ids.index(self._current_variant_id) if self._current_variant_id in self._variant_ids else -1
         next_variant = self._variant_ids[current_index + 1] if 0 <= current_index < len(self._variant_ids) - 1 else ""
-        if not self._service.approve_manual_review(self._current_variant_id):
-            self._service.restore_state(saved_state)
-            QMessageBox.warning(self, "审核失败", "当前字形没有可审核的人工修订稿或自动优化稿。")
-            return
         approved_variant = self._current_variant_id
-        try:
-            self._service.save()
-        except (OSError, RuntimeError, ValueError) as exc:
-            self._service.restore_state(saved_state)
-            QMessageBox.critical(self, "审核失败", f"无法保存审核状态：{exc}")
-            return
+        reusable = self._reusable_review_file()
+        if reusable is None:
+            if not self._save_current_image(approve=True):
+                return
+        else:
+            timing = BatchTiming()
+            state_backup = self._service.snapshot_variant_state(approved_variant)
+            detail = self._service.get_variant(approved_variant)
+            manual_edit = detail.get("手工编辑", {}) if detail else {}
+            if not isinstance(manual_edit, dict):
+                manual_edit = {}
+            try:
+                with timing.measure("状态提交"):
+                    self._service.mark_manual_saved(
+                        approved_variant,
+                        os.path.basename(reusable[0]),
+                        reusable[1],
+                        edited=bool(manual_edit.get("已编辑", True)),
+                    )
+                    if not self._service.approve_manual_review(approved_variant):
+                        raise RuntimeError("当前审核稿无法审核通过")
+                    self._service.save()
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._service.restore_variant_state(state_backup)
+                QMessageBox.critical(self, "审核失败", f"无法保存审核状态：{exc}")
+                return
+            write_log(
+                timing.format_summary(
+                    "手工审核复用",
+                    {"字形": 1, "复用PNG": 1},
+                )
+            )
         self._current_status = config.STATUS_REVIEWED
         self._status_label.setText(STATUS_REVIEWED)
         self._status_label.setStyleSheet(
@@ -1921,11 +2277,70 @@ class ReviewPage(QWidget):
         if self._service is not None:
             self.summary_changed.emit(self._service)
         self.status_message.emit(f"已审核通过：{approved_variant}")
-        self._populate_variants(select_variant=next_variant or approved_variant)
+        self._advance_after_review_approval(approved_variant, next_variant)
+        if not next_variant:
+            self._show_review_end_notice()
+
+    def _advance_after_review_approval(
+        self,
+        approved_variant: str,
+        next_variant: str,
+    ) -> None:
+        """局部更新审核结果，并按当前筛选定位下一字形。"""
+
+        self._refresh_progress(list(self._records_by_id.values()))
+        if self._filter_combo.currentText() == STAGE_PENDING_REVIEW:
+            node = self._node_for_variant(approved_variant)
+            if node is not None:
+                parent = node.parent()
+                row = self._variant_ids.index(approved_variant)
+                with QSignalBlocker(self._item_tree):
+                    if parent is not None:
+                        parent.removeChild(node)
+                        if parent.childCount() == 0:
+                            parent_row = self._item_tree.indexOfTopLevelItem(parent)
+                            if parent_row >= 0:
+                                self._item_tree.takeTopLevelItem(parent_row)
+                        else:
+                            self._update_group_item(parent)
+                    self._variant_ids.pop(row)
+                    self._item_nodes.pop(row)
+            self._list_count_label.setText(
+                f"显示 / 总数：{len(self._variant_ids)} / {len(self._records_by_id)}"
+            )
+
+        target = self._node_for_variant(next_variant) if next_variant else None
+        if target is not None:
+            self._item_tree.setCurrentItem(target)
+        elif approved_variant not in self._variant_ids:
+            self._clear_current()
+        else:
+            self._update_navigation_buttons()
+
+    def _show_review_end_notice(self) -> None:
+        """说明当前搜索和筛选范围已经没有下一字形。"""
+
+        pending_count = sum(
+            self._record_phase_status(self._records_by_id[variant_id])
+            == STAGE_PENDING_REVIEW
+            for variant_id in self._variant_ids
+            if variant_id in self._records_by_id
+        )
+        if pending_count:
+            detail = (
+                "当前字形已审核通过，已到当前搜索和筛选范围的最后一条。\n"
+                f"该范围内仍有 {pending_count} 个待审核字形，可从左侧列表重新选择。"
+            )
+        else:
+            detail = (
+                "当前字形已审核通过，已到当前搜索和筛选范围的最后一条。\n"
+                "该范围内的待审核字形已全部处理完成。"
+            )
+        QMessageBox.information(self, "手工审核", detail)
 
     def complete_all_reviews(self) -> None:
         """确认后在后台完成当前字库的全部待审核字形。"""
-        if self._batch_running or not self._service:
+        if self._batch_running or self._save_running or not self._service:
             return
         if self._canvas.is_dirty and not self._save_unsaved_before_batch():
             return
@@ -2018,6 +2433,7 @@ class ReviewPage(QWidget):
         library_path = self._service.ziku_dir
         total = len(pending_ids)
         self._set_batch_running(True, total)
+        self._batch_started_at = time.perf_counter()
         try:
             worker = _BulkReviewWorker(
                 lambda progress, cancel_check: _run_bulk_review(
@@ -2039,12 +2455,15 @@ class ReviewPage(QWidget):
             self._batch_worker = worker
             self._batch_pool.start(worker)
         except Exception as exc:
+            elapsed = self._batch_elapsed_seconds()
             self._batch_worker = None
+            self._batch_started_at = None
             self._set_batch_running(False)
             QMessageBox.critical(
                 self,
                 "完成手工审核失败",
-                f"无法启动批量审核任务：{exc}",
+                f"无法启动批量审核任务：{exc}\n\n"
+                f"总耗时：{format_elapsed_time(elapsed)}",
             )
 
     def _set_batch_running(
@@ -2137,8 +2556,10 @@ class ReviewPage(QWidget):
     ) -> None:
         if self._batch_worker is not worker:
             return
-        reload_error = self._finish_bulk_review(worker)
         summary = result if isinstance(result, dict) else {}
+        elapsed = self._batch_elapsed_seconds(summary)
+        self._batch_started_at = None
+        reload_error = self._finish_bulk_review(worker)
         stopped = bool(summary.get("已停止", False))
         succeeded = int(summary.get("成功", 0))
         skipped = int(summary.get("跳过", 0))
@@ -2157,6 +2578,7 @@ class ReviewPage(QWidget):
             )
             if details:
                 message += f"\n\n{details}"
+        message += f"\n\n总耗时：{format_elapsed_time(elapsed)}"
         if reload_error:
             message += f"\n\n批量审核已经结束，但页面刷新失败：{reload_error}"
             QMessageBox.critical(self, "完成手工审核", message)
@@ -2177,8 +2599,13 @@ class ReviewPage(QWidget):
     ) -> None:
         if self._batch_worker is not worker:
             return
+        elapsed = self._batch_elapsed_seconds()
+        self._batch_started_at = None
         reload_error = self._finish_bulk_review(worker)
-        detail = f"批量审核任务异常终止：{message}"
+        detail = (
+            f"批量审核任务异常终止：{message}\n\n"
+            f"总耗时：{format_elapsed_time(elapsed)}"
+        )
         if reload_error:
             detail += f"\n\n页面刷新失败：{reload_error}"
         QMessageBox.critical(
@@ -2187,6 +2614,18 @@ class ReviewPage(QWidget):
             detail,
         )
         self.status_message.emit("批量审核任务异常终止。")
+
+    def _batch_elapsed_seconds(self, result: dict[str, Any] | None = None) -> float:
+        if result is not None:
+            try:
+                elapsed = float(result.get("总耗时秒", -1.0))
+            except (TypeError, ValueError):
+                elapsed = -1.0
+            if elapsed >= 0.0:
+                return elapsed
+        if self._batch_started_at is None:
+            return 0.0
+        return max(0.0, time.perf_counter() - self._batch_started_at)
 
     def _finish_bulk_review(self, worker: _BulkReviewWorker) -> str:
         """刷新批处理结果，并确保任何刷新异常都不会遗留页面锁定。"""
@@ -2863,8 +3302,8 @@ class ReviewPage(QWidget):
             self._item_tree.setCurrentItem(target_node)
 
     def _request_home(self) -> None:
-        if self._batch_running:
-            self.status_message.emit("正在完成手工审核，请等待任务结束。")
+        if self._batch_running or self._save_running:
+            self.status_message.emit("正在保存手工审核结果，请等待任务结束。")
             return
         if self._canvas.is_dirty and not self._confirm_discard():
             return
@@ -2874,19 +3313,27 @@ class ReviewPage(QWidget):
         dialog = QMessageBox(self)
         dialog.setWindowTitle("尚未保存")
         dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setText("当前字形有未保存的修改，是否放弃修改？")
+        dialog.setText("当前字形有未保存的修改，请先决定如何处理。")
         dialog.setStandardButtons(
-            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel
         )
-        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Save)
+        save_button = dialog.button(QMessageBox.StandardButton.Save)
         discard_button = dialog.button(QMessageBox.StandardButton.Discard)
         cancel_button = dialog.button(QMessageBox.StandardButton.Cancel)
+        if save_button is not None:
+            save_button.setText("保存修改")
         if discard_button is not None:
             discard_button.setText("放弃修改")
         if cancel_button is not None:
             cancel_button.setText("取消")
             dialog.setEscapeButton(cancel_button)
-        if dialog.exec() != QMessageBox.StandardButton.Discard.value:
+        choice = dialog.exec()
+        if choice == QMessageBox.StandardButton.Save.value:
+            return self.save_current()
+        if choice != QMessageBox.StandardButton.Discard.value:
             return False
         self._canvas.discard_changes()
         return True
@@ -3532,8 +3979,22 @@ class ReviewPage(QWidget):
         )
         return button
 
+    @staticmethod
+    def _fit_navigation_button(button: QToolButton) -> None:
+        """为中文导航文字预留边框、内边距和系统缩放余量。"""
+
+        text_width = button.fontMetrics().horizontalAdvance(button.text())
+        button.setFixedWidth(max(76, text_width + 42))
+
+    def showEvent(self, event: Any) -> None:
+        """主题字体在首次显示时才稳定，随后重新核算导航文字宽度。"""
+
+        super().showEvent(event)
+        self._fit_navigation_button(self._previous_button)
+        self._fit_navigation_button(self._next_button)
+
     def shutdown(self) -> None:
-        """关闭程序时取消批量审核并释放排队中的缩略图任务。"""
+        """关闭程序时收拢保存任务并释放后台缩略图。"""
 
         self._list_thumbnail_generation += 1
         self._list_thumbnail_timer.stop()
@@ -3541,6 +4002,8 @@ class ReviewPage(QWidget):
             self._batch_worker.request_cancel()
         self._list_thumbnail_pool.clear()
         self._batch_pool.clear()
+        self._save_pool.clear()
+        self._save_pool.waitForDone()
         self._list_thumbnail_workers.clear()
         self._list_thumbnail_inflight.clear()
         self._list_thumbnail_cache.clear()

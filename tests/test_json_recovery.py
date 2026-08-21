@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import config
+from data.library_database import LIBRARY_DATABASE_FILENAME, LibraryDatabase
 from services.batch_persistence import BatchPersistenceSession, JOURNAL_FILENAME
 from services.glyph_service import GlyphService
 from utils.file_utils import atomic_write_json, safe_read_json
@@ -42,7 +43,6 @@ class JsonRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             service, first_id, second_id = self._build_service(directory)
             json_path = Path(directory) / "恢复测试.json"
-            backup_path = Path(str(json_path) + ".bak")
             second_before = dict(service.get_variant(second_id))
             journal_path = self._leave_reviewed_journal(service, first_id)
             json_path.write_bytes(b"{corrupt-main")
@@ -51,8 +51,7 @@ class JsonRecoveryTests(unittest.TestCase):
 
             self.assertEqual(recovered.get_variant(first_id)["状态"], config.STATUS_REVIEWED)
             self.assertEqual(recovered.get_variant(second_id), second_before)
-            self.assertIsInstance(json.loads(json_path.read_text(encoding="utf-8")), dict)
-            self.assertIsInstance(json.loads(backup_path.read_text(encoding="utf-8")), dict)
+            self.assertEqual(json_path.read_bytes(), b"{corrupt-main")
             self.assertFalse(journal_path.exists())
 
     def test_missing_main_uses_backup_then_replays_journal(self) -> None:
@@ -60,11 +59,11 @@ class JsonRecoveryTests(unittest.TestCase):
             service, first_id, second_id = self._build_service(directory)
             json_path = Path(directory) / "恢复测试.json"
             journal_path = self._leave_reviewed_journal(service, first_id)
-            json_path.unlink()
+            json_path.unlink(missing_ok=True)
 
             recovered = GlyphService("恢复测试", directory)
 
-            self.assertTrue(json_path.is_file())
+            self.assertFalse(json_path.exists())
             self.assertIsNotNone(recovered.get_variant(second_id))
             self.assertEqual(recovered.get_variant(first_id)["状态"], config.STATUS_REVIEWED)
             self.assertFalse(journal_path.exists())
@@ -129,6 +128,31 @@ class JsonRecoveryTests(unittest.TestCase):
 
             self.assertEqual(safe_read_json(str(json_path))["状态"], "已恢复")
             self.assertEqual(backup_path.read_bytes(), b"good-backup")
+
+    def test_library_uses_sqlite_without_generating_main_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service, _first_id, _second_id = self._build_service(directory)
+            json_path = Path(directory) / f"{service.ziku_name}.json"
+
+            self.assertFalse(json_path.exists())
+            database_path = Path(directory) / LIBRARY_DATABASE_FILENAME
+            self.assertTrue(database_path.is_file())
+            self.assertEqual(LibraryDatabase.open(directory).load_data()["数据版本"], 3)
+
+    def test_atomic_backup_falls_back_when_hardlink_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            json_path = Path(directory) / "data.json"
+            atomic_write_json({"值": 1}, str(json_path))
+
+            with (
+                patch("utils.file_utils.os.link", side_effect=OSError("不支持硬链接")),
+                patch("utils.file_utils.shutil.copy2", wraps=__import__("shutil").copy2) as copy,
+            ):
+                atomic_write_json({"值": 2}, str(json_path))
+
+            copy.assert_called_once()
+            self.assertEqual(safe_read_json(str(json_path))["值"], 2)
+            self.assertEqual(safe_read_json(str(json_path) + ".bak")["值"], 1)
 
 
 if __name__ == "__main__":

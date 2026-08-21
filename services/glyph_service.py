@@ -12,6 +12,7 @@ from typing import Any, Optional, Tuple
 from send2trash import send2trash
 
 import config
+from data.library_database import LibraryDatabase, library_database_path
 from services.batch_persistence import (
     JOURNAL_FILENAME,
     acquire_batch_library_lock,
@@ -84,11 +85,21 @@ class GlyphService:
         return cls(ziku_name, ziku_dir)
 
     def __init__(self, ziku_name: str, ziku_dir: str) -> None:
-        """兼容旧调用；正式运行代码应使用 :meth:`open` 明确副作用。"""
+        """打开 SQLite 字库；首次打开旧字库时执行一次性导入。"""
         self.ziku_name = ziku_name
         self.ziku_dir = ziku_dir
         self._json_path = os.path.join(ziku_dir, f"{ziku_name}.json")
+        self._database: LibraryDatabase | None = None
+        self._dirty_variant_ids: set[str] = set()
+        self._deleted_variant_ids: set[str] = set()
+        self._all_variants_dirty = False
         self._data = self._load_or_init()
+        if self._database is None:
+            self._database = LibraryDatabase.install_from_data(
+                self.ziku_dir,
+                self._data,
+                source_path=self._json_path if os.path.isfile(self._json_path) else "",
+            )
         self._migrate_workflow_dirs()
 
     def _migrate_workflow_dirs(self) -> None:
@@ -106,7 +117,25 @@ class GlyphService:
             os.replace(old_path, new_path)
 
     def _load_or_init(self) -> dict[str, Any]:
-        """读取当前数据，并兼容迁移旧版流程状态名称。"""
+        """读取数据库，或将当前 JSON 字库一次性导入数据库。"""
+        database_path = library_database_path(self.ziku_dir)
+        if os.path.isfile(database_path):
+            self._database = LibraryDatabase.open(self.ziku_dir)
+            data = self._database.load_data()
+            if self._normalize_database_data(data):
+                self._database.save_full_data(data)
+            recover_file_transactions(
+                data,
+                ziku_dir=self.ziku_dir,
+                persist_callback=self._database.save_full_data,
+            )
+            recover_batch_journal(
+                data,
+                ziku_name=self.ziku_name,
+                ziku_dir=self.ziku_dir,
+                persist_callback=self._database.save_full_data,
+            )
+            return data
         backup_path = self._json_path + ".bak"
         journal_path = os.path.join(self.ziku_dir, JOURNAL_FILENAME)
         file_transaction_exists = has_file_transaction_artifacts(self.ziku_dir)
@@ -133,6 +162,7 @@ class GlyphService:
                 atomic_write_json(
                     data,
                     self._json_path,
+                    indent=None,
                     backup_existing=False,
                 )
             if data.get("数据版本") != 3:
@@ -191,7 +221,7 @@ class GlyphService:
                     detail["整体协调参数"] = {}
                     data_changed = True
             if data_changed:
-                atomic_write_json(data, self._json_path)
+                atomic_write_json(data, self._json_path, indent=None)
             return data
         current_time = self._now()
         return {
@@ -211,6 +241,29 @@ class GlyphService:
             "变体详情": {},
             "整体协调": self._default_coordination_summary(),
         }
+
+    def _normalize_database_data(self, data: dict[str, Any]) -> bool:
+        """补齐当前数据契约，避免缺失字段被错误判定为已完成。"""
+        changed = False
+        coordination = data.get("整体协调")
+        if not isinstance(coordination, dict):
+            coordination = {}
+            data["整体协调"] = coordination
+            changed = True
+        contract_fields = ("墨色方法", "墨色方法版本", "墨色统计")
+        missing_contract = any(key not in coordination for key in contract_fields)
+        for key, default_value in self._default_coordination_summary().items():
+            if key not in coordination:
+                coordination[key] = copy.deepcopy(default_value)
+                changed = True
+        if missing_contract and coordination.get("墨色统一完成") is True:
+            coordination["墨色统一完成"] = False
+            changed = True
+        for detail in data.get("变体详情", {}).values():
+            if isinstance(detail, dict) and "整体协调参数" not in detail:
+                detail["整体协调参数"] = {}
+                changed = True
+        return changed
 
     def init_metadata(
         self,
@@ -234,6 +287,13 @@ class GlyphService:
     def get_metadata(self) -> dict[str, Any]:
         return dict(self._data.get("元数据", {}))
 
+    def remove_metadata_keys(self, *keys: str) -> None:
+        """删除不再使用的字库参数字段。"""
+        metadata = self._data.setdefault("元数据", {})
+        for key in keys:
+            metadata.pop(key, None)
+        self._update_mtime()
+
     def snapshot_state(self) -> dict[str, Any]:
         """复制完整字库状态，供跨文件保存事务失败时恢复。"""
         return copy.deepcopy(self._data)
@@ -244,6 +304,7 @@ class GlyphService:
             raise TypeError("字库状态快照必须是字典。")
         self._data.clear()
         self._data.update(copy.deepcopy(snapshot))
+        self._all_variants_dirty = True
 
     def snapshot_variant_state(
         self,
@@ -304,9 +365,10 @@ class GlyphService:
                     groups[str(char)] = copy.deepcopy(variant_ids)
                 else:
                     groups.pop(str(char), None)
+        self._dirty_variant_ids.add(variant_id)
 
     def rename_ziku(self, new_name: str) -> str:
-        """改名字库目录、数据文件和库名，返回改名后的目录。"""
+        """改名字库目录和数据库内库名，返回改名后的目录。"""
         new_name = new_name.strip()
         if not new_name:
             raise ValueError("字库名称不能为空。")
@@ -319,32 +381,26 @@ class GlyphService:
         old_dir = os.path.abspath(self.ziku_dir)
         parent_dir = os.path.dirname(old_dir)
         new_dir = os.path.join(parent_dir, new_name)
-        old_json_path = self._json_path
-        renamed_json_path = os.path.join(old_dir, f"{new_name}.json")
-        final_json_path = os.path.join(new_dir, f"{new_name}.json")
         if os.path.exists(new_dir):
             raise FileExistsError(f"字库“{new_name}”已存在。")
-        if os.path.exists(renamed_json_path):
-            raise FileExistsError(f"数据文件“{new_name}.json”已存在。")
 
         self._data["库名"] = new_name
         self._data.setdefault("元数据", {})["最后修改"] = self._now()
         try:
-            os.replace(old_json_path, renamed_json_path)
             os.replace(old_dir, new_dir)
             self.ziku_name = new_name
             self.ziku_dir = new_dir
-            self._json_path = final_json_path
+            self._json_path = os.path.join(new_dir, f"{new_name}.json")
+            self._database = LibraryDatabase.open(new_dir)
             self.save()
         except Exception:
             self._data["库名"] = old_name
             if os.path.exists(new_dir) and not os.path.exists(old_dir):
                 os.replace(new_dir, old_dir)
-            if os.path.exists(renamed_json_path) and not os.path.exists(old_json_path):
-                os.replace(renamed_json_path, old_json_path)
             self.ziku_name = old_name
             self.ziku_dir = old_dir
-            self._json_path = old_json_path
+            self._json_path = os.path.join(old_dir, f"{old_name}.json")
+            self._database = LibraryDatabase.open(old_dir)
             raise
         return new_dir
 
@@ -371,6 +427,7 @@ class GlyphService:
             else:
                 detail["状态"] = config.STATUS_PENDING_OPTIMIZATION
             invalidated_count += 1
+        self._all_variants_dirty = True
         self._data["整体协调"] = self._default_coordination_summary()
         self.save()
         return invalidated_count
@@ -442,6 +499,7 @@ class GlyphService:
         }
         self._data["变体详情"][variant_id] = detail
         self._data["字形组索引"].setdefault(target_char, []).append(variant_id)
+        self._dirty_variant_ids.add(variant_id)
         self._update_mtime()
         return variant_id
 
@@ -451,6 +509,7 @@ class GlyphService:
         detail = self._data["变体详情"].pop(variant_id, None)
         if not detail:
             return
+        self._deleted_variant_ids.add(variant_id)
         target_char = str(detail.get("归属字", ""))
         variants = self._data["字形组索引"].get(target_char, [])
         remaining = [item for item in variants if item != variant_id]
@@ -688,6 +747,8 @@ class GlyphService:
         return normalized
 
     def get_variant(self, variant_id: str) -> dict[str, Any]:
+        if variant_id in self._data["变体详情"]:
+            self._dirty_variant_ids.add(variant_id)
         return self._data["变体详情"].get(variant_id, {})
 
     def get_variants(self) -> dict[str, dict[str, Any]]:
@@ -957,6 +1018,7 @@ class GlyphService:
         detail = self._data["变体详情"].pop(variant_id, None)
         if not detail:
             return False
+        self._deleted_variant_ids.add(variant_id)
         target_char = str(detail.get("归属字", ""))
         index = self._data["字形组索引"].get(target_char, [])
         self._data["字形组索引"][target_char] = [number for number in index if number != variant_id]
@@ -974,6 +1036,7 @@ class GlyphService:
         detail = self._data["变体详情"].pop(variant_id, None)
         if not detail:
             return
+        self._deleted_variant_ids.add(variant_id)
         workflow_dirs = self.get_workflow_dirs()
         layer_fields = (
             ("原图", "原始文件"),
@@ -1005,9 +1068,12 @@ class GlyphService:
             self.remove_variant(variant_id, char)
 
     def get_char_variants(self, char: str) -> list[dict[str, Any]]:
-        return [self._data["变体详情"][number] for number in self._data["字形组索引"].get(char, []) if number in self._data["变体详情"]]
+        variant_ids = self._data["字形组索引"].get(char, [])
+        self._dirty_variant_ids.update(variant_ids)
+        return [self._data["变体详情"][number] for number in variant_ids if number in self._data["变体详情"]]
 
     def get_all_variants(self) -> list[dict[str, Any]]:
+        self._all_variants_dirty = True
         return list(self._data["变体详情"].values())
 
     def get_all_chars(self) -> list[str]:
@@ -1025,6 +1091,12 @@ class GlyphService:
     def get_total_count(self) -> int:
         return len(self._data["变体详情"])
 
+    def save_library_summary(self, summary: Mapping[str, Any]) -> None:
+        """保存可重建的字库摘要，供首页和核对流程复用。"""
+        if self._database is None:
+            raise RuntimeError("字库数据库尚未初始化。")
+        self._database.save_summary(summary)
+
     def save_session(self, char: str, variant_index: int = 0) -> None:
         self._data["会话"] = {"上次编辑字": char, "变体索引": variant_index}
         self.save()
@@ -1034,7 +1106,21 @@ class GlyphService:
         return session if session.get("上次编辑字") else None
 
     def save(self) -> None:
-        atomic_write_json(self._data, self._json_path)
+        if self._database is None:
+            raise RuntimeError("字库数据库尚未初始化。")
+        dirty_ids = (
+            self._data["变体详情"].keys()
+            if self._all_variants_dirty
+            else self._dirty_variant_ids
+        )
+        self._database.save_data(
+            self._data,
+            dirty_variant_ids=dirty_ids,
+            deleted_variant_ids=self._deleted_variant_ids,
+        )
+        self._dirty_variant_ids.clear()
+        self._deleted_variant_ids.clear()
+        self._all_variants_dirty = False
 
     def _remove_finished_file(self, detail: dict[str, Any]) -> None:
         filename = str(detail.get("成品文件", ""))

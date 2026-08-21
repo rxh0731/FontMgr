@@ -9,14 +9,35 @@ from unittest.mock import patch
 import config
 from services.batch_persistence import (
     JOURNAL_FILENAME,
+    JOURNAL_VERSION,
     BatchJournalUncertainError,
     BatchPersistenceSession,
+    _compact_json,
+    _payload_checksum,
 )
+from data.library_database import LibraryDatabase
 from services.glyph_service import GlyphService
-from utils.file_utils import safe_read_json
 
 
 class BatchPersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _write_legacy_record(
+        service: GlyphService,
+        variant_id: str,
+        *,
+        newline: bool = True,
+    ) -> Path:
+        payload = {
+            "版本": JOURNAL_VERSION,
+            "库名": service.ziku_name,
+            "状态": service.snapshot_variant_state(variant_id),
+        }
+        record = {"载荷": payload, "校验": _payload_checksum(payload)}
+        path = Path(service.ziku_dir) / JOURNAL_FILENAME
+        suffix = "\n" if newline else ""
+        path.write_text(_compact_json(record) + suffix, encoding="utf-8")
+        return path
+
     def _build_service(self, directory: str) -> tuple[GlyphService, str, str]:
         service = GlyphService("测试库", directory)
         service.ensure_dirs()
@@ -60,7 +81,6 @@ class BatchPersistenceTests(unittest.TestCase):
     def test_checkpoint_groups_multiple_variant_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, first_id, second_id = self._build_service(directory)
-            json_path = Path(directory) / "测试库.json"
             session = BatchPersistenceSession(
                 service,
                 checkpoint_items=2,
@@ -70,10 +90,10 @@ class BatchPersistenceTests(unittest.TestCase):
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
             session.record_variant(first_id)
             self.assertFalse(session.checkpoint_if_due())
-            on_disk = safe_read_json(str(json_path))
+            on_disk = LibraryDatabase.open(directory).load_data()
             self.assertEqual(
                 on_disk["变体详情"][first_id]["状态"],
-                config.STATUS_PENDING_OPTIMIZATION,
+                config.STATUS_REVIEWED,
             )
 
             service.update_variant(second_id, **{"状态": config.STATUS_REVIEWED})
@@ -81,7 +101,7 @@ class BatchPersistenceTests(unittest.TestCase):
             self.assertTrue(session.checkpoint_if_due())
             session.finish()
 
-            saved = safe_read_json(str(json_path))
+            saved = LibraryDatabase.open(directory).load_data()
             self.assertEqual(
                 saved["变体详情"][first_id]["状态"],
                 config.STATUS_REVIEWED,
@@ -103,19 +123,16 @@ class BatchPersistenceTests(unittest.TestCase):
                         "services.batch_persistence.time.monotonic",
                         return_value=session._last_checkpoint,
                     ),
-                    patch("services.batch_persistence.os.fsync") as fsync_mock,
                     patch.object(service, "save", wraps=service.save) as save_mock,
                 ):
                     for _index in range(99):
                         session.record_variant(first_id)
                         self.assertFalse(session.checkpoint_if_due())
 
-                    self.assertEqual(save_mock.call_count, 0)
-                    self.assertEqual(fsync_mock.call_count, 99)
+                    self.assertEqual(save_mock.call_count, 99)
                     session.record_variant(first_id)
                     self.assertTrue(session.checkpoint_if_due())
-                    self.assertEqual(save_mock.call_count, 1)
-                    self.assertGreaterEqual(fsync_mock.call_count, 100)
+                    self.assertEqual(save_mock.call_count, 100)
             finally:
                 session.finish()
 
@@ -141,26 +158,25 @@ class BatchPersistenceTests(unittest.TestCase):
                 finally:
                     session.leave_for_recovery()
 
-            self.assertEqual(save_mock.call_count, 3)
+            self.assertEqual(save_mock.call_count, 9)
 
     def test_finish_forces_remaining_large_library_state_to_full_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service, first_id, _second_id = self._build_service(directory)
-            json_path = Path(directory) / "测试库.json"
             with patch.object(service, "get_total_count", return_value=1000):
                 session = BatchPersistenceSession(service)
 
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
             session.record_variant(first_id)
             self.assertEqual(
-                safe_read_json(str(json_path))["变体详情"][first_id]["状态"],
-                config.STATUS_PENDING_OPTIMIZATION,
+                LibraryDatabase.open(directory).load_data()["变体详情"][first_id]["状态"],
+                config.STATUS_REVIEWED,
             )
 
             session.finish()
 
             self.assertEqual(
-                safe_read_json(str(json_path))["变体详情"][first_id]["状态"],
+                LibraryDatabase.open(directory).load_data()["变体详情"][first_id]["状态"],
                 config.STATUS_REVIEWED,
             )
             self.assertFalse((Path(directory) / JOURNAL_FILENAME).exists())
@@ -190,17 +206,13 @@ class BatchPersistenceTests(unittest.TestCase):
             session = BatchPersistenceSession(service)
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
 
-            with patch(
-                "services.batch_persistence.os.fsync",
-                side_effect=[OSError("模拟首次同步失败"), None],
-            ) as fsync_mock:
-                with self.assertRaisesRegex(OSError, "模拟首次同步失败"):
+            with patch.object(service, "save", side_effect=OSError("模拟数据库提交失败")):
+                with self.assertRaisesRegex(BatchJournalUncertainError, "数据库提交结果无法确认"):
                     session.record_variant(first_id)
 
-            self.assertEqual(fsync_mock.call_count, 2)
             self.assertEqual(session.pending_count, 0)
             journal_path = Path(directory) / JOURNAL_FILENAME
-            self.assertEqual(journal_path.read_bytes(), b"")
+            self.assertFalse(journal_path.exists())
             session.leave_for_recovery()
 
             recovered = GlyphService("测试库", directory)
@@ -217,13 +229,10 @@ class BatchPersistenceTests(unittest.TestCase):
             session = BatchPersistenceSession(service)
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
 
-            with patch(
-                "services.batch_persistence.os.fsync",
-                side_effect=[OSError("模拟日志同步失败"), OSError("模拟回退同步失败")],
-            ):
+            with patch.object(service, "save", side_effect=OSError("模拟数据库提交失败")):
                 with self.assertRaisesRegex(
                     BatchJournalUncertainError,
-                    "未能安全回退",
+                    "数据库提交结果无法确认",
                 ):
                     session.record_variant(first_id)
 
@@ -262,9 +271,8 @@ class BatchPersistenceTests(unittest.TestCase):
             service, first_id, _second_id = self._build_service(directory)
             session = BatchPersistenceSession(service)
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
-            session.record_variant(first_id)
             session.leave_for_recovery()
-            journal_path = Path(directory) / JOURNAL_FILENAME
+            journal_path = self._write_legacy_record(service, first_id)
             with open(journal_path, "ab") as handle:
                 handle.write(b'{"incomplete"')
                 handle.flush()
@@ -283,10 +291,8 @@ class BatchPersistenceTests(unittest.TestCase):
             service, first_id, _second_id = self._build_service(directory)
             session = BatchPersistenceSession(service)
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
-            session.record_variant(first_id)
             session.leave_for_recovery()
-            journal_path = Path(directory) / JOURNAL_FILENAME
-            journal_path.write_bytes(journal_path.read_bytes().removesuffix(b"\n"))
+            journal_path = self._write_legacy_record(service, first_id, newline=False)
 
             recovered = GlyphService("测试库", directory)
 
@@ -301,9 +307,8 @@ class BatchPersistenceTests(unittest.TestCase):
             service, first_id, _second_id = self._build_service(directory)
             session = BatchPersistenceSession(service)
             service.update_variant(first_id, **{"状态": config.STATUS_REVIEWED})
-            session.record_variant(first_id)
             session.leave_for_recovery()
-            journal_path = Path(directory) / JOURNAL_FILENAME
+            journal_path = self._write_legacy_record(service, first_id)
             with open(journal_path, "ab") as handle:
                 handle.write(b'{"incomplete"\n')
                 handle.flush()

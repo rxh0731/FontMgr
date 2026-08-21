@@ -133,7 +133,7 @@ class OptimizationService:
         return self._glyph.move_variant_to_char(variant_id, new_char)
 
     def create_batch_persistence(self) -> BatchPersistenceSession:
-        """为整库任务创建轻量日志与分组提交会话。"""
+        """为整库任务创建逐字数据库提交会话。"""
         return BatchPersistenceSession(self._glyph)
 
     def list_items(self) -> list[dict[str, Any]]:
@@ -1501,10 +1501,8 @@ class OptimizationService:
                     output_hashes,
                 )
             }
-            # 批量首次处理没有任何 JSON 引用的旧阶段文件时允许快速直装：
-            # 进程中止最多留下未引用新图，字形仍待优化，重试会完整覆盖。
-            # 交互保存及任何含旧引用的记录继续使用完整持久图片事务。
-            requires_transaction = persistence is None or bool(recorded_stage_paths)
+            # SQLite 提交失败时仍需独立清单恢复，首次生成也使用图片事务。
+            requires_transaction = True
             if requires_transaction:
                 changes: list[FileChange] = []
                 seen_targets: set[str] = set()
@@ -1567,8 +1565,7 @@ class OptimizationService:
                 try:
                     persistence.record_variant(variant_id)
                 except BatchJournalUncertainError:
-                    # 日志可能已经包含完整记录。此时回滚图片会让下次重放
-                    # 指向旧文件；保留新文件和内存状态，由启动恢复统一裁决。
+                    # 数据库提交结果未知，保留图片和清单，由启动恢复统一裁决。
                     state_persisted = True
                     raise
             state_persisted = True

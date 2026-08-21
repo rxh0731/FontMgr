@@ -352,17 +352,48 @@ class ImportPageTests(unittest.TestCase):
         self.assertTrue(page._return_home_after_import)
         self.assertFalse(page._progress_bar.isHidden())
 
-        with patch("ui.pages.import_page.QMessageBox.information"):
+        with patch("ui.pages.import_page.QMessageBox.information") as information:
             page._import_finished(
                 {"已取消": True, "成功": 2, "跳过": 0, "失败": 0, "字库路径": "路径"},
                 context,
             )
+
+        self.assertIn("总耗时：", information.call_args.args[2])
 
         self.assertEqual(home_requests, [True])
         self.assertIsNone(page._active_import_token)
         self.assertIsNone(page._active_task_kind)
         self.assertTrue(page._progress_bar.isHidden())
         page.deleteLater()
+
+    def test_create_and_append_completion_feedback_include_elapsed_time(self) -> None:
+        for append_mode in (False, True):
+            with self.subTest(append_mode=append_mode):
+                page = ImportPage()
+                context = ImportRunContext(
+                    token=1,
+                    append_mode=append_mode,
+                    library_name="测试库",
+                    target_directory="",
+                    cancel_event=threading.Event(),
+                    directory_created=threading.Event(),
+                )
+                page._active_import_token = context.token
+                page._active_task_kind = "import"
+
+                with patch("ui.pages.import_page.QMessageBox.information") as information:
+                    page._import_finished(
+                        {"成功": 3, "跳过": 1, "失败": 0, "字库路径": "路径"},
+                        context,
+                    )
+
+                message = information.call_args.args[2]
+                self.assertIn(
+                    "字库添加完成" if append_mode else "字库“测试库”创建完成",
+                    message,
+                )
+                self.assertIn("总耗时：", message)
+                page.deleteLater()
 
     def test_late_import_failure_cannot_delete_new_task_directory(self) -> None:
         """旧导入失败信号不得按新任务状态清目录或解锁新页面。"""

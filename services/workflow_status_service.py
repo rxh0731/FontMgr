@@ -357,6 +357,144 @@ def project_stage_status(
         dirty,
         verify_files=verify_files,
     )
+    return _project_stage_status_from_workflow(
+        source,
+        workflow,
+        finished_dir,
+        phase,
+        verify_files=verify_files,
+    )
+
+
+def project_all_stage_statuses(
+    detail: Mapping[str, Any] | None,
+    coordination_summary: Mapping[str, Any] | None,
+    finished_dir: str | os.PathLike[str],
+    *,
+    verify_files: bool = True,
+) -> dict[str, WorkflowStageProjection]:
+    """只解析一次内部工作流，并投影三个制作阶段。"""
+
+    source = detail if isinstance(detail, Mapping) else {}
+    workflow = resolve_workflow_status(
+        source,
+        coordination_summary,
+        finished_dir,
+        verify_files=verify_files,
+    )
+    facts = _stage_projection_facts(
+        source,
+        workflow,
+        finished_dir,
+        verify_files=verify_files,
+    )
+    return {
+        phase: _project_stage_status_from_workflow(
+            source,
+            workflow,
+            finished_dir,
+            phase,
+            verify_files=verify_files,
+            facts=facts,
+        )
+        for phase in WORKFLOW_PHASES
+    }
+
+
+def _project_stage_status_from_workflow(
+    source: Mapping[str, Any],
+    workflow: WorkflowStatus,
+    finished_dir: str | os.PathLike[str],
+    phase: str,
+    *,
+    verify_files: bool,
+    facts: Mapping[str, Any] | None = None,
+) -> WorkflowStageProjection:
+    """使用已解析的内部状态生成单个阶段投影。"""
+
+    values = facts or _stage_projection_facts(
+        source,
+        workflow,
+        finished_dir,
+        verify_files=verify_files,
+    )
+    primary_status = str(values["primary_status"])
+    valid_original = bool(values["valid_original"])
+    valid_reviewed_file = bool(values["valid_reviewed_file"])
+    reviewed_filename = str(values["reviewed_filename"])
+    review_claimed_complete = bool(values["review_claimed_complete"])
+    review_completed = bool(values["review_completed"])
+    optimization_completed = bool(values["optimization_completed"])
+    finished_proves_previous = bool(values["finished_proves_previous"])
+
+    if phase == PHASE_OPTIMIZATION:
+        admitted = True
+        completed = optimization_completed
+        file_error = (
+            primary_status not in _PRIMARY_STAGE_MAP
+            or (
+                primary_status == config.STATUS_PENDING_OPTIMIZATION
+                and not valid_original
+            )
+            or (
+                primary_status != config.STATUS_PENDING_OPTIMIZATION
+                and not optimization_completed
+            )
+        )
+    elif phase == PHASE_REVIEW:
+        admitted = optimization_completed
+        completed = admitted and review_completed
+        file_error = (
+            admitted
+            and (
+                (
+                    primary_status == config.STATUS_PENDING_MANUAL_REVIEW
+                    and bool(reviewed_filename)
+                    and not valid_reviewed_file
+                )
+                or (
+                    review_claimed_complete
+                    and not review_completed
+                )
+            )
+        )
+    else:
+        admitted = review_completed
+        completed = admitted and workflow.is_completed
+        file_error = (
+            admitted
+            and primary_status == config.STATUS_FINISHED
+            and not workflow.has_valid_finished
+        )
+
+    markers = _projection_markers(workflow, phase, file_error=file_error)
+
+    status = ""
+    if admitted:
+        status = (
+            PHASE_COMPLETED_STATUSES[phase]
+            if completed
+            else PHASE_PENDING_STATUSES[phase]
+        )
+    return WorkflowStageProjection(
+        phase=phase,
+        status=status,
+        admitted=admitted,
+        completed=completed,
+        markers=markers,
+        workflow=workflow,
+    )
+
+
+def _stage_projection_facts(
+    source: Mapping[str, Any],
+    workflow: WorkflowStatus,
+    finished_dir: str | os.PathLike[str],
+    *,
+    verify_files: bool,
+) -> dict[str, Any]:
+    """集中计算三个阶段共用的文件与准入事实。"""
+
     primary_status = _normalize_primary_status(source.get("状态"))
     library_dir = _library_dir_from_finished_dir(finished_dir)
     valid_original = (
@@ -423,64 +561,16 @@ def project_stage_status(
         or review_completed
         or finished_proves_previous
     )
-
-    if phase == PHASE_OPTIMIZATION:
-        admitted = True
-        completed = optimization_completed
-        file_error = (
-            primary_status not in _PRIMARY_STAGE_MAP
-            or (
-                primary_status == config.STATUS_PENDING_OPTIMIZATION
-                and not valid_original
-            )
-            or (
-                primary_status != config.STATUS_PENDING_OPTIMIZATION
-                and not optimization_completed
-            )
-        )
-    elif phase == PHASE_REVIEW:
-        admitted = optimization_completed
-        completed = admitted and review_completed
-        file_error = (
-            admitted
-            and (
-                (
-                    primary_status == config.STATUS_PENDING_MANUAL_REVIEW
-                    and bool(reviewed_filename)
-                    and not valid_reviewed_file
-                )
-                or (
-                    review_claimed_complete
-                    and not review_completed
-                )
-            )
-        )
-    else:
-        admitted = review_completed
-        completed = admitted and workflow.is_completed
-        file_error = (
-            admitted
-            and primary_status == config.STATUS_FINISHED
-            and not workflow.has_valid_finished
-        )
-
-    markers = _projection_markers(workflow, phase, file_error=file_error)
-
-    status = ""
-    if admitted:
-        status = (
-            PHASE_COMPLETED_STATUSES[phase]
-            if completed
-            else PHASE_PENDING_STATUSES[phase]
-        )
-    return WorkflowStageProjection(
-        phase=phase,
-        status=status,
-        admitted=admitted,
-        completed=completed,
-        markers=markers,
-        workflow=workflow,
-    )
+    return {
+        "primary_status": primary_status,
+        "valid_original": valid_original,
+        "valid_reviewed_file": valid_reviewed_file,
+        "reviewed_filename": reviewed_filename,
+        "review_claimed_complete": review_claimed_complete,
+        "review_completed": review_completed,
+        "optimization_completed": optimization_completed,
+        "finished_proves_previous": finished_proves_previous,
+    }
 
 
 def _normalize_primary_status(raw_status: object) -> str:

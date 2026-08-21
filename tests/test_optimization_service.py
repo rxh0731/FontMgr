@@ -39,6 +39,7 @@ from services.background_model_service import (
     BackgroundModelDescriptor,
     BackgroundModelInferenceResult,
 )
+from services.file_transaction_recovery import FileTransaction
 from services.workflow_status_service import (
     MARKER_FILE_ERROR,
     STAGE_COMPLETED,
@@ -1646,7 +1647,8 @@ class OptimizationServiceTests(unittest.TestCase):
                     side_effect=AssertionError("PNG 编码完成后不应再次回读计算摘要"),
                 ),
                 patch(
-                    "services.optimization_service.FileTransaction.begin"
+                    "services.optimization_service.FileTransaction.begin",
+                    wraps=FileTransaction.begin,
                 ) as begin_transaction,
             ):
                 service.save_selection(
@@ -1655,7 +1657,7 @@ class OptimizationServiceTests(unittest.TestCase):
                     persistence=MagicMock(),
                 )
 
-            begin_transaction.assert_not_called()
+            begin_transaction.assert_called_once()
 
             call_args = glyph.confirm_optimization.call_args
             preview_path = Path(workflow_dirs["优化预览"]) / "流式摘要.png"

@@ -1,4 +1,4 @@
-"""批处理字形状态的轻量日志与分组持久化。"""
+"""批处理字形状态的逐字数据库提交与旧日志恢复。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from utils.file_utils import atomic_write_json
 
@@ -32,7 +32,7 @@ _LARGE_CHECKPOINT_SECONDS = 12.0
 
 
 class BatchJournalUncertainError(RuntimeError):
-    """日志提交结果无法确认；调用方必须保留当前图片并停止批处理。"""
+    """数据库提交结果无法确认；调用方必须保留当前图片并停止批处理。"""
 
 
 class _BatchLibraryLock:
@@ -148,7 +148,7 @@ def acquire_batch_library_lock(ziku_dir: str) -> _BatchLibraryLock:
 
 
 def _default_checkpoint_limits(glyph_service: GlyphService) -> tuple[int, float]:
-    """按字库规模放宽完整 JSON 检查点，逐字日志仍同步落盘。"""
+    """按字库规模控制批处理进度分组。"""
     variant_count = max(0, int(glyph_service.get_total_count()))
     if variant_count >= _LARGE_LIBRARY_MIN_VARIANTS:
         return _LARGE_CHECKPOINT_ITEMS, _LARGE_CHECKPOINT_SECONDS
@@ -198,7 +198,8 @@ def recover_batch_journal(
     *,
     ziku_name: str,
     ziku_dir: str,
-    json_path: str,
+    json_path: str | None = None,
+    persist_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     """重放异常退出前已落盘的完整单字记录。"""
     journal_path = os.path.join(ziku_dir, JOURNAL_FILENAME)
@@ -245,7 +246,12 @@ def recover_batch_journal(
             applied += 1
 
         if applied:
-            atomic_write_json(data, json_path)
+            if persist_callback is not None:
+                persist_callback(data)
+            elif json_path:
+                atomic_write_json(data, json_path, indent=None)
+            else:
+                raise RuntimeError("批处理恢复缺少状态持久化入口。")
         try:
             os.remove(journal_path)
         except FileNotFoundError:
@@ -256,7 +262,7 @@ def recover_batch_journal(
 
 
 class BatchPersistenceSession:
-    """每字写小型恢复日志，定期合并到完整字库 JSON。"""
+    """逐字提交 SQLite，并在整个批次期间独占当前字库。"""
 
     def __init__(
         self,
@@ -284,7 +290,6 @@ class BatchPersistenceSession:
         self._checkpoint_seconds = max(0.1, float(checkpoint_seconds))
         self._pending_count = 0
         self._last_checkpoint = time.monotonic()
-        self._handle = None
         self._closed = False
         self._batch_lock = acquire_batch_library_lock(glyph_service.ziku_dir)
 
@@ -297,34 +302,19 @@ class BatchPersistenceSession:
         return self._journal_path
 
     def record_variant(self, variant_id: str) -> None:
-        """在图片提交后持久记录该字形的新状态。"""
+        """在图片安装后直接提交该字形的数据库状态。"""
         if self._closed:
             raise RuntimeError("批处理持久化会话已经结束。")
-        snapshot = self._glyph.snapshot_variant_state(variant_id)
-        payload = {
-            "版本": JOURNAL_VERSION,
-            "库名": self._glyph.ziku_name,
-            "状态": snapshot,
-        }
-        record = {
-            "载荷": payload,
-            "校验": _payload_checksum(payload),
-        }
-        handle = self._ensure_handle()
-        record_bytes = (_compact_json(record) + "\n").encode("utf-8")
-        start_offset = handle.seek(0, os.SEEK_END)
         try:
-            written = handle.write(record_bytes)
-            if written != len(record_bytes):
-                raise OSError("批处理恢复日志没有完整写入。")
-            handle.flush()
-            os.fsync(handle.fileno())
+            self._glyph.save()
         except Exception as exc:
-            self._rollback_failed_append(handle, start_offset, exc)
+            raise BatchJournalUncertainError(
+                f"字形“{variant_id}”的数据库提交结果无法确认：{exc}"
+            ) from exc
         self._pending_count += 1
 
     def checkpoint_if_due(self) -> bool:
-        """达到字数或时间阈值时合并一次完整 JSON。"""
+        """达到字数或时间阈值时结束当前进度分组。"""
         if not self._pending_count:
             return False
         elapsed = time.monotonic() - self._last_checkpoint
@@ -337,84 +327,34 @@ class BatchPersistenceSession:
         return True
 
     def checkpoint(self) -> None:
-        """原子保存完整 JSON；失败时保留日志供下次恢复。"""
+        """结束当前进度分组；字形状态已经逐字提交。"""
         if self._closed:
             raise RuntimeError("批处理持久化会话已经结束。")
         if not self._pending_count:
             self._last_checkpoint = time.monotonic()
             return
-        self._close_handle()
-        self._glyph.save()
-        try:
-            os.remove(self._journal_path)
-        except FileNotFoundError:
-            pass
         self._pending_count = 0
         self._last_checkpoint = time.monotonic()
 
     def finish(self) -> None:
-        """任务正常结束或停止时强制合并剩余记录。"""
+        """任务正常结束或停止时结束剩余进度分组。"""
         if self._closed:
             return
         try:
             self.checkpoint()
         finally:
-            self._close_handle()
             self._batch_lock.release()
             self._closed = True
 
     def leave_for_recovery(self) -> None:
-        """关闭文件但保留日志，供异常退出恢复或回归测试使用。"""
+        """异常结束会话；已提交字形无需额外恢复日志。"""
         if self._closed:
             return
-        self._close_handle()
         self._batch_lock.release()
         self._closed = True
 
-    def _ensure_handle(self):
-        if self._handle is None:
-            os.makedirs(os.path.dirname(self._journal_path), exist_ok=True)
-            self._handle = open(
-                self._journal_path,
-                "a+b",
-                buffering=0,
-            )
-        return self._handle
-
-    def _rollback_failed_append(
-        self,
-        handle: Any,
-        start_offset: int,
-        original_error: Exception,
-    ) -> None:
-        """截断未确认的日志记录，避免下次启动误重放失败状态。"""
-        rollback_error: Exception | None = None
-        try:
-            handle.truncate(start_offset)
-            handle.flush()
-            os.fsync(handle.fileno())
-        except Exception as exc:
-            rollback_error = exc
-        finally:
-            self._close_handle()
-        if rollback_error is not None:
-            raise BatchJournalUncertainError(
-                "批处理状态日志写入失败，且未能安全回退失败记录："
-                f"写入错误={original_error}；回退错误={rollback_error}"
-            ) from original_error
-        raise original_error
-
-    def _close_handle(self) -> None:
-        if self._handle is None:
-            return
-        try:
-            self._handle.close()
-        finally:
-            self._handle = None
-
     def __del__(self) -> None:
         try:
-            self._close_handle()
             self._batch_lock.release()
         except Exception:
             pass
