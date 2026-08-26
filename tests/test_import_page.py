@@ -14,9 +14,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PIL import Image
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
 
 from ui.pages.import_page import ImportPage, ImportRunContext, ScanItem, ScanTask
+from services.settings_service import ApplicationSettings
 from utils.file_utils import compute_file_md5
 
 
@@ -40,6 +41,25 @@ class ImportPageTests(unittest.TestCase):
         self.assertAlmostEqual(page._width_mm_spin.value(), 50.80, places=2)
         self.assertAlmostEqual(page._height_mm_spin.value(), 25.40, places=2)
         page.deleteLater()
+
+    def test_create_mode_uses_program_default_specification_and_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "ui.pages.import_page.SettingsService.load",
+            return_value=ApplicationSettings(
+                default_dpi=600,
+                default_canvas_width=320,
+                default_canvas_height=480,
+                default_image_directory=directory,
+            ),
+        ):
+            page = ImportPage()
+        try:
+            self.assertEqual(page._dpi_spin.value(), 600)
+            self.assertEqual(page._width_px_spin.value(), 320)
+            self.assertEqual(page._height_px_spin.value(), 480)
+            self.assertEqual(page._directory_edit.text(), directory)
+        finally:
+            page.deleteLater()
 
     def test_physical_millimeters_update_corresponding_pixel_size(self) -> None:
         page = ImportPage()
@@ -97,18 +117,36 @@ class ImportPageTests(unittest.TestCase):
             incoming_path.write_bytes(existing_path.read_bytes())
             digest = compute_file_md5(str(existing_path))
 
-            with patch(
-                "ui.pages.import_page.identify_character",
-                return_value=("正确", ("未分类",)),
-            ):
-                items = self._run_scan(
-                    [str(incoming_path)],
-                    {digest: (str(existing_path), existing_path.name)},
-                )
+            items = self._run_scan(
+                [str(incoming_path)],
+                {digest: (str(existing_path), existing_path.name)},
+            )
 
         self.assertEqual(items[0].category, "重复")
         self.assertEqual(items[0].duplicate_path, str(existing_path))
         self.assertEqual(items[0].duplicate_filename, existing_path.name)
+
+    def test_ambiguous_card_keeps_candidates_without_source_explanation(self) -> None:
+        page = ImportPage()
+        item = ScanItem(
+            "路径",
+            "台-0001.png",
+            "台",
+            "歧义",
+            ("臺", "檯", "颱", "台"),
+            "",
+            False,
+        )
+
+        card = page._create_scan_card(item, "一对一")
+        labels = [label.text() for label in card.findChildren(QLabel)]
+        buttons = [button.text() for button in card.findChildren(QPushButton)]
+
+        self.assertTrue({"臺", "檯", "颱", "台"}.issubset(buttons))
+        self.assertFalse(any("s2t" in text or "候选来源" in text for text in labels))
+        self.assertFalse(any("候选来源" in button.toolTip() for button in card.findChildren(QPushButton)))
+        card.deleteLater()
+        page.deleteLater()
 
     def test_clearing_scan_results_resets_exception_confirmation(self) -> None:
         page = ImportPage()

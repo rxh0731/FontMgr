@@ -94,8 +94,11 @@ class ReviewCanvas(QWidget):
     """支持自由变换、像素修订、视图控制与撤销重做的 RGBA 画布。"""
 
     changed = Signal(bool)
+    pixels_changed = Signal()
     zoom_changed = Signal(int)
     transform_changed = Signal(dict)
+    transform_interaction_started = Signal()
+    transform_interaction_finished = Signal(bool)
     ink_color_changed = Signal(QColor)
     brush_size_changed = Signal(int)
     history_changed = Signal(bool, bool)
@@ -148,6 +151,7 @@ class ReviewCanvas(QWidget):
         self._tool = self.TOOL_PAN
         self._brush_size = 10
         self._brush_color = QColor(0, 0, 0, 255)
+        self._brush_ink_coverage = 255
         self._pressure_enabled = True
         self._minimum_pressure_ratio = 0.2
         self._zoom = 1.0
@@ -160,6 +164,8 @@ class ReviewCanvas(QWidget):
         self._last_image_point = QPoint()
         self._drawing = False
         self._stroke_tool = self.TOOL_BRUSH
+        self._stroke_brush_color = QColor(self._brush_color)
+        self._stroke_ink_coverage = self._brush_ink_coverage
         self._last_stroke_width = float(self._brush_size)
         self._stroke_before_state: _CanvasState | None = None
         self._stroke_changed = False
@@ -416,6 +422,7 @@ class ReviewCanvas(QWidget):
         """从当前非透明笔画中自动取样出现次数最多的主墨色。"""
         sampled = self._dominant_ink_color(self._image)
         self._brush_color = sampled
+        self._brush_ink_coverage = self._dominant_ink_coverage(self._image)
         self.ink_color_changed.emit(QColor(sampled))
         return QColor(sampled)
 
@@ -1124,6 +1131,14 @@ class ReviewCanvas(QWidget):
     def _begin_stroke(self, point: QPoint, tool: str, width: float) -> None:
         self._drawing = True
         self._stroke_tool = tool
+        if tool == self.TOOL_BRUSH:
+            self._stroke_brush_color = QColor(self._brush_color)
+            self._stroke_ink_coverage = self._local_ink_coverage(
+                self._image,
+                point,
+                width,
+                self._brush_ink_coverage,
+            )
         self._stroke_before_state = self._snapshot()
         self._stroke_changed = False
         point, _shift = self._expand_image_for_stroke(point, width, tool)
@@ -1323,33 +1338,120 @@ class ReviewCanvas(QWidget):
         if dirty_source.isEmpty():
             return False
         before = self._image.copy(dirty_source)
-        painter = QPainter(self._image)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if stroke_tool == self.TOOL_ERASER:
+            painter = QPainter(self._image)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            color = QColor(0, 0, 0, 0)
+            distance = max(abs(end.x() - start.x()), abs(end.y() - start.y()))
+            steps = max(
+                1,
+                int(
+                    math.ceil(
+                        distance / max(1.0, min(start_width, end_width) * 0.35)
+                    )
+                ),
+            )
+            for index in range(steps + 1):
+                ratio = index / steps
+                x = start.x() + (end.x() - start.x()) * ratio
+                y = start.y() + (end.y() - start.y()) * ratio
+                width = start_width + (end_width - start_width) * ratio
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 0))
+                painter.drawEllipse(QPointF(x, y), width / 2.0, width / 2.0)
+            painter.end()
         else:
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            color = self._brush_color
-        distance = max(abs(end.x() - start.x()), abs(end.y() - start.y()))
-        steps = max(1, int(math.ceil(distance / max(1.0, min(start_width, end_width) * 0.35))))
-        for index in range(steps + 1):
-            ratio = index / steps
-            x = start.x() + (end.x() - start.x()) * ratio
-            y = start.y() + (end.y() - start.y()) * ratio
-            width = start_width + (end_width - start_width) * ratio
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawEllipse(QPointF(x, y), width / 2.0, width / 2.0)
-        painter.end()
+            self._blend_ink_stroke(
+                dirty_source,
+                start,
+                end,
+                start_width,
+                end_width,
+            )
         if before == self._image.copy(dirty_source):
             return False
         self._commit_stroke_undo()
         self._update_content_bounds_after_stroke(dirty_source, stroke_tool)
         self._invalidate_render()
         self._set_dirty(True)
+        self.pixels_changed.emit()
         self.update(self._stroke_dirty_rect(start, end, max(start_width, end_width)))
         return True
+
+    def _blend_ink_stroke(
+        self,
+        dirty_source: QRect,
+        start: QPoint,
+        end: QPoint,
+        start_width: float,
+        end_width: float,
+    ) -> None:
+        """按附近原笔画的视觉墨量融合补笔，避免重叠区域反复变黑。"""
+
+        mask = QImage(
+            dirty_source.size(),
+            QImage.Format.Format_ARGB32,
+        )
+        mask.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(mask)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        distance = max(abs(end.x() - start.x()), abs(end.y() - start.y()))
+        steps = max(
+            1,
+            int(
+                math.ceil(
+                    distance / max(1.0, min(start_width, end_width) * 0.35)
+                )
+            ),
+        )
+        for index in range(steps + 1):
+            ratio = index / steps
+            x = start.x() + (end.x() - start.x()) * ratio - dirty_source.x()
+            y = start.y() + (end.y() - start.y()) * ratio - dirty_source.y()
+            width = start_width + (end_width - start_width) * ratio
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 255))
+            painter.drawEllipse(QPointF(x, y), width / 2.0, width / 2.0)
+        painter.end()
+
+        pixels = self._qimage_to_rgba(self._image.copy(dirty_source))
+        mask_alpha = self._qimage_to_rgba(mask)[..., 3].astype(np.float32)
+        desired_coverage = np.rint(
+            mask_alpha * float(self._stroke_ink_coverage) / 255.0
+        ).astype(np.uint8)
+        current_coverage = self._visual_coverage(pixels)
+        changed = desired_coverage > current_coverage
+        if not np.any(changed):
+            return
+
+        color = QColor(self._stroke_brush_color)
+        red, green, blue = color.red(), color.green(), color.blue()
+        darkness = 255.0 - (
+            red * 0.299
+            + green * 0.587
+            + blue * 0.114
+        )
+        if darkness < 1.0:
+            red = green = blue = 0
+            darkness = 255.0
+        required_alpha = np.clip(
+            np.rint(desired_coverage.astype(np.float32) * 255.0 / darkness),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        pixels[changed, 0] = red
+        pixels[changed, 1] = green
+        pixels[changed, 2] = blue
+        pixels[changed, 3] = required_alpha[changed]
+
+        updated = self._rgba_to_qimage(pixels)
+        image_painter = QPainter(self._image)
+        image_painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Source
+        )
+        image_painter.drawImage(dirty_source.topLeft(), updated)
+        image_painter.end()
 
     def _commit_stroke_undo(self) -> None:
         """首次实际改动像素时提交落笔前快照，整笔只产生一个撤销记录。"""
@@ -1853,6 +1955,7 @@ class ReviewCanvas(QWidget):
         self._transform_drag_modifiers = modifiers
         self._set_transform_drag_anchor(kind)
         self._transform_drag_started = False
+        self.transform_interaction_started.emit()
         if not external_view:
             self.setCursor(self._cursor_for_transform_hit(kind))
         return kind
@@ -2025,11 +2128,14 @@ class ReviewCanvas(QWidget):
 
     def _finish_transform_drag(self) -> bool:
         """收束当前自由变换拖动，并清除与所属视图绑定的会话状态。"""
+        active = bool(self._transform_drag_kind)
         changed = self._transform_drag_started
         self._transform_drag_kind = ""
         self._transform_drag_started = False
         self._transform_drag_view = None
         self._transform_drag_modifiers = Qt.KeyboardModifier.NoModifier
+        if active:
+            self.transform_interaction_finished.emit(changed)
         return changed
 
     def _native_transform_view(self) -> _TransformView:
@@ -2095,6 +2201,7 @@ class ReviewCanvas(QWidget):
         self._refresh_content_bounds()
         self.sample_ink_color()
         self._set_dirty_from_state()
+        self.pixels_changed.emit()
         self._emit_transform()
         self.update()
 
@@ -2105,6 +2212,7 @@ class ReviewCanvas(QWidget):
         color = self._image.pixelColor(point)
         if color.alpha() < 32:
             return
+        self._brush_ink_coverage = self._color_visual_coverage(color)
         color.setAlpha(255)
         self.set_brush_color(color)
 
@@ -2112,6 +2220,10 @@ class ReviewCanvas(QWidget):
         return _CanvasState(self._image.copy(), self._transform, QPointF(self._image_origin))
 
     def _restore_state(self, state: _CanvasState) -> None:
+        pixels_changed = (
+            self._image != state.image
+            or self._image_origin != state.image_origin
+        )
         self._image = state.image.copy()
         self._transform = state.transform
         self._image_origin = QPointF(state.image_origin)
@@ -2119,6 +2231,8 @@ class ReviewCanvas(QWidget):
         self._refresh_content_bounds()
         self.sample_ink_color()
         self._set_dirty_from_state()
+        if pixels_changed:
+            self.pixels_changed.emit()
         self._emit_transform()
         self.update()
 
@@ -2551,6 +2665,71 @@ class ReviewCanvas(QWidget):
         green = (color >> 8) & 0xFF
         blue = color & 0xFF
         return QColor(red, green, blue, 255)
+
+    @classmethod
+    def _dominant_ink_coverage(cls, image: QImage) -> int:
+        """返回全图主体笔画的视觉墨量，供远离原笔画时安全回退。"""
+
+        if image.isNull():
+            return 255
+        pixels = cls._qimage_to_rgba(image)
+        height, width = pixels.shape[:2]
+        sample_limit = 65_536
+        step = max(1, math.ceil(math.sqrt(width * height / sample_limit)))
+        coverage = cls._visual_coverage(pixels)[::step, ::step]
+        core = coverage[coverage >= 16]
+        values = core if core.size else coverage[coverage > 0]
+        if not values.size:
+            return 255
+        return max(1, min(255, int(round(float(np.percentile(values, 70))))))
+
+    @classmethod
+    def _local_ink_coverage(
+        cls,
+        image: QImage,
+        point: QPoint,
+        width: float,
+        fallback: int,
+    ) -> int:
+        """取样落笔点附近原笔画；空白区域回退到当前字形主体墨量。"""
+
+        if image.isNull():
+            return max(1, min(255, int(fallback)))
+        radius = max(5, int(math.ceil(float(width) * 1.25)))
+        region = QRect(
+            point.x() - radius,
+            point.y() - radius,
+            radius * 2 + 1,
+            radius * 2 + 1,
+        ).intersected(image.rect())
+        if region.isEmpty():
+            return max(1, min(255, int(fallback)))
+        coverage = cls._visual_coverage(cls._qimage_to_rgba(image.copy(region)))
+        core = coverage[coverage >= 16]
+        values = core if core.size >= 8 else coverage[coverage > 0]
+        if values.size < 3:
+            return max(1, min(255, int(fallback)))
+        sampled = int(round(float(np.percentile(values, 70))))
+        return max(1, min(255, sampled))
+
+    @staticmethod
+    def _color_visual_coverage(color: QColor) -> int:
+        luminance = color.red() * 0.299 + color.green() * 0.587 + color.blue() * 0.114
+        coverage = color.alpha() * (255.0 - luminance) / 255.0
+        return max(1, min(255, int(round(coverage))))
+
+    @staticmethod
+    def _visual_coverage(pixels: np.ndarray) -> np.ndarray:
+        values = np.asarray(pixels, dtype=np.float32)
+        if values.ndim != 3 or values.shape[2] != 4:
+            raise ValueError("视觉墨量输入必须是 RGBA 像素数组")
+        luminance = (
+            values[..., 0] * 0.299
+            + values[..., 1] * 0.587
+            + values[..., 2] * 0.114
+        )
+        coverage = values[..., 3] * (255.0 - luminance) / 255.0
+        return np.clip(np.rint(coverage), 0.0, 255.0).astype(np.uint8)
 
     @staticmethod
     def _finite_value(value: float | None, fallback: float) -> float:

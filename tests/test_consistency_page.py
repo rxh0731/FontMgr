@@ -22,8 +22,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QHeaderView,
+    QHBoxLayout,
     QMessageBox,
     QScrollArea,
+    QSlider,
     QTreeWidget,
     QWidget,
 )
@@ -583,6 +585,151 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             )
             self.assertEqual(final_render_count, 1, "一次拖动松手后只能重算一次预览。")
 
+    def test_drag_release_keeps_final_live_position_until_preview_arrives(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            variant_id = page._selected_id
+            card = page._cards[variant_id]
+            self.assertTrue(
+                self._wait_until(
+                    lambda: page._coordinated_preview_cache_key(variant_id)
+                    in page._preview_cache
+                )
+            )
+            start = card._control_rect().center()
+            end = start + QPointF(24.0, 0.0)
+            preview_started = threading.Event()
+            allow_preview = threading.Event()
+            original_preview = AdjustmentService.preview_coordinated
+
+            def delayed_preview(service: AdjustmentService, *args, **kwargs):
+                detail = args[0] if args else {}
+                adjustment = args[1] if len(args) > 1 else {}
+                if (
+                    str(detail.get("变体ID", "")) == variant_id
+                    and abs(float(adjustment.get("移动X", 0.0))) > 0.01
+                ):
+                    preview_started.set()
+                    allow_preview.wait(3.0)
+                return original_preview(service, *args, **kwargs)
+
+            try:
+                with patch.object(
+                    AdjustmentService,
+                    "preview_coordinated",
+                    new=delayed_preview,
+                ):
+                    self._send_card_mouse_event(
+                        card,
+                        QEvent.Type.MouseButtonPress,
+                        start,
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton,
+                    )
+                    self._send_card_mouse_event(
+                        card,
+                        QEvent.Type.MouseMove,
+                        end,
+                        Qt.MouseButton.NoButton,
+                        Qt.MouseButton.LeftButton,
+                    )
+                    self.app.processEvents()
+                    during = self._render_widget(card)
+                    during_center = self._dark_pixel_centroid(during, card._work_rect())
+                    live_controls = [
+                        (
+                            card._live_control_polygon_logical.at(index).x(),
+                            card._live_control_polygon_logical.at(index).y(),
+                        )
+                        for index in range(
+                            card._live_control_polygon_logical.count()
+                        )
+                    ]
+                    self.assertEqual(len(live_controls), 4)
+
+                    self._send_card_mouse_event(
+                        card,
+                        QEvent.Type.MouseButtonRelease,
+                        end,
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.NoButton,
+                    )
+                    self.assertTrue(self._wait_until(preview_started.is_set))
+                    after_release = self._render_widget(card)
+                    after_release_center = self._dark_pixel_centroid(
+                        after_release,
+                        card._work_rect(),
+                    )
+                    self.assertTrue(card._live_preview_active)
+                    self.assertAlmostEqual(
+                        after_release_center.x(),
+                        during_center.x(),
+                        delta=1.5,
+                        msg="等待高清预览时不得短暂跳回旧位置。",
+                    )
+                    self.assertAlmostEqual(
+                        after_release_center.y(),
+                        during_center.y(),
+                        delta=1.5,
+                        msg="等待高清预览时不得短暂跳回旧位置。",
+                    )
+
+                    allow_preview.set()
+                    self.assertTrue(
+                        self._wait_until(
+                            lambda: variant_id not in page._comparison_preview_pending
+                            and not card._live_preview_active
+                        )
+                    )
+                    committed_controls = [
+                        (
+                            card._control_polygon_logical.at(index).x(),
+                            card._control_polygon_logical.at(index).y(),
+                        )
+                        for index in range(card._control_polygon_logical.count())
+                    ]
+                    self.assertEqual(len(committed_controls), 4)
+                    for committed, live in zip(committed_controls, live_controls):
+                        self.assertAlmostEqual(committed[0], live[0], delta=1e-6)
+                        self.assertAlmostEqual(committed[1], live[1], delta=1e-6)
+            finally:
+                allow_preview.set()
+
+    def test_selected_high_quality_preview_never_blocks_gui_thread(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            variant_id = page._selected_id
+            page._discard_queued_card_previews()
+            page._clear_variant_preview_cache(variant_id)
+            main_thread_id = threading.get_ident()
+            render_threads: list[int] = []
+            rendered = threading.Event()
+            original_preview = AdjustmentService.preview_coordinated
+
+            def tracked_preview(service: AdjustmentService, *args, **kwargs):
+                render_threads.append(threading.get_ident())
+                try:
+                    return original_preview(service, *args, **kwargs)
+                finally:
+                    rendered.set()
+
+            with patch.object(
+                AdjustmentService,
+                "preview_coordinated",
+                new=tracked_preview,
+            ):
+                started_at = time.perf_counter()
+                page._refresh_selected_preview()
+                elapsed = time.perf_counter() - started_at
+                self.assertLess(elapsed, 0.1)
+                self.assertTrue(self._wait_until(rendered.is_set))
+
+            self.assertTrue(render_threads)
+            self.assertTrue(
+                all(thread_id != main_thread_id for thread_id in render_threads),
+                "高质量协调预览不得在 GUI 主线程执行。",
+            )
+
     def test_comparison_drag_moves_cached_glyph_pixels_before_release(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1100, 720)
@@ -639,11 +786,14 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 wraps=page._adjustment_service.preview_coordinated,
             ) as render_preview:
                 for _index in range(5):
-                    self._wheel_card(card, 120)
+                    self._wheel_card(card, 120, Qt.KeyboardModifier.ControlModifier)
                     self.app.processEvents()
                 self.assertEqual(render_preview.call_count, 0)
                 QTest.qWait(page._comparison_wheel_timer.interval() + 40)
-                self.assertEqual(render_preview.call_count, 1)
+                self.assertTrue(
+                    self._wait_until(lambda: render_preview.call_count == 1),
+                    "滚轮会话结束后没有在后台生成高质量预览。",
+                )
 
             scaled = page._detail_canvas.transform()
             self.assertGreater(float(scaled["scale"]), 1.0)
@@ -656,13 +806,271 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertAlmostEqual(float(page._detail_canvas.transform()["scale"]), 1.0)
             self.assertFalse(page._detail_canvas.can_undo)
 
+    def test_comparison_plain_wheel_scrolls_without_scaling_selected_card(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            card = page._cards[page._selected_id]
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            self.assertGreater(scroll_bar.maximum(), 0)
+            before_value = scroll_bar.value()
+            before_transform = page._detail_canvas.transform()
+
+            self._wheel_card(card, -120)
+            self.app.processEvents()
+
+            self.assertEqual(
+                page._detail_canvas.transform(),
+                before_transform,
+                "普通滚轮不应改变选中字形的缩放参数。",
+            )
+            self.assertGreater(
+                scroll_bar.value(),
+                before_value,
+                "普通滚轮应交给整体协调列表滚动。",
+            )
+
+    def test_plain_wheel_after_move_scrolls_monotonically_without_rebuilding_buffer(
+        self,
+    ) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            variant_id = page._selected_id
+            self.assertTrue(self._wait_until(lambda: page._loaded_detail_id == variant_id))
+            card = page._cards[variant_id]
+            self._drag_card(
+                card,
+                card._control_rect().center(),
+                QPointF(18.0, 6.0),
+            )
+            self.app.processEvents()
+            self.assertTrue(page._is_dirty(variant_id))
+
+            cards_before = dict(page._cards)
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            values = [scroll_bar.value()]
+            for _ in range(3):
+                current_card = page._cards.get(variant_id, next(iter(page._cards.values())))
+                self._wheel_card(current_card, -120)
+                self.app.processEvents()
+                values.append(scroll_bar.value())
+
+            self.assertEqual(values, sorted(values))
+            self.assertGreater(values[-1], values[0])
+            for visible_id, old_card in cards_before.items():
+                if visible_id in page._cards:
+                    self.assertIs(
+                        page._cards[visible_id],
+                        old_card,
+                        "同一虚拟缓冲区内滚动不得销毁并重建卡片。",
+                    )
+
+    def test_virtual_rows_use_cell_height_plus_grid_spacing(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            spacing = page.COMPARISON_ROW_GAP
+            row_stride = page.COMPARISON_CELL_HEIGHT + spacing
+            self.assertEqual(page._comparison_row_stride(), row_stride)
+            self.assertEqual(page._grid.verticalSpacing(), 0)
+
+            total_rows = len(page._variants) // page._grid_columns
+            margins = page._grid.contentsMargins()
+            expected_height = (
+                margins.top()
+                + margins.bottom()
+                + total_rows * page.COMPARISON_CELL_HEIGHT
+                + max(0, total_rows - 1) * spacing
+            )
+            self.assertGreaterEqual(page._grid_host.minimumHeight(), expected_height)
+
+            page._scroll_to_variant_index(page._grid_columns * 2)
+            self.app.processEvents()
+            self.assertEqual(
+                page._comparison_scroll.verticalScrollBar().value(),
+                row_stride,
+                "定位字形时必须把网格行距计入滚动位置。",
+            )
+
+    def test_responsive_column_change_discards_historical_grid_rows(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            page._grid_columns = 1
+            page._render_virtual_view()
+            self.app.processEvents()
+            self.assertEqual(page._grid.rowCount(), len(page._variants))
+
+            page._grid_columns = 4
+            page._render_virtual_view()
+            self.app.processEvents()
+            expected_rows = (len(page._variants) + 3) // 4
+            self.assertEqual(
+                page._grid.rowCount(),
+                expected_rows,
+                "响应式换列后不得保留旧的一列网格行数。",
+            )
+            self.assertTrue(page._cards)
+            self.assertTrue(
+                all(
+                    card.height() == page.COMPARISON_CELL_HEIGHT
+                    for card in page._cards.values()
+                ),
+                "历史空行不得把当前比较卡片拉高。",
+            )
+
+    def test_crossing_virtual_buffer_reuses_overlapping_cards(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            originals = list(page._variants)
+            expanded = list(originals)
+            for cycle in range(1, 4):
+                for detail in originals:
+                    clone = deepcopy(detail)
+                    original_id = str(detail["变体ID"])
+                    clone_id = f"{original_id}-virtual-{cycle}"
+                    clone["变体ID"] = clone_id
+                    expanded.append(clone)
+                    page._variant_by_id[clone_id] = clone
+            page._variants = expanded
+            page._render_virtual_view()
+            self.app.processEvents()
+
+            cards_before = dict(page._cards)
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            self.assertGreater(scroll_bar.maximum(), page._comparison_row_stride() * 2)
+            scroll_bar.setValue(page._comparison_row_stride() * 2)
+            self.app.processEvents()
+            cards_after = dict(page._cards)
+
+            overlapping_ids = set(cards_before) & set(cards_after)
+            self.assertTrue(overlapping_ids)
+            self.assertNotEqual(set(cards_before), set(cards_after))
+            for variant_id in overlapping_ids:
+                self.assertIs(cards_after[variant_id], cards_before[variant_id])
+            self.assertTrue(all(not card.isWindow() for card in cards_after.values()))
+
+    def test_scrolling_focused_card_out_of_buffer_does_not_leave_blank_rows(
+        self,
+    ) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            originals = list(page._variants)
+            expanded = list(originals)
+            for cycle in range(1, 4):
+                for detail in originals:
+                    clone = deepcopy(detail)
+                    original_id = str(detail["变体ID"])
+                    clone_id = f"{original_id}-focus-{cycle}"
+                    clone["变体ID"] = clone_id
+                    expanded.append(clone)
+                    page._variant_by_id[clone_id] = clone
+            page._variants = expanded
+            page._render_virtual_view()
+            self.app.processEvents()
+
+            focused_card = page._cards[page._selected_id]
+            focused_card.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.app.processEvents()
+            self.assertTrue(focused_card.hasFocus())
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            target = min(page._comparison_row_stride() * 6, scroll_bar.maximum())
+            scroll_bar.setValue(target)
+            self.app.processEvents()
+
+            self.assertEqual(
+                scroll_bar.value(),
+                target,
+                "焦点卡片离开缓冲区时不得把滚动条拉回旧位置。",
+            )
+            self.assertNotIn(page._selected_id, page._cards)
+            visible_tops = [
+                card.mapTo(page._comparison_scroll.viewport(), QPoint(0, 0)).y()
+                for card in page._cards.values()
+                if card.mapTo(
+                    page._comparison_scroll.viewport(),
+                    QPoint(0, 0),
+                ).y()
+                + card.height()
+                > 0
+            ]
+            self.assertTrue(visible_tops)
+            self.assertLessEqual(
+                min(visible_tops),
+                page.COMPARISON_ROW_GAP,
+                "虚拟卡片首行必须覆盖视口顶部，不得留下空行。",
+            )
+
+    def test_clicking_visible_comparison_card_keeps_scroll_position(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            scroll_bar.setValue(min(220, scroll_bar.maximum()))
+            self.app.processEvents()
+            visible_ids = list(page._cards)
+            self.assertTrue(visible_ids)
+            target_id = visible_ids[-1]
+            before_value = scroll_bar.value()
+
+            page._select_variant_deferred(target_id)
+            self.app.processEvents()
+
+            self.assertEqual(
+                scroll_bar.value(),
+                before_value,
+                "点击当前可视区内的字图不应重新定位比较区滚动条。",
+            )
+
+    def test_moving_one_card_then_selecting_another_keeps_scroll_position(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            scroll_bar = page._comparison_scroll.verticalScrollBar()
+            scroll_bar.setValue(min(220, scroll_bar.maximum()))
+            self.app.processEvents()
+            visible_ids = list(page._cards)
+            self.assertGreaterEqual(len(visible_ids), 2)
+            target_id = visible_ids[-1]
+            page._select_variant_deferred(target_id)
+            self.assertTrue(
+                self._wait_until(lambda: page._loaded_detail_id == target_id),
+            )
+            card = page._cards[target_id]
+            with (
+                patch.object(
+                    page,
+                    "_refresh_filtered_view",
+                    wraps=page._refresh_filtered_view,
+                ) as full_refresh,
+                patch.object(
+                    page,
+                    "_render_virtual_view",
+                    wraps=page._render_virtual_view,
+                ) as rebuild_cards,
+            ):
+                self._drag_card(
+                    card,
+                    card._control_rect().center(),
+                    QPointF(18.0, 6.0),
+                )
+                self.app.processEvents()
+                full_refresh.assert_not_called()
+                rebuild_cards.assert_not_called()
+            before_value = scroll_bar.value()
+
+            next_id = next(item for item in page._cards if item != target_id)
+            page._select_variant_deferred(next_id)
+            self.app.processEvents()
+
+            self.assertEqual(
+                scroll_bar.value(),
+                before_value,
+                "移动字图后切换到另一个可视字图不应造成列表跳行。",
+            )
+
     def test_pending_wheel_session_hands_off_to_drag_as_separate_undo_step(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1100, 720)
             variant_id = page._selected_id
             card = page._cards[variant_id]
 
-            self._wheel_card(card, 120)
+            self._wheel_card(card, 120, Qt.KeyboardModifier.ControlModifier)
             self.app.processEvents()
             wheel_transform = page._detail_canvas.transform()
             self.assertEqual(page._comparison_transform_mode, "wheel")
@@ -741,7 +1149,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             card = page._cards[variant_id]
 
             for _index in range(3):
-                self._wheel_card(card, 120)
+                self._wheel_card(card, 120, Qt.KeyboardModifier.ControlModifier)
             QTest.qWait(page._comparison_wheel_timer.interval() + 40)
             first_scale = float(page._detail_canvas.transform()["scale"])
             self.assertGreater(first_scale, 1.0)
@@ -755,7 +1163,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
 
             card = page._cards[variant_id]
             for _index in range(2):
-                self._wheel_card(card, -120)
+                self._wheel_card(card, -120, Qt.KeyboardModifier.ControlModifier)
             QTest.qWait(page._comparison_wheel_timer.interval() + 40)
             second_scale = float(page._detail_canvas.transform()["scale"])
 
@@ -806,10 +1214,13 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertFalse(page._comparison_transform_active)
             self.assertEqual(page._comparison_transform_mode, "")
             self.assertFalse(card._drag_kind)
-            self.assertFalse(card._live_preview_active)
             self.assertFalse(page._detail_canvas._transform_drag_kind)
             self.assertIsNone(page._detail_canvas._transform_drag_view)
             self.assertEqual(len(page._detail_canvas._undo_stack), 1)
+            self.assertTrue(
+                self._wait_until(lambda: not card._live_preview_active),
+                "焦点中断后应在高清预览返回时结束临时投影。",
+            )
             page._detail_canvas.undo()
             self.assertAlmostEqual(float(page._detail_canvas.transform()["x"]), 0.0)
             self.assertAlmostEqual(float(page._detail_canvas.transform()["y"]), 0.0)
@@ -873,9 +1284,14 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                         "卡片不得在命中圈重叠时自行选择与 ReviewCanvas 不同的手柄。",
                     )
 
-    def test_initial_load_opens_first_page_in_pinyin_order(self) -> None:
+    def test_initial_load_opens_unpaginated_results_in_pinyin_order(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
             self.assertEqual(page._complete_button.text(), "批量整体协调")
+            self.assertEqual(
+                page._recalculate_baseline_button.text(),
+                "重新计算全库基准",
+            )
+            self.assertTrue(page._recalculate_baseline_button.isEnabled())
             self.assertEqual(page._order_combo.currentText(), "拼音顺序")
             self.assertNotEqual(page._selected_id, variant_ids[0])
             self.assertEqual(
@@ -887,36 +1303,95 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
 
             self._show_at(page, 1100, 720)
 
-            self.assertEqual((page._grid_columns, page._grid_rows), (4, 2))
+            self.assertGreaterEqual(
+                page._grid_columns,
+                page.COMPARISON_MIN_COLUMNS,
+            )
             self.assertEqual(page._page_index, 0)
             self.assertIs(page._page_variants()[0], page._variants[0])
-            self.assertEqual(page._page_label.text(), "第 1 / 2 页")
+            self.assertEqual(len(page._page_variants()), len(page._variants))
+            self.assertIn(
+                "可滚动查看全部字形",
+                page._comparison_scroll_label.text(),
+            )
 
-    def test_comparison_grid_uses_confirmed_responsive_capacity_and_fixed_slots(self) -> None:
+    def test_batch_coordination_keeps_fixed_baseline_and_submits_only_pending(
+        self,
+    ) -> None:
+        with self._page_with_sixteen_variants() as (page, variant_ids):
+            with (
+                patch.object(
+                    page,
+                    "_confirm_complete_coordination",
+                    return_value=True,
+                ),
+                patch.object(page._coordination_pool, "start") as start,
+            ):
+                page._complete_coordination()
+
+            start.assert_called_once()
+            task = page._coordination_task
+            self.assertIsNotNone(task)
+            self.assertEqual(set(task._variant_ids), set(variant_ids))
+            self.assertFalse(task._ink_config.get("重算几何后基准", False))
+            self.assertEqual(task._ink_config["基准"], page._ink_baseline)
+            self.assertEqual(page._coordination_task_context["类型"], "批量协调")
+            page._finish_coordination_task(False, "测试结束")
+
+    def test_explicit_baseline_recalculation_submits_the_whole_library(self) -> None:
+        with self._page_with_sixteen_variants() as (page, variant_ids):
+            with (
+                patch.object(
+                    page,
+                    "_confirm_recalculate_coordination_baseline",
+                    return_value=True,
+                ),
+                patch.object(page._coordination_pool, "start") as start,
+            ):
+                page._recalculate_coordination_baseline()
+
+            start.assert_called_once()
+            task = page._coordination_task
+            self.assertIsNotNone(task)
+            self.assertEqual(set(task._variant_ids), set(variant_ids))
+            self.assertTrue(task._ink_config["重算几何后基准"])
+            self.assertEqual(
+                page._coordination_task_context["类型"],
+                "全库基准重算",
+            )
+            page._finish_coordination_task(False, "测试结束")
+
+    def test_comparison_grid_columns_follow_available_viewport_width(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
-            self._show_at(page, 1600, 900)
             ordered_ids = [str(item["变体ID"]) for item in page._variants]
+            observed_columns: list[int] = []
+            for width, height in ((1100, 720), (1600, 900), (1920, 1080)):
+                self._show_at(page, width, height)
+                observed_columns.append(page._grid_columns)
+                margins = page._grid.contentsMargins()
+                spacing = max(0, page._grid.horizontalSpacing())
+                usable_width = (
+                    page._comparison_scroll.viewport().width()
+                    - margins.left()
+                    - margins.right()
+                )
+                expected = max(
+                    page.COMPARISON_MIN_COLUMNS,
+                    (usable_width + spacing)
+                    // (page.COMPARISON_CARD_MIN_WIDTH + spacing),
+                )
+                self.assertEqual(page._grid_columns, expected)
+                self.assertTrue(page._cards)
+                self.assertGreaterEqual(
+                    min(card.width() for card in page._cards.values()),
+                    page.COMPARISON_CARD_MIN_WIDTH,
+                )
 
-            self.assertEqual((page._grid_columns, page._grid_rows), (5, 3))
-            self.assertEqual(page._page_size(), 15)
-            self.assertEqual(len(page._grid_slots), 15)
-            self.assertEqual(len(page._page_variants()), 15)
-            self.assertEqual(len(page._cards), 15)
+            self.assertEqual(observed_columns, sorted(observed_columns))
+            self.assertGreater(observed_columns[-1], observed_columns[0])
+            self.assertEqual(len(page._page_variants()), len(page._variants))
             first_card = page._cards[ordered_ids[0]]
             self.assertEqual(self._grid_position(page, first_card), (0, 0))
-            first_slot_geometry = first_card.geometry()
-
-            page._change_page(1)
-            for _ in range(3):
-                self.app.processEvents()
-
-            self.assertEqual(page._page_index, 1)
-            self.assertEqual(len(page._grid_slots), 15)
-            self.assertEqual(len(page._page_variants()), 1)
-            self.assertEqual(len(page._cards), 1)
-            final_card = page._cards[ordered_ids[-1]]
-            self.assertEqual(self._grid_position(page, final_card), (0, 0))
-            self.assertEqual(final_card.geometry(), first_slot_geometry)
 
             first_group = page._glyph_list.topLevelItem(0)
             page._glyph_list.setCurrentItem(first_group.child(0))
@@ -927,25 +1402,9 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 self.app.processEvents()
 
             self.assertEqual(page._selected_id, ordered_ids[0])
-            self.assertEqual((page._grid_columns, page._grid_rows), (4, 2))
-            self.assertEqual(page._page_size(), 8)
-            self.assertEqual(len(page._grid_slots), 8)
-            self.assertEqual(len(page._page_variants()), 8)
-            self.assertEqual(len(page._cards), 8)
-            self.assertEqual(page._grid.columnStretch(4), 0)
-            self.assertEqual(page._grid.rowStretch(2), 0)
-            self.assertEqual(page._grid.cellRect(0, 4).width(), 0)
-            self.assertEqual(page._grid.cellRect(2, 0).height(), 0)
-            margins = page._grid.contentsMargins()
-            last_slot = page._grid_slots[-1].geometry()
-            self.assertEqual(
-                last_slot.right(),
-                page._grid_host.rect().right() - margins.right(),
-            )
-            self.assertEqual(
-                last_slot.bottom(),
-                page._grid_host.rect().bottom() - margins.bottom(),
-            )
+            self.assertEqual(page._grid_columns, observed_columns[0])
+            self.assertEqual(len(page._page_variants()), len(page._variants))
+            self.assertEqual(page._grid.columnCount(), observed_columns[0])
 
     def test_comparison_selection_loads_detail_in_background_and_keeps_latest_result(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
@@ -987,6 +1446,38 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                     self.assertEqual(page._loaded_detail_id, latest_target)
             finally:
                 release.set()
+
+    def test_comparison_selection_selects_and_reveals_matching_list_item(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            target_id = next(
+                variant_id
+                for variant_id in page._cards
+                if variant_id != page._selected_id
+            )
+            target_item = page._list_items_by_id[target_id]
+            last_group = page._glyph_list.topLevelItem(
+                page._glyph_list.topLevelItemCount() - 1
+            )
+            page._glyph_list.scrollToItem(last_group.child(last_group.childCount() - 1))
+            self.app.processEvents()
+            self.assertFalse(
+                page._glyph_list.viewport().rect().intersects(
+                    page._glyph_list.visualItemRect(target_item)
+                )
+            )
+
+            page._cards[target_id].selected.emit(target_id)
+            self.app.processEvents()
+
+            self.assertEqual(page._selected_id, target_id)
+            self.assertIs(page._glyph_list.currentItem(), target_item)
+            self.assertTrue(target_item.parent().isExpanded())
+            self.assertTrue(
+                page._glyph_list.viewport().rect().intersects(
+                    page._glyph_list.visualItemRect(target_item)
+                )
+            )
 
     def test_entering_detail_loads_selected_glyph_even_when_background_load_is_pending(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
@@ -1068,6 +1559,78 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertTrue(page._detail_canvas.has_image)
             self.assertEqual(page._detail_canvas.tool, ReviewCanvas.TOOL_TRANSFORM)
 
+    def test_detail_navigation_uses_top_row_and_brush_size_uses_slider(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            self.assertFalse(page._detail_navigation.isVisible())
+
+            page._enter_detail(page._selected_id)
+            self.app.processEvents()
+
+            self.assertTrue(page._detail_navigation.isVisible())
+            self.assertIs(
+                page._detail_navigation.parentWidget(),
+                page._comparison_mode_button.parentWidget(),
+            )
+            self.assertIsInstance(page._detail_brush_size, QSlider)
+            self.assertIsInstance(page._detail_toolbar.layout(), QHBoxLayout)
+            self.assertEqual(page._detail_brush_size.orientation(), Qt.Orientation.Horizontal)
+            self.assertEqual(
+                (page._detail_brush_size.minimum(), page._detail_brush_size.maximum()),
+                (1, 100),
+            )
+            page._detail_brush_size.setValue(24)
+            self.assertEqual(page._detail_canvas.brush_size, 24)
+            self.assertEqual(page._undo_button.text(), "↶")
+            self.assertEqual(page._redo_button.text(), "↷")
+            self.assertEqual(
+                page._detail_tool_buttons[ReviewCanvas.TOOL_TRANSFORM].text(),
+                "变换",
+            )
+            self.assertEqual(
+                page._detail_tool_buttons[ReviewCanvas.TOOL_ERASER].text(),
+                "橡皮",
+            )
+            self.assertEqual(page._source_button.text(), "原稿")
+            self.assertEqual(page._grid_button.text(), "网格")
+            self.assertEqual(page._transparent_button.text(), "透明")
+
+            page._leave_detail()
+            self.app.processEvents()
+            self.assertFalse(page._detail_navigation.isVisible())
+
+    def test_detail_transform_defers_library_refresh_until_interaction_finishes(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            self._show_at(page, 1100, 720)
+            page._enter_detail(page._selected_id)
+            self.app.processEvents()
+            canvas = page._detail_canvas
+            exact_processor = canvas._render_postprocessor
+
+            with patch.object(page, "_render_status") as render_status:
+                page._on_detail_transform_started()
+                interactive_processor = canvas._render_postprocessor
+                self.assertTrue(page._detail_transform_active)
+                self.assertIsNot(interactive_processor, exact_processor)
+
+                self.assertTrue(canvas.set_transform(x=12.0))
+                self.assertIn(page._selected_id, page._dirty_variant_ids)
+                render_status.assert_not_called()
+
+                page._on_detail_transform_finished(True)
+                self.assertFalse(page._detail_transform_active)
+                self.assertIsNot(canvas._render_postprocessor, interactive_processor)
+                render_status.assert_called_once()
+
+    def test_status_refresh_uses_cached_dirty_set_without_rescanning_signatures(self) -> None:
+        with self._page_with_sixteen_variants() as (page, _variant_ids):
+            with patch.object(
+                page,
+                "_is_dirty",
+                side_effect=AssertionError("状态刷新不应重新计算全部字形签名"),
+            ):
+                page._render_status()
+
     def test_glyph_list_matches_review_tree_presentation(self) -> None:
         with self._page_with_sixteen_variants(
             {"移动X": 2.0, "移动Y": 0.0, "等比缩放": 1.0}
@@ -1137,7 +1700,10 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertGreaterEqual(header.sectionSize(1), protected_status_width)
             self.assertEqual(tree.topLevelItemCount(), 16)
             self.assertEqual(page._list_count_label.text(), "显示 17/17")
-            self.assertEqual(page._search_edit.placeholderText(), "搜索字符、字形或文件名")
+            self.assertEqual(
+                page._search_edit.placeholderText(),
+                "搜索归属字、文件名或变体ID",
+            )
 
             single_detail = page._variant_by_id[variant_ids[1]]
             single_char = str(single_detail["归属字"])
@@ -1229,6 +1795,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
 
             dirty_id = variant_ids[1]
             page._adjustments[dirty_id]["移动X"] = 3.0
+            page._sync_dirty_variant(dirty_id)
             page._populate_list()
             statuses = page._list_items_by_id
             self.assertEqual(
@@ -1493,7 +2060,7 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 self.assertEqual(after[key], before[key])
             self.assertTrue(page._is_dirty(variant_id))
             self.assertIs(page._view_stack.currentWidget(), page._detail_view)
-            self.assertEqual((page._grid_columns, page._grid_rows), (4, 2))
+            self.assertEqual(page._grid_columns, 4)
 
     def test_right_action_footer_stays_outside_scroll_area(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
@@ -1727,6 +2294,10 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 str(detail["变体ID"])
                 for detail in page._page_variants()
             ]
+            dirty_ids = page_ids[:2]
+            for offset, variant_id in enumerate(dirty_ids, 1):
+                page._adjustments[variant_id]["移动X"] = float(offset)
+                page._sync_dirty_variant(variant_id)
 
             with (
                 patch.object(page, "_reload_variants", wraps=page._reload_variants) as reload_all,
@@ -1746,25 +2317,30 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             clear_all.assert_not_called()
             information.assert_called_once()
             for variant_id in page_ids:
-                self.assertEqual(
-                    page._glyph.get_variant(variant_id)["状态"],
-                    config.STATUS_FINISHED,
+                expected = (
+                    config.STATUS_FINISHED
+                    if variant_id in dirty_ids
+                    else config.STATUS_REVIEWED
                 )
-            self.assertEqual(page._page_index, 1)
+                self.assertEqual(page._glyph.get_variant(variant_id)["状态"], expected)
+            self.assertEqual(page._page_index, 0)
 
-    def test_rebuilding_comparison_page_never_detaches_cards_as_windows(self) -> None:
+    def test_refreshing_same_virtual_range_keeps_cards_attached_and_reuses_them(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1600, 900)
-            old_cards = list(page._cards.values())
+            old_cards = dict(page._cards)
             self.assertTrue(old_cards)
-            self.assertTrue(all(not card.isWindow() for card in old_cards))
+            self.assertTrue(all(not card.isWindow() for card in old_cards.values()))
 
             page._render_page()
 
-            self.assertTrue(all(not card.isVisible() for card in old_cards))
-            self.assertTrue(all(not card.isWindow() for card in old_cards))
+            self.assertEqual(set(page._cards), set(old_cards))
+            self.assertTrue(
+                all(page._cards[variant_id] is card for variant_id, card in old_cards.items())
+            )
+            self.assertTrue(all(not card.isWindow() for card in old_cards.values()))
             top_level_widgets = set(QApplication.topLevelWidgets())
-            self.assertTrue(all(card not in top_level_widgets for card in old_cards))
+            self.assertTrue(all(card not in top_level_widgets for card in old_cards.values()))
             self.assertTrue(all(not card.isWindow() for card in page._cards.values()))
 
     def test_save_and_next_on_last_result_shows_end_notice(self) -> None:
@@ -1789,11 +2365,12 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertIn("最后一条", information.call_args.args[2])
             self.assertEqual(page._selected_id, last_id)
 
-    def test_saving_last_comparison_page_reports_last_page(self) -> None:
+    def test_saving_dirty_comparison_result_keeps_unpaginated_position(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1600, 900)
-            page._change_page(1)
-            self.assertEqual(page._page_index, 1)
+            selected_id = page._selected_id
+            page._adjustments[selected_id]["移动X"] = 3.0
+            page._sync_dirty_variant(selected_id)
 
             with patch.object(QMessageBox, "information") as information:
                 page._save_action()
@@ -1805,10 +2382,10 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 )
 
             information.assert_called_once()
-            self.assertEqual(information.call_args.args[1], "保存本页")
-            self.assertIn("最后一页", information.call_args.args[2])
-            self.assertNotIn("总耗时：", information.call_args.args[2])
-            self.assertEqual(page._page_index, 1)
+            self.assertEqual(information.call_args.args[1], "保存全部修改")
+            self.assertIn("已保存 1 个字形", information.call_args.args[2])
+            self.assertEqual(page._page_index, 0)
+            self.assertEqual(page._selected_id, selected_id)
 
     def test_complete_coordination_runs_in_background_and_restores_after_failure(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
@@ -1822,9 +2399,11 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 _adjustments: dict[str, dict[str, object]],
                 _ink_config: dict[str, object] | None = None,
                 _baseline: dict[str, object] | None = None,
+                source_images_by_id: dict[str, Image.Image] | None = None,
                 progress_callback: object = None,
                 cancel_check: object = None,
                 commit_gate: object = None,
+                include_metrics: bool = False,
             ) -> dict[str, object]:
                 started.set()
                 if callable(progress_callback):
@@ -2263,9 +2842,11 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 _adjustments: dict[str, dict[str, object]],
                 _ink_config: dict[str, object] | None = None,
                 _baseline: dict[str, object] | None = None,
+                source_images_by_id: dict[str, Image.Image] | None = None,
                 progress_callback: object = None,
                 cancel_check: object = None,
                 commit_gate: object = None,
+                include_metrics: bool = False,
             ) -> dict[str, object]:
                 started.set()
                 while not (callable(cancel_check) and cancel_check()):
@@ -2781,27 +3362,14 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertEqual(len(keys), 1)
             self.assertEqual(keys[0][1], page._signature(variant_id))
 
-    def test_save_current_page_keeps_ink_change_within_clicked_page(self) -> None:
+    def test_save_all_changes_applies_global_ink_change_to_all_results(self) -> None:
         with self._page_with_sixteen_variants() as (page, variant_ids):
             self._show_at(page, 1600, 900)
-            page_ids = [
+            result_ids = [
                 str(detail["变体ID"])
                 for detail in page._page_variants()
             ]
-            next_page_id = str(page._variants[len(page_ids)]["变体ID"])
-            outside_ids = [
-                variant_id for variant_id in variant_ids if variant_id not in page_ids
-            ]
-            self.assertEqual(len(page_ids), page._page_size())
-            self.assertTrue(outside_ids)
-
-            draft_id = outside_ids[0]
-            outside_detail = page._variant_by_id[draft_id]
-            outside_output = (
-                Path(page._glyph.get_workflow_dirs()["成品"])
-                / str(outside_detail["原始文件"])
-            )
-            page._adjustments[draft_id]["移动X"] = 23.0
+            self.assertEqual(set(result_ids), set(variant_ids))
             page._ink_check.setChecked(False)
             self.app.processEvents()
 
@@ -2817,35 +3385,19 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 str(detail["变体ID"])
                 for detail in save_spy.call_args.args[0]
             ]
-            self.assertEqual(submitted_ids, page_ids)
+            self.assertEqual(set(submitted_ids), set(result_ids))
 
-            for variant_id in page_ids:
+            for variant_id in result_ids:
                 detail = page._variant_by_id[variant_id]
                 self.assertEqual(detail["状态"], config.STATUS_FINISHED)
                 record = detail["整体协调参数"]["墨色协调"]
                 self.assertFalse(record["启用"])
                 self.assertEqual(record["跳过原因"], "已关闭墨色统一")
                 self.assertFalse(page._is_dirty(variant_id))
-
-            outside_detail = page._variant_by_id[draft_id]
-            self.assertEqual(outside_detail["状态"], config.STATUS_REVIEWED)
-            self.assertFalse(outside_detail.get("成品文件"))
-            self.assertFalse(outside_output.exists())
-            self.assertTrue(page._is_dirty(draft_id))
-            self.assertEqual(page._adjustments[draft_id]["移动X"], 23.0)
-            self.assertEqual(
-                page._saved_adjustments[draft_id]["移动X"],
-                0.0,
-            )
             self.assertFalse(page._initial_ink_enabled)
-            self.assertEqual(page._page_index, 1)
-            self.assertEqual(page._selected_id, next_page_id)
-            self.assertEqual(
-                str(page._page_variants()[0]["变体ID"]),
-                next_page_id,
-            )
+            self.assertEqual(page._page_index, 0)
 
-    def test_save_current_page_stays_on_last_page_or_when_save_fails(self) -> None:
+    def test_save_all_changes_keeps_selection_or_when_save_fails(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
             self._show_at(page, 1600, 900)
             initial_id = page._selected_id
@@ -2855,11 +3407,9 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
             self.assertEqual(page._page_index, 0)
             self.assertEqual(page._selected_id, initial_id)
 
-            page._change_page(1)
-            self.assertEqual(page._page_index, 1)
-            last_page_ids = [
-                str(item["变体ID"]) for item in page._page_variants()
-            ]
+            dirty_id = str(page._variants[-1]["变体ID"])
+            page._adjustments[dirty_id]["移动X"] = 4.0
+            page._sync_dirty_variant(dirty_id)
             real_save = page._adjustment_service.save_coordinated_variants
             with patch.object(
                 page._adjustment_service,
@@ -2867,43 +3417,26 @@ class ConsistencyPageResponsiveTests(unittest.TestCase):
                 wraps=real_save,
             ) as save_spy:
                 self.assertTrue(page._save_current_page(show_success=False))
-            self.assertEqual(page._page_index, 1)
+            self.assertEqual(page._page_index, 0)
             self.assertEqual(
                 [str(item["变体ID"]) for item in save_spy.call_args.args[0]],
-                last_page_ids,
+                [dirty_id],
             )
-            self.assertIn(page._selected_id, last_page_ids)
+            self.assertEqual(page._selected_id, initial_id)
             self.assertEqual(
-                page._coordination_status(page._variant_by_id[last_page_ids[0]]),
+                page._coordination_status(page._variant_by_id[dirty_id]),
                 "已协调",
             )
 
-    def test_save_current_page_clamps_to_new_last_page_when_filter_shrinks(
-        self,
-    ) -> None:
+    def test_legacy_page_navigation_keeps_unpaginated_results(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):
-            page._grid_columns = 5
-            page._grid_rows = 1
-            page._render_page()
             ordered_ids = [str(item["变体ID"]) for item in page._variants]
             page._change_page(3)
-            self.assertEqual(page._page_index, 3)
-
-            def shrink_filtered_results(*_args: object, **_kwargs: object) -> bool:
-                page._variants = page._variants[:-1]
-                page._selected_id = ordered_ids[0]
-                page._page_index = 0
-                return True
-
-            with patch.object(
-                page,
-                "_save_variants",
-                side_effect=shrink_filtered_results,
-            ):
-                self.assertTrue(page._save_current_page(show_success=False))
-
-            self.assertEqual(page._page_index, 2)
-            self.assertEqual(page._selected_id, ordered_ids[10])
+            self.assertEqual(page._page_index, 0)
+            self.assertEqual(
+                [str(item["变体ID"]) for item in page._page_variants()],
+                ordered_ids,
+            )
 
     def test_discard_restores_persisted_baselines_and_refreshes_page_state(self) -> None:
         with self._page_with_sixteen_variants() as (page, _variant_ids):

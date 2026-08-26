@@ -19,6 +19,11 @@ from data.config_store import set_last_ziku_path
 from data.library_summary_store import LibrarySummaryStore
 from services.glyph_service import GlyphService
 from services.library_summary_service import summarize_glyph_service
+from services.settings_service import (
+    PERFORMANCE_CONSERVATIVE,
+    ApplicationSettings,
+    SettingsService,
+)
 from ui.dialogs.library_parameters_dialog import LibraryParametersDialog
 from ui.pages.home_page import (
     HomePage,
@@ -37,10 +42,14 @@ if TYPE_CHECKING:
     from ui.pages.consistency_page import ConsistencyPage
     from ui.pages.custom_scripture_layout_page import CustomScriptureLayoutPage
     from ui.pages.export_page import ExportPage
+    from ui.pages.help_page import HelpPage
     from ui.pages.import_page import ImportPage
+    from ui.pages.image_lab_page import ImageLabPage
     from ui.pages.optimization_page import OptimizationPage
     from ui.pages.review_page import ReviewPage
     from ui.pages.scripture_layout_page import ScriptureLayoutPage
+    from ui.pages.text_statistics_page import TextStatisticsPage
+    from ui.pages.settings_page import SettingsPage
 
 
 def _connect_manual_review_navigation(
@@ -111,6 +120,9 @@ class MainWindow(QMainWindow):
     PAGE_OPTIMIZATION = 3
     PAGE_SCRIPTURE_LAYOUT = 4
     PAGE_CUSTOM_SCRIPTURE_LAYOUT = 5
+    PAGE_TEXT_STATISTICS = 6
+    PAGE_SETTINGS = 7
+    PAGE_HELP = 8
 
     def __init__(self) -> None:
         super().__init__()
@@ -124,6 +136,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 720)
         self.resize(1380, 880)
         self._thread_pool = QThreadPool.globalInstance()
+        self._automatic_thread_count = max(1, self._thread_pool.maxThreadCount())
+        self._settings_service = SettingsService()
+        try:
+            self._apply_performance_settings(self._settings_service.load())
+        except (OSError, RuntimeError, ValueError):
+            self._apply_performance_settings(self._settings_service.defaults())
         self._workers: set[FunctionWorker] = set()
         self._library_scan_generation = 0
         self._library_scan_active = False
@@ -151,8 +169,12 @@ class MainWindow(QMainWindow):
         self._optimization_page: OptimizationPage | None = None
         self._scripture_layout_page: ScriptureLayoutPage | None = None
         self._custom_scripture_layout_page: CustomScriptureLayoutPage | None = None
+        self._text_statistics_page: TextStatisticsPage | None = None
+        self._settings_page: SettingsPage | None = None
+        self._help_page: HelpPage | None = None
         self._consistency_page: ConsistencyPage | None = None
         self._export_page: ExportPage | None = None
+        self._image_lab_page: ImageLabPage | None = None
         self._stack.addWidget(self._home_page)
         for attribute, index in (
             ("_import_page", self.PAGE_IMPORT),
@@ -160,6 +182,9 @@ class MainWindow(QMainWindow):
             ("_optimization_page", self.PAGE_OPTIMIZATION),
             ("_scripture_layout_page", self.PAGE_SCRIPTURE_LAYOUT),
             ("_custom_scripture_layout_page", self.PAGE_CUSTOM_SCRIPTURE_LAYOUT),
+            ("_text_statistics_page", self.PAGE_TEXT_STATISTICS),
+            ("_settings_page", self.PAGE_SETTINGS),
+            ("_help_page", self.PAGE_HELP),
         ):
             placeholder = QWidget()
             placeholder.setObjectName(f"unloadedPage{index}")
@@ -187,6 +212,9 @@ class MainWindow(QMainWindow):
                 "_custom_scripture_layout_page",
                 MainWindow.PAGE_CUSTOM_SCRIPTURE_LAYOUT,
             ),
+            ("_text_statistics_page", MainWindow.PAGE_TEXT_STATISTICS),
+            ("_settings_page", MainWindow.PAGE_SETTINGS),
+            ("_help_page", MainWindow.PAGE_HELP),
         ):
             page = getattr(self, attribute, None)
             if page is not None and current_page is page:
@@ -194,10 +222,13 @@ class MainWindow(QMainWindow):
                 return
         consistency_page = getattr(self, "_consistency_page", None)
         export_page = getattr(self, "_export_page", None)
+        image_lab_page = getattr(self, "_image_lab_page", None)
         if consistency_page is not None and current_page is consistency_page:
             MainWindow._release_dynamic_page(self, "_consistency_page")
         elif export_page is not None and current_page is export_page:
             MainWindow._release_dynamic_page(self, "_export_page")
+        elif image_lab_page is not None and current_page is image_lab_page:
+            MainWindow._release_dynamic_page(self, "_image_lab_page")
 
     def _connect_import_page(self, page: ImportPage) -> None:
         page.home_requested.connect(self.show_home)
@@ -222,6 +253,20 @@ class MainWindow(QMainWindow):
         self,
         page: CustomScriptureLayoutPage,
     ) -> None:
+        page.home_requested.connect(self.show_home)
+        page.status_message.connect(self.statusBar().showMessage)
+
+    def _connect_text_statistics_page(self, page: TextStatisticsPage) -> None:
+        page.home_requested.connect(self.show_home)
+        page.status_message.connect(self.statusBar().showMessage)
+
+    def _connect_settings_page(self, page: SettingsPage) -> None:
+        page.home_requested.connect(self.show_home)
+        page.status_message.connect(self.statusBar().showMessage)
+        page.settings_saved.connect(self._apply_performance_settings)
+        page.cache_cleanup_requested.connect(self._release_idle_memory)
+
+    def _connect_help_page(self, page: HelpPage) -> None:
         page.home_requested.connect(self.show_home)
         page.status_message.connect(self.statusBar().showMessage)
 
@@ -329,6 +374,55 @@ class MainWindow(QMainWindow):
             )
         return self._custom_scripture_layout_page
 
+    def _ensure_text_statistics_page(self) -> TextStatisticsPage:
+        if self._text_statistics_page is None:
+            from ui.pages.text_statistics_page import TextStatisticsPage
+
+            page = TextStatisticsPage()
+            self._connect_text_statistics_page(page)
+            self._install_fixed_page(
+                "_text_statistics_page",
+                self.PAGE_TEXT_STATISTICS,
+                page,
+            )
+        return self._text_statistics_page
+
+    def _ensure_settings_page(self) -> SettingsPage:
+        if self._settings_page is None:
+            from ui.pages.settings_page import SettingsPage
+
+            page = SettingsPage(service=self._settings_service)
+            self._connect_settings_page(page)
+            self._install_fixed_page(
+                "_settings_page",
+                self.PAGE_SETTINGS,
+                page,
+            )
+        return self._settings_page
+
+    def _ensure_help_page(self) -> HelpPage:
+        if self._help_page is None:
+            from ui.pages.help_page import HelpPage
+
+            page = HelpPage()
+            self._connect_help_page(page)
+            self._install_fixed_page(
+                "_help_page",
+                self.PAGE_HELP,
+                page,
+            )
+        return self._help_page
+
+    def _apply_performance_settings(self, settings: ApplicationSettings) -> None:
+        processor_count = self._automatic_thread_count
+        if settings.performance_mode == PERFORMANCE_CONSERVATIVE:
+            processor_count = max(1, processor_count // 2)
+        self._thread_pool.setMaxThreadCount(processor_count)
+
+    def _release_idle_memory(self) -> None:
+        gc.collect()
+        self.statusBar().showMessage("已释放闲置内存")
+
     def show_create_page(self) -> None:
         with _feature_startup_cursor():
             names = scan_library_names()
@@ -364,12 +458,53 @@ class MainWindow(QMainWindow):
                     "定制经文排版：每个非空行作为一列，使用空行分隔版面"
                 )
             return
+        if route == "statistics":
+            with _feature_startup_cursor():
+                page = getattr(self, "_text_statistics_page", None)
+                if page is None:
+                    page = MainWindow._ensure_text_statistics_page(self)
+                self._stack.setCurrentWidget(page)
+                self.statusBar().showMessage(
+                    "文字统计：请选择经文文件，或直接输入、粘贴文字"
+                )
+            return
+        if route == "settings":
+            with _feature_startup_cursor():
+                page = getattr(self, "_settings_page", None)
+                if page is None:
+                    page = MainWindow._ensure_settings_page(self)
+                else:
+                    page.reload()
+                self._stack.setCurrentWidget(page)
+                self.statusBar().showMessage("设置：程序级偏好与数据维护")
+            return
+        if route == "help":
+            page = getattr(self, "_help_page", None)
+            if page is None:
+                page = MainWindow._ensure_help_page(self)
+            self._stack.setCurrentWidget(page)
+            self.statusBar().showMessage("使用说明：选择主题或搜索具体操作")
+            return
+        if route == "image_lab":
+            with _feature_startup_cursor():
+                page = getattr(self, "_image_lab_page", None)
+                if page is None:
+                    from ui.pages.image_lab_page import ImageLabPage
+
+                    page = ImageLabPage()
+                    page.home_requested.connect(self.show_home)
+                    page.status_message.connect(self.statusBar().showMessage)
+                    self._image_lab_page = page
+                    self._stack.addWidget(page)
+                self._stack.setCurrentWidget(page)
+                self.statusBar().showMessage(
+                    "图片实验室：打开整幅拓片、手稿或文字扫描件"
+                )
+            return
         names = {
-            "template": "模板工坊",
             "statistics": "文字统计",
             "layout": "通用经文排版",
             "custom_layout": "定制经文排版",
-            "help": "使用说明",
             "settings": "设置",
         }
         name = names.get(route, "该功能")
@@ -948,7 +1083,9 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        text_statistics_page = getattr(self, "_text_statistics_page", None)
         export_page = getattr(self, "_export_page", None)
+        image_lab_page = getattr(self, "_image_lab_page", None)
         if export_page is not None and export_page.is_running:
             QMessageBox.information(
                 self,
@@ -957,10 +1094,25 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if image_lab_page is not None and image_lab_page.is_running:
+            QMessageBox.information(
+                self,
+                "图片实验室任务正在执行",
+                "请先等待预览完成，或停止完整尺寸导出后再关闭程序。",
+            )
+            event.ignore()
+            return
         if (
             self._consistency_page is not None
             and self._stack.currentWidget() is self._consistency_page
             and not self._consistency_page._confirm_leave_page()
+        ):
+            event.ignore()
+            return
+        if (
+            image_lab_page is not None
+            and self._stack.currentWidget() is image_lab_page
+            and not image_lab_page._confirm_leave_page()
         ):
             event.ignore()
             return
@@ -972,6 +1124,9 @@ class MainWindow(QMainWindow):
             export_page,
             scripture_layout_page,
             custom_scripture_layout_page,
+            text_statistics_page,
+            getattr(self, "_settings_page", None),
+            image_lab_page,
         ):
             shutdown = getattr(page, "shutdown", None)
             if callable(shutdown):

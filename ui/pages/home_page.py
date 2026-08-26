@@ -592,9 +592,9 @@ class HomePage(WatermarkWidget):
             ("排", "通用经文排版", "使用字库进行通用经文排版", "#493b66", "layout"),
             ("定", "定制经文排版", "按空行分版和逐列参数生成版面", "#35556A", "custom_layout"),
             ("统", "文字统计", "查看字库与字符统计", "#294d43", "statistics"),
-            ("模", "模板工坊", "创建和管理处理模板", "#2d426d", "template"),
-            ("?", "使用说明", "查看操作方法和说明", "#554630", "help"),
+            ("图", "图片实验室", "处理整幅拓片和文字扫描件", "#2d426d", "image_lab"),
             ("设", "设置", "目录、显示和程序设置", "#3d4654", "settings"),
+            ("?", "使用说明", "查看操作方法和说明", "#554630", "help"),
         )
         for column, definition in enumerate(tool_defs):
             mark, title_text, detail, color, key = definition

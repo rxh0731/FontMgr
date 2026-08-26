@@ -30,6 +30,8 @@ from data.layout_template_store import (
     DEFAULT_TEMPLATE_PARAMETERS,
     LayoutTemplateStore,
 )
+from services.glyph_service import GlyphService
+from services.settings_service import ApplicationSettings
 from ui.main_window import MainWindow
 from ui.pages.scripture_layout_page import (
     CUSTOM_TEMPLATE_ID,
@@ -71,6 +73,57 @@ class ScriptureLayoutPageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_system_library_list_uses_sqlite_instead_of_main_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "字库"
+            sqlite_library = root / "SQLite字库"
+            legacy_json_library = root / "仅JSON字库"
+            sqlite_library.mkdir(parents=True)
+            legacy_json_library.mkdir()
+            GlyphService.open(sqlite_library.name, str(sqlite_library))
+            (legacy_json_library / f"{legacy_json_library.name}.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            template_path = str(Path(directory) / "排版模板.json")
+
+            with (
+                patch.object(config, "LAYOUT_TEMPLATE_FILE", template_path),
+                patch.object(config, "ZIKU_ROOT", str(root)),
+            ):
+                page = ScriptureLayoutPage()
+            try:
+                names = [
+                    page._system_library_combo.itemText(index)
+                    for index in range(page._system_library_combo.count())
+                ]
+                self.assertEqual(names, ["SQLite字库"])
+                self.assertFalse(
+                    (sqlite_library / f"{sqlite_library.name}.json").exists()
+                )
+            finally:
+                page.shutdown()
+                page.deleteLater()
+
+    def test_output_directory_uses_program_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            template_path = str(Path(directory) / "排版模板.json")
+            with (
+                patch.object(config, "LAYOUT_TEMPLATE_FILE", template_path),
+                patch(
+                    "ui.pages.scripture_layout_page.SettingsService.load",
+                    return_value=ApplicationSettings(
+                        default_layout_directory=directory
+                    ),
+                ),
+            ):
+                page = ScriptureLayoutPage()
+            try:
+                self.assertEqual(page._output_path_edit.text(), directory)
+            finally:
+                page.shutdown()
+                page.deleteLater()
 
     def test_page_contains_confirmed_workbench_regions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -126,6 +126,26 @@ class ApplicationDatabase:
                 (key, int(version), packed, self._now()),
             )
 
+    def check_integrity(self) -> list[str]:
+        """只读核对程序数据库，并返回发现的问题。"""
+        connection = self._connect()
+        try:
+            integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+            foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+        finally:
+            connection.close()
+
+        issues = [
+            str(row[0])
+            for row in integrity_rows
+            if row and str(row[0]).strip().lower() != "ok"
+        ]
+        issues.extend(
+            "外键异常：" + "，".join(str(value) for value in row)
+            for row in foreign_key_rows
+        )
+        return issues
+
     @staticmethod
     def _now() -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")

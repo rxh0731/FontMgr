@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 
 import config
 from services.glyph_service import GlyphService
+from services.settings_service import SettingsService
 from services.import_service import ImportService
 from services.traditional_chinese_service import identify_character
 from utils.batch_observability import ProgressThrottle, format_elapsed_time
@@ -221,7 +222,11 @@ class ScanTask(QRunnable):
                     return
                 filename = os.path.basename(path)
                 original_char = extractor._extract_char(filename)
-                category, candidates = identify_character(original_char)
+                if original_char == "未分类":
+                    category = "正确"
+                    candidates = (original_char,)
+                else:
+                    category, candidates = identify_character(original_char)
                 if category in {"一对一", "歧义"}:
                     candidates = tuple(dict.fromkeys((*candidates, original_char)))
                     final_char = ""
@@ -331,6 +336,11 @@ class ImportPage(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        settings_service = SettingsService()
+        try:
+            self._application_settings = settings_service.load()
+        except (OSError, RuntimeError, ValueError):
+            self._application_settings = settings_service.defaults()
         self._append_mode = False
         self._glyph_service: GlyphService | None = None
         self._existing_names: list[str] = []
@@ -421,7 +431,7 @@ class ImportPage(QWidget):
         self._dpi_spin = QSpinBox()
         self._dpi_spin.setRange(1, 9600)
         self._dpi_spin.setSuffix(" DPI")
-        self._dpi_spin.setValue(300)
+        self._dpi_spin.setValue(self._application_settings.default_dpi)
         right_form.addRow("分辨率", self._dpi_spin)
 
         size_widget = QWidget()
@@ -431,7 +441,9 @@ class ImportPage(QWidget):
         self._width_px_spin = QSpinBox()
         self._width_px_spin.setRange(1, 50000)
         self._width_px_spin.setSuffix(" 像素")
-        self._width_px_spin.setValue(250)
+        self._width_px_spin.setValue(
+            self._application_settings.default_canvas_width
+        )
         self._width_mm_spin = QDoubleSpinBox()
         self._width_mm_spin.setRange(0.01, 10000)
         self._width_mm_spin.setDecimals(2)
@@ -439,7 +451,9 @@ class ImportPage(QWidget):
         self._height_px_spin = QSpinBox()
         self._height_px_spin.setRange(1, 50000)
         self._height_px_spin.setSuffix(" 像素")
-        self._height_px_spin.setValue(250)
+        self._height_px_spin.setValue(
+            self._application_settings.default_canvas_height
+        )
         self._height_mm_spin = QDoubleSpinBox()
         self._height_mm_spin.setRange(0.01, 10000)
         self._height_mm_spin.setDecimals(2)
@@ -556,13 +570,22 @@ class ImportPage(QWidget):
         self._subtitle_label.setText("填写规格、扫描核对文字图片并创建字库")
         self._name_edit.clear()
         self._name_edit.setReadOnly(False)
-        self._dpi_spin.setValue(300)
-        self._width_px_spin.setValue(250)
-        self._height_px_spin.setValue(250)
+        self._dpi_spin.setValue(self._application_settings.default_dpi)
+        self._width_px_spin.setValue(
+            self._application_settings.default_canvas_width
+        )
+        self._height_px_spin.setValue(
+            self._application_settings.default_canvas_height
+        )
         self._pixels_to_millimeters()
         self._set_spec_enabled(True)
         self._import_button.setText("确认并创建字库")
         self._reset_scan()
+        self._directory_edit.setText(
+            SettingsService.usable_directory(
+                self._application_settings.default_image_directory
+            )
+        )
 
     def configure_append(self, glyph_service: GlyphService, existing_names: list[str] | None = None) -> None:
         """切换为追加模式，读取并锁定现有字库规格。"""
@@ -582,6 +605,11 @@ class ImportPage(QWidget):
         self._set_spec_enabled(False)
         self._import_button.setText("确认并导入字图")
         self._reset_scan()
+        self._directory_edit.setText(
+            SettingsService.usable_directory(
+                self._application_settings.default_image_directory
+            )
+        )
 
     def _bind_conversions(self) -> None:
         self._dpi_spin.valueChanged.connect(self._pixels_to_millimeters)
@@ -995,6 +1023,7 @@ class ImportPage(QWidget):
             action_box.addWidget(title)
             choices_host = QWidget()
             choices = FlowLayout(choices_host, spacing=8)
+            choices_host.setMaximumWidth(220)
             button_group = QButtonGroup(card)
             button_group.setExclusive(True)
 

@@ -15,4 +15,4 @@ PyMuPDF==1.28.0
 rapidocr==3.9.2
 onnxruntime==1.28.0
 pywin32==312
-zhconv==1.4.3
+opencc==1.4.2

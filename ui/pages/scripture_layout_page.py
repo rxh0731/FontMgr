@@ -91,6 +91,7 @@ from core.scripture_layout import (
     compute_grid,
     parse_scripture,
 )
+from data.library_database import LIBRARY_DATABASE_FILENAME
 from data.layout_template_store import (
     DEFAULT_TEMPLATE_ID,
     LayoutTemplate,
@@ -116,6 +117,7 @@ from services.scripture_layout_service import (
     plan_board_output,
     render_board_preview,
 )
+from services.settings_service import SettingsService
 from services.scripture_text_service import (
     ScriptureTextResult,
     load_scripture_text,
@@ -1809,7 +1811,18 @@ class ScriptureLayoutPage(QWidget):
         desktop_path = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.DesktopLocation
         )
-        self._output_path_edit = QLineEdit(desktop_path or config.SCRIPT_DIR)
+        settings_service = SettingsService()
+        try:
+            default_layout_directory = (
+                settings_service.load().default_layout_directory
+            )
+        except (OSError, RuntimeError, ValueError):
+            default_layout_directory = ""
+        output_directory = SettingsService.usable_directory(
+            default_layout_directory,
+            desktop_path or config.SCRIPT_DIR,
+        )
+        self._output_path_edit = QLineEdit(output_directory)
         self._output_path_edit.setObjectName("layoutOutputDirectoryEdit")
         self._output_path_edit.setPlaceholderText("选择 PSD/PSB 输出目录")
         browse = QPushButton("浏览")
@@ -1862,7 +1875,8 @@ class ScriptureLayoutPage(QWidget):
                 (
                     entry.name
                     for entry in root.iterdir()
-                    if entry.is_dir() and (entry / f"{entry.name}.json").is_file()
+                    if entry.is_dir()
+                    and (entry / LIBRARY_DATABASE_FILENAME).is_file()
                 ),
                 key=natural_key,
             )

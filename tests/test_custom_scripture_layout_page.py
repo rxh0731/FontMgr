@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QLabel, QScrollArea
 
 import config
+from services.glyph_service import GlyphService
 from services.scripture_layout_service import GenerationResult, GlyphIndex
 from ui.pages.custom_scripture_layout_page import CustomScriptureLayoutPage
 from ui.main_window import MainWindow
@@ -29,6 +30,26 @@ class CustomScriptureLayoutPageTests(unittest.TestCase):
             patch.object(config, "ZIKU_ROOT", str(Path(directory) / "字库")),
         ):
             return CustomScriptureLayoutPage()
+
+    def test_system_library_list_inherits_sqlite_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "字库"
+            library = root / "111"
+            library.mkdir(parents=True)
+            GlyphService.open(library.name, str(library))
+
+            page = self._page(directory)
+            try:
+                self.assertEqual(page._system_library_combo.count(), 1)
+                self.assertEqual(page._system_library_combo.currentText(), "111")
+                self.assertEqual(
+                    page._system_library_combo.currentData(),
+                    str(library),
+                )
+                self.assertFalse((library / "111.json").exists())
+            finally:
+                page.shutdown()
+                page.deleteLater()
 
     def test_page_uses_confirmed_title_output_name_and_default_board(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -443,9 +443,9 @@ class HomePageTests(unittest.TestCase):
             ("layout", "通用经文排版"),
             ("custom_layout", "定制经文排版"),
             ("statistics", "文字统计"),
-            ("template", "模板工坊"),
-            ("help", "使用说明"),
+            ("image_lab", "图片实验室"),
             ("settings", "设置"),
+            ("help", "使用说明"),
         )
         self.assertEqual(
             list(page._tool_cards),

@@ -97,6 +97,8 @@ class AdjustmentService:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         adjustments_by_id: Optional[dict[str, dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        *,
+        source_images_by_id: Optional[dict[str, Image.Image]] = None,
     ) -> dict[str, Any]:
         """统计审核结果；提供几何参数时按最终几何后的视觉墨量取基准。"""
         width_ratios: list[float] = []
@@ -109,7 +111,13 @@ class AdjustmentService:
         canvas_height = max(1, int(metadata.get("画布高", 250)))
         for current, detail in enumerate(variants, 1):
             self._raise_if_coordination_cancelled(cancel_check)
-            image = self._load_reviewed_image(detail)
+            variant_id = str(detail.get("变体ID", ""))
+            source_override = (source_images_by_id or {}).get(variant_id)
+            image = (
+                source_override.copy()
+                if source_override is not None
+                else self._load_reviewed_image(detail)
+            )
             if image is not None:
                 try:
                     if self._upstream_ink_issue(image):
@@ -137,7 +145,6 @@ class AdjustmentService:
                         )
                         ink_image = working
                         if adjustments_by_id is not None:
-                            variant_id = str(detail.get("变体ID", ""))
                             applied = self._normalized_coordination(
                                 adjustments_by_id.get(variant_id)
                             )
@@ -363,6 +370,9 @@ class AdjustmentService:
         ] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         commit_gate: Optional[Callable[[], bool]] = None,
+        *,
+        source_images_by_id: Optional[dict[str, Image.Image]] = None,
+        include_metrics: bool = False,
     ) -> dict[str, Any]:
         """以批次事务生成成品，任一失败都不留下部分保存结果。"""
         library_lock = acquire_batch_library_lock(self._glyph.ziku_dir)
@@ -376,6 +386,8 @@ class AdjustmentService:
                 progress_callback,
                 cancel_check,
                 commit_gate,
+                source_images_by_id=source_images_by_id,
+                include_metrics=include_metrics,
             )
         finally:
             library_lock.release()
@@ -391,8 +403,12 @@ class AdjustmentService:
         ] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         commit_gate: Optional[Callable[[], bool]] = None,
+        *,
+        source_images_by_id: Optional[dict[str, Image.Image]] = None,
+        include_metrics: bool = False,
     ) -> dict[str, Any]:
         """调用方持有字库独占锁时完成整批渲染与持久提交。"""
+        source_images_by_id = source_images_by_id or {}
         if not variants:
             return {"成功": 0, "失败": 0, "失败详情": []}
         total = len(variants)
@@ -408,6 +424,7 @@ class AdjustmentService:
             "正在核对批次",
         )
         normalized_ink = self._normalized_ink_config(ink_config)
+        self._validate_ink_baseline_scope(variants, normalized_ink)
         if normalized_ink["启用"] and (
             normalized_ink["重算几何后基准"] or normalized_ink["基准"] is None
         ):
@@ -418,6 +435,7 @@ class AdjustmentService:
                 target_ratio=requested_ratio,
                 adjustments_by_id=adjustments_by_id,
                 cancel_check=cancel_check,
+                source_images_by_id=source_images_by_id,
             )
             normalized_ink["基准"] = formal_baseline["墨色基准"]
             coordination_baseline = formal_baseline
@@ -495,7 +513,17 @@ class AdjustmentService:
 
         timing.add("准备", time.perf_counter() - preparation_started)
         rendering_started = time.perf_counter()
-        render_requests: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+        render_requests: list[
+            tuple[
+                int,
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                str,
+                Image.Image | None,
+            ]
+        ] = []
         for index, detail in enumerate(variants):
             self._raise_if_coordination_cancelled(cancel_check, temporary_paths)
             label = self._coordination_progress_label(detail)
@@ -519,11 +547,14 @@ class AdjustmentService:
                     (canvas_width, canvas_height),
                     target_dpi,
                 )
-                if self._reusable_coordination_output(
+                if (
+                    variant_id not in source_images_by_id
+                    and self._reusable_coordination_output(
                     detail,
                     str(plan["target_path"]),
                     str(plan["filename"]),
                     generation_signature,
+                    )
                 ):
                     prepared.append(
                         {
@@ -547,6 +578,7 @@ class AdjustmentService:
                         applied,
                         variant_ink,
                         generation_signature,
+                        source_images_by_id.get(variant_id),
                     )
                 )
             except Exception as exc:
@@ -582,6 +614,7 @@ class AdjustmentService:
                         generation_signature,
                         (canvas_width, canvas_height),
                         target_dpi,
+                        source_override,
                     ): (index, str(plan["label"]))
                     for (
                         index,
@@ -590,6 +623,7 @@ class AdjustmentService:
                         applied,
                         variant_ink,
                         generation_signature,
+                        source_override,
                     ) in render_requests
                 }
                 for future in as_completed(futures):
@@ -641,17 +675,53 @@ class AdjustmentService:
 
         timing.add("渲染编码", time.perf_counter() - rendering_started)
         changed_items = [item for item in prepared if not item.get("reused")]
+        review_items: list[dict[str, Any]] = []
+        review_dir = self._glyph.get_workflow_dirs()["手工审核"]
+        os.makedirs(review_dir, exist_ok=True)
+        for item in changed_items:
+            variant_id = str(item["variant_id"])
+            source_override = source_images_by_id.get(variant_id)
+            if source_override is None:
+                continue
+            detail = item["detail"]
+            review_filename = os.path.basename(
+                str(detail.get("审核文件", "") or "")
+            )
+            if not review_filename:
+                review_filename = os.path.splitext(
+                    os.path.basename(str(detail.get("原始文件", "")))
+                )[0] + ".png"
+            review_target = os.path.join(review_dir, review_filename)
+            review_temp = self._save_coordination_temp_png(
+                source_override,
+                review_target,
+                (target_dpi, target_dpi),
+            )
+            review_items.append(
+                {
+                    "variant_id": variant_id,
+                    "detail": detail,
+                    "filename": review_filename,
+                    "target_path": review_target,
+                    "temporary_path": review_temp,
+                    "md5": compute_file_md5(review_temp),
+                }
+            )
+            temporary_paths.append(review_temp)
         transaction_preparation_started = time.perf_counter()
         try:
             baseline = (
                 dict(coordination_baseline)
                 if coordination_baseline is not None
-                else self.analyze()
+                else self.analyze(
+                    adjustments_by_id=adjustments_by_id,
+                    source_images_by_id=source_images_by_id,
+                )
             )
-            state_backups = [
-                self._glyph.snapshot_variant_state(str(item["variant_id"]))
-                for item in changed_items
-            ]
+            state_ids = {
+                str(item["variant_id"]) for item in changed_items
+            } | {str(item["variant_id"]) for item in review_items}
+            state_backups = [self._glyph.snapshot_variant_state(variant_id) for variant_id in state_ids]
             self._raise_if_coordination_cancelled(cancel_check)
             # 快照准备完成后再原子关闭取消窗口。通过后必须完整提交或完整回滚，
             # 不再观察取消标志，避免把成品文件和 JSON 留在半提交状态。
@@ -682,7 +752,11 @@ class AdjustmentService:
                     {"请求": total, "成功": total, "复用": total, "失败": 0},
                 )
             )
-            return {"成功": total, "失败": 0, "失败详情": []}
+            return self._coordination_success_result(
+                total,
+                reused=total,
+                include_metrics=include_metrics,
+            )
         transaction: FileTransaction | None = None
         state_persisted = False
         commit_started = time.perf_counter()
@@ -705,11 +779,42 @@ class AdjustmentService:
                         backup_prefix=".fonteditor_coordination_rollback_",
                     )
                     for item in changed_items
+                ]
+                + [
+                    FileChange(
+                        target_path=str(item["target_path"]),
+                        temporary_path=str(item["temporary_path"]),
+                        new_md5=str(item["md5"]),
+                        backup_prefix=".fonteditor_review_rollback_",
+                    )
+                    for item in review_items
                 ],
                 recovery_variant_batch_state_snapshot(state_backups),
             )
             transaction.backup_targets()
 
+            for item in review_items:
+                self._glyph.mark_manual_saved(
+                    str(item["variant_id"]),
+                    str(item["filename"]),
+                    str(item["md5"]),
+                )
+                for rendered_item in changed_items:
+                    if str(rendered_item["variant_id"]) != str(item["variant_id"]):
+                        continue
+                    rendered_item["parameters"]["生成签名"] = (
+                        self._coordination_generation_signature(
+                            self._glyph.get_variant(str(item["variant_id"])),
+                            rendered_item["parameters"].get("整体变换", {}),
+                            self._ink_config_for_variant(
+                                normalized_ink,
+                                str(item["variant_id"]),
+                            ),
+                            (canvas_width, canvas_height),
+                            target_dpi,
+                        )
+                    )
+                    break
             for index, item in enumerate(changed_items):
                 self._glyph.mark_finished(
                     str(item["variant_id"]),
@@ -794,7 +899,93 @@ class AdjustmentService:
                 },
             )
         )
-        return {"成功": len(prepared), "失败": 0, "失败详情": []}
+        return self._coordination_success_result(
+            len(prepared),
+            reused=len(prepared) - len(changed_items),
+            include_metrics=include_metrics,
+        )
+
+    def _validate_ink_baseline_scope(
+        self,
+        variants: list[dict[str, Any]],
+        ink_config: dict[str, Any],
+    ) -> None:
+        """禁止部分批次重算或替换已经生效的全库墨色基准。"""
+
+        if not ink_config.get("启用"):
+            return
+        submitted_ids = {
+            str(detail.get("变体ID", "")).strip()
+            for detail in variants
+            if str(detail.get("变体ID", "")).strip()
+        }
+        eligible_ids = {
+            str(detail.get("变体ID", "")).strip()
+            for detail in self.load_reviewed_variants(pinyin_order=False)
+            if str(detail.get("变体ID", "")).strip()
+        }
+        full_scope = bool(eligible_ids) and submitted_ids == eligible_ids
+        if ink_config.get("重算几何后基准") and not full_scope:
+            raise ValueError(
+                "重新计算全库墨色基准必须提交全部可协调字形，不能只处理部分字形。"
+            )
+
+        summary = self._glyph.get_coordination_summary()
+        if summary.get("墨色统一启用") is not True:
+            return
+        current_baseline = self._finite_ink_baseline(summary.get("墨色基准"))
+        requested_baseline = self._finite_ink_baseline(ink_config.get("基准"))
+        if current_baseline is None or requested_baseline is None:
+            return
+        current_method = str(summary.get("墨色方法", "") or "").strip()
+        requested_method = str(ink_config.get("方法", "") or "").strip()
+        try:
+            current_version = int(summary.get("墨色方法版本"))
+            requested_version = int(ink_config.get("方法版本"))
+        except (TypeError, ValueError):
+            current_version = requested_version = 0
+        contract_changed = (
+            not math.isclose(
+                current_baseline,
+                requested_baseline,
+                rel_tol=0.0,
+                abs_tol=0.01,
+            )
+            or current_method != requested_method
+            or current_version != requested_version
+        )
+        if contract_changed and not full_scope:
+            raise ValueError(
+                "全库墨色基准或算法契约发生变化，必须提交全部可协调字形。"
+            )
+
+    @staticmethod
+    def _finite_ink_baseline(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            baseline = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return baseline if math.isfinite(baseline) and 0.0 < baseline <= 255.0 else None
+
+    @staticmethod
+    def _coordination_success_result(
+        success: int,
+        *,
+        reused: int,
+        include_metrics: bool,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "成功": int(success),
+            "失败": 0,
+            "失败详情": [],
+        }
+        if include_metrics:
+            normalized_reused = max(0, min(int(reused), int(success)))
+            result["复用"] = normalized_reused
+            result["重新生成"] = max(0, int(success) - normalized_reused)
+        return result
 
     @classmethod
     def _raise_if_coordination_cancelled(
@@ -892,13 +1083,18 @@ class AdjustmentService:
         generation_signature: str,
         canvas_size: tuple[int, int],
         target_dpi: float,
+        source_override: Image.Image | None = None,
     ) -> dict[str, Any]:
         """渲染并验证一个临时成品，不修改字库状态。"""
 
         temporary_path = ""
         try:
             canvas_width, canvas_height = canvas_size
-            source = self._load_reviewed_image(detail)
+            source = (
+                source_override.copy()
+                if source_override is not None
+                else self._load_reviewed_image(detail)
+            )
             if source is None:
                 raise FileNotFoundError("找不到审核通过的文字图片")
             if not self._has_visible_ink(source):

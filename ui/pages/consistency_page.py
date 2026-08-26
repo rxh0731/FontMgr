@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import hashlib
 from collections import OrderedDict
 from copy import deepcopy
 from threading import Event, Lock
@@ -174,6 +175,7 @@ class _CoordinationTask(QRunnable):
         adjustments: dict[str, dict[str, Any]],
         ink_config: dict[str, Any],
         coordination_baseline: dict[str, Any],
+        pixel_drafts: dict[str, Image.Image] | None = None,
         *,
         return_full_state: bool = True,
     ) -> None:
@@ -185,6 +187,7 @@ class _CoordinationTask(QRunnable):
         self._adjustments = adjustments
         self._ink_config = ink_config
         self._coordination_baseline = coordination_baseline
+        self._pixel_drafts = pixel_drafts or {}
         self._return_full_state = bool(return_full_state)
         self._cancel_event = Event()
         self._commit_lock = Lock()
@@ -226,15 +229,24 @@ class _CoordinationTask(QRunnable):
                 if not detail:
                     raise KeyError(f"找不到待协调字形：{variant_id}")
                 variants.append(detail)
-            result = AdjustmentService(worker_glyph).save_coordinated_variants(
-                variants,
-                self._adjustments,
-                self._ink_config,
-                self._coordination_baseline,
-                progress_callback=self.signals.progress.emit,
-                cancel_check=self.is_cancel_requested,
-                commit_gate=self.try_begin_commit,
-            )
+            try:
+                result = AdjustmentService(worker_glyph).save_coordinated_variants(
+                    variants,
+                    self._adjustments,
+                    self._ink_config,
+                    self._coordination_baseline,
+                    source_images_by_id=self._pixel_drafts,
+                    progress_callback=self.signals.progress.emit,
+                    cancel_check=self.is_cancel_requested,
+                    commit_gate=self.try_begin_commit,
+                    include_metrics=True,
+                )
+            finally:
+                for image in self._pixel_drafts.values():
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
         except CoordinationCancelled:
             try:
                 self.signals.finished.emit(
@@ -284,6 +296,7 @@ class GlyphPreviewCard(QWidget):
     transform_changed = Signal(str, object, object)
     transform_finished = Signal(str)
     wheel_requested = Signal(str, float)
+    scroll_requested = Signal(float, bool)
 
     FOOTER_HEIGHT = 36
     WORK_RATIO = 1.3
@@ -304,6 +317,7 @@ class GlyphPreviewCard(QWidget):
         self._char = ""
         self._filename = ""
         self._status = "待协调"
+        self._dirty = False
         self._preview_size = QSize()
         self._preview_bounds = (0.0, 0.0, 0.0, 0.0)
         self._canvas_size = self._normalized_canvas_size(canvas_size)
@@ -321,6 +335,8 @@ class GlyphPreviewCard(QWidget):
         self._live_control_polygon_logical = QPolygonF()
         self._live_preview_active = False
         self._drag_kind = ""
+        self._pending_transform_position: QPointF | None = None
+        self._pending_transform_modifiers = Qt.KeyboardModifier.NoModifier
         self._rotation_cursor: QCursor | None = None
         self._hit_test_handler: Callable[
             [QPointF, Qt.KeyboardModifier],
@@ -363,7 +379,7 @@ class GlyphPreviewCard(QWidget):
             )
         else:
             self._preview_bounds = tuple(float(value) for value in bounds)
-        self.finish_live_preview()
+        self.finish_live_preview(commit_controls=True)
         self.update()
 
     def set_transform(self, transform: dict[str, Any]) -> None:
@@ -426,7 +442,15 @@ class GlyphPreviewCard(QWidget):
         self._live_control_polygon_logical = normalized
         self.update()
 
-    def finish_live_preview(self) -> None:
+    def finish_live_preview(self, *, commit_controls: bool = False) -> None:
+        if (
+            commit_controls
+            and self._live_preview_active
+            and self._live_control_polygon_logical.count() == 4
+        ):
+            self._control_polygon_logical = QPolygonF(
+                self._live_control_polygon_logical
+            )
         self._live_preview_active = False
         self._live_source_polygon_logical = QPolygonF()
         self._live_control_polygon_logical = QPolygonF()
@@ -438,15 +462,25 @@ class GlyphPreviewCard(QWidget):
             return QPolygonF()
         return QPolygonF(polygon)
 
-    def set_metadata(self, char: str, filename: str, status: str) -> None:
+    def set_metadata(
+        self,
+        char: str,
+        filename: str,
+        status: str,
+        dirty: bool = False,
+    ) -> None:
         self._char = char
         self._filename = filename
         self._status = status
-        self.setToolTip(f"{char} · {filename}\n{status}")
+        self._dirty = bool(dirty)
+        marker = "\n未保存修改" if self._dirty else ""
+        self.setToolTip(f"{char} · {filename}\n{status}{marker}")
         self.update()
 
     def set_selected(self, selected: bool) -> None:
         self._selected = bool(selected)
+        if not self._selected and not self._drag_kind:
+            self._pending_transform_position = None
         if not self._selected and not self._drag_kind:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.update()
@@ -512,9 +546,10 @@ class GlyphPreviewCard(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             filename,
         )
-        status_color = QColor(
-            PHASE_STATUS_COLORS.get(self._status, "#A6B0BE")
-        )
+        status_color = QColor("#E05252" if self._dirty else PHASE_STATUS_COLORS.get(
+            self._status,
+            "#A6B0BE",
+        ))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(status_color)
         painter.drawEllipse(
@@ -728,6 +763,10 @@ class GlyphPreviewCard(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             was_selected = self._selected
+            if not was_selected and self._image_area().contains(event.position()):
+                # 先记录按下位置，再发出选中信号，避免缓存命中时异步回调先于状态建立。
+                self._pending_transform_position = QPointF(event.position())
+                self._pending_transform_modifiers = event.modifiers()
             self.selected.emit(self.variant_id)
             if was_selected:
                 kind = self._hit_test(event.position(), event.modifiers())
@@ -746,6 +785,14 @@ class GlyphPreviewCard(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         position = event.position()
+        if (
+            self._pending_transform_position is not None
+            and self._selected
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and self._try_resume_pending_transform(position, event.modifiers())
+        ):
+            event.accept()
+            return
         if self._drag_kind and event.buttons() & Qt.MouseButton.LeftButton:
             self.transform_changed.emit(
                 self.variant_id,
@@ -763,17 +810,75 @@ class GlyphPreviewCard(QWidget):
             self.cancel_transform_interaction(notify=True)
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pending_transform_position = None
         super().mouseReleaseEvent(event)
 
+    def resume_pending_transform(self) -> bool:
+        """精调数据就绪后，尝试接续仍未释放的首次拖动。"""
+        if self._pending_transform_position is None:
+            return False
+        if not QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self._pending_transform_position = None
+            return False
+        position = self.mapFromGlobal(QCursor.pos())
+        return self._try_resume_pending_transform(
+            QPointF(position),
+            self._pending_transform_modifiers,
+        )
+
+    def _try_resume_pending_transform(
+        self,
+        position: QPointF,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        if self._pending_transform_position is None or not self._selected:
+            return False
+        start_position = QPointF(self._pending_transform_position)
+        start_modifiers = self._pending_transform_modifiers
+        kind = self._hit_test(start_position, start_modifiers)
+        if not kind:
+            return False
+        self._pending_transform_position = None
+        self._drag_kind = kind
+        self.begin_live_preview()
+        self.transform_started.emit(
+            self.variant_id,
+            start_position,
+            start_modifiers,
+        )
+        if position != start_position:
+            self.transform_changed.emit(
+                self.variant_id,
+                QPointF(position),
+                modifiers,
+            )
+        self.setCursor(self._cursor_object_for_hit(kind))
+        return True
+
     def wheelEvent(self, event: QWheelEvent) -> None:
+        # 比较区的普通滚轮用于滚动整个字形列表，避免选中卡片时意外缩放并造成视图跳动。
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = float(event.pixelDelta().y())
+            if delta != 0.0:
+                self.scroll_requested.emit(delta, True)
+                event.accept()
+                return
+            delta = float(event.angleDelta().y())
+            if delta == 0.0:
+                event.ignore()
+                return
+            self.scroll_requested.emit(delta, False)
+            event.accept()
+            return
         if not self._selected:
-            super().wheelEvent(event)
+            event.ignore()
             return
         delta = float(event.angleDelta().y())
         if delta == 0.0:
             delta = float(event.pixelDelta().y() * 8)
         if delta == 0.0:
-            super().wheelEvent(event)
+            event.ignore()
             return
         self.wheel_requested.emit(self.variant_id, delta)
         event.accept()
@@ -786,7 +891,7 @@ class GlyphPreviewCard(QWidget):
     def event(self, event: QEvent) -> bool:
         if (
             hasattr(self, "_drag_kind")
-            and self._drag_kind
+            and (self._drag_kind or self._pending_transform_position is not None)
             and event.type()
             in {
                 QEvent.Type.FocusOut,
@@ -798,13 +903,22 @@ class GlyphPreviewCard(QWidget):
             self.cancel_transform_interaction(notify=True)
         return super().event(event)
 
-    def cancel_transform_interaction(self, *, notify: bool = False) -> None:
+    def cancel_transform_interaction(
+        self,
+        *,
+        notify: bool = False,
+        keep_live_preview: bool = False,
+    ) -> None:
         """清理被释放或系统中断的卡片变换状态。"""
         was_dragging = bool(self._drag_kind)
         self._drag_kind = ""
+        self._pending_transform_position = None
         if notify and was_dragging:
             self.transform_finished.emit(self.variant_id)
-        self.finish_live_preview()
+        # 通知页面后由页面决定是否等待高清预览；此处立即撤掉投影会短暂显示旧位置。
+        handed_off = notify and was_dragging
+        if not keep_live_preview and not handed_off:
+            self.finish_live_preview()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _hit_test(
@@ -963,12 +1077,10 @@ class ConsistencyPage(QWidget):
 
     WORK_RATIO = 1.3
     BACKGROUND_ANALYSIS_THRESHOLD = 32
-    LARGE_COLUMNS = 5
-    LARGE_ROWS = 3
-    COMPACT_COLUMNS = 4
-    COMPACT_ROWS = 2
-    LARGE_VIEWPORT_WIDTH = 760
-    LARGE_VIEWPORT_HEIGHT = 520
+    COMPARISON_CARD_MIN_WIDTH = 148
+    COMPARISON_CELL_HEIGHT = 168
+    COMPARISON_ROW_GAP = 10
+    COMPARISON_MIN_COLUMNS = 1
     LIST_PANEL_MIN_WIDTH = 250
     LIST_PANEL_DEFAULT_WIDTH = 285
     LIST_PANEL_MAX_WIDTH = 400
@@ -1039,6 +1151,9 @@ class ConsistencyPage(QWidget):
         self._saved_adjustments: dict[str, dict[str, Any]] = {}
         self._saved_signatures: dict[str, tuple[tuple[str, Any], ...]] = {}
         self._saved_ink_signatures: dict[str, tuple[Any, ...]] = {}
+        self._pixel_drafts: dict[str, QImage] = {}
+        self._saved_pixel_signatures: dict[str, str] = {}
+        self._dirty_variant_ids: set[str] = set()
         self._ink_modes: dict[str, str] = {}
         self._content_sizes: dict[str, tuple[int, int]] = {}
         self._detail_cache: OrderedDict[
@@ -1087,13 +1202,23 @@ class ConsistencyPage(QWidget):
         self._list_placeholder_icon = QIcon()
         self._cards: dict[str, GlyphPreviewCard] = {}
         self._grid_slots: list[QWidget] = []
+        self._retired_cards: list[GlyphPreviewCard] = []
         self._selected_id = ""
         self._reference_variant_id = ""
-        self._page_index = 0
-        self._grid_columns = self.COMPACT_COLUMNS
-        self._grid_rows = self.COMPACT_ROWS
+        self._virtual_first_row = 0
+        self._virtual_last_row = -1
+        self._virtual_rendering = False
+        self._virtual_render_signature: tuple[Any, ...] | None = None
+        self._virtual_layout_signature: tuple[int, int, int, int] | None = None
+        self._virtual_grid_shape: tuple[int, int] | None = None
+        self._comparison_preview_pending: set[str] = set()
+        self._page_index = 0  # 兼容旧状态快照；页面不再使用分页导航。
+        self._grid_columns = self.COMPARISON_MIN_COLUMNS
+        self._grid_rows = 1
         self._updating_controls = False
         self._loading_detail = False
+        self._detail_transform_active = False
+        self._detail_transform_variant_id = ""
         self._comparison_transform_active = False
         self._comparison_transform_mode = ""
         self._comparison_transform_changed = False
@@ -1279,6 +1404,7 @@ class ConsistencyPage(QWidget):
         self._task_detail_label.setToolTip("")
         self._main_splitter.setEnabled(False)
         self._complete_button.setEnabled(False)
+        self._recalculate_baseline_button.setEnabled(False)
         for action in self._shortcut_actions:
             action.setEnabled(False)
 
@@ -1371,6 +1497,7 @@ class ConsistencyPage(QWidget):
         self._complete_button.setEnabled(
             not self._coordination_busy and bool(self._all_variants)
         )
+        self._update_recalculate_baseline_button()
 
         if succeeded:
             total = max(1, len(self._all_variants))
@@ -1568,9 +1695,31 @@ class ConsistencyPage(QWidget):
         self._mode_status_label = QLabel("请选择字形")
         self._mode_status_label.setProperty("role", "muted")
         mode_layout.addWidget(self._mode_status_label)
+        self._detail_navigation = QWidget()
+        detail_navigation_layout = QHBoxLayout(self._detail_navigation)
+        detail_navigation_layout.setContentsMargins(4, 0, 0, 0)
+        detail_navigation_layout.setSpacing(5)
+        self._detail_position_label = QLabel("0 / 0")
+        self._detail_position_label.setProperty("role", "muted")
+        detail_navigation_layout.addWidget(self._detail_position_label)
+        previous = QPushButton("上一字形")
+        previous.setObjectName("compactButton")
+        previous.clicked.connect(lambda: self._move_detail_selection(-1))
+        detail_navigation_layout.addWidget(previous)
+        next_button = QPushButton("下一字形")
+        next_button.setObjectName("compactButton")
+        next_button.clicked.connect(lambda: self._move_detail_selection(1))
+        detail_navigation_layout.addWidget(next_button)
+        self._detail_navigation.hide()
+        mode_layout.addWidget(self._detail_navigation)
         layout.addWidget(mode_bar)
 
         self._view_stack = QStackedWidget()
+        # 单字精调工具栏合并为单行后内容较宽；隐藏页面不得反向撑大主窗口。
+        self._view_stack.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
+        )
         self._comparison_view = self._build_comparison_view()
         self._detail_view = self._build_detail_view()
         self._view_stack.addWidget(self._comparison_view)
@@ -1588,19 +1737,18 @@ class ConsistencyPage(QWidget):
         nav_layout = QHBoxLayout(nav)
         nav_layout.setContentsMargins(8, 6, 8, 6)
         nav_layout.setSpacing(5)
+        self._comparison_scope_label = QLabel("整体协调字形列表")
+        self._comparison_scope_label.setProperty("role", "muted")
+        nav_layout.addWidget(self._comparison_scope_label)
         nav_layout.addStretch()
-        self._previous_page_button = QPushButton("上一页")
-        self._previous_page_button.setObjectName("compactButton")
-        self._previous_page_button.clicked.connect(lambda: self._change_page(-1))
-        nav_layout.addWidget(self._previous_page_button)
-        self._page_label = QLabel("第 0 / 0 页")
-        self._page_label.setMinimumWidth(82)
-        self._page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        nav_layout.addWidget(self._page_label)
-        self._next_page_button = QPushButton("下一页")
-        self._next_page_button.setObjectName("compactButton")
-        self._next_page_button.clicked.connect(lambda: self._change_page(1))
-        nav_layout.addWidget(self._next_page_button)
+        self._comparison_scroll_label = QLabel("可滚动查看全部字形")
+        self._comparison_scroll_label.setProperty("role", "muted")
+        nav_layout.addWidget(self._comparison_scroll_label)
+        self._show_all_matches_button = QPushButton("查看全部匹配")
+        self._show_all_matches_button.setObjectName("compactButton")
+        self._show_all_matches_button.clicked.connect(self._show_all_search_matches)
+        self._show_all_matches_button.hide()
+        nav_layout.addWidget(self._show_all_matches_button)
         layout.addWidget(nav)
 
         self._comparison_scroll = QScrollArea()
@@ -1609,14 +1757,18 @@ class ConsistencyPage(QWidget):
         self._comparison_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._comparison_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._grid_host = QWidget()
-        self._grid = QGridLayout(self._grid_host)
+        self._grid_container = QWidget(self._grid_host)
+        self._grid = QGridLayout(self._grid_container)
         self._grid.setContentsMargins(10, 10, 10, 10)
         self._grid.setHorizontalSpacing(10)
-        self._grid.setVerticalSpacing(10)
+        self._grid.setVerticalSpacing(0)
         self._comparison_scroll.setWidget(self._grid_host)
+        self._comparison_scroll.verticalScrollBar().valueChanged.connect(
+            self._comparison_scroll_changed
+        )
         layout.addWidget(self._comparison_scroll, 1)
 
-        self._status_label = QLabel("本页 0 字")
+        self._status_label = QLabel("显示 0 个字形　未保存 0 个")
         self._status_label.setContentsMargins(10, 5, 10, 7)
         self._status_label.setProperty("role", "muted")
         layout.addWidget(self._status_label)
@@ -1628,65 +1780,71 @@ class ConsistencyPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        nav = QWidget()
-        nav_layout = QHBoxLayout(nav)
-        nav_layout.setContentsMargins(8, 6, 8, 6)
-        nav_layout.addStretch()
-        self._detail_position_label = QLabel("0 / 0")
-        self._detail_position_label.setProperty("role", "muted")
-        nav_layout.addWidget(self._detail_position_label)
-        previous = QPushButton("上一字形")
-        previous.setObjectName("compactButton")
-        previous.clicked.connect(lambda: self._move_detail_selection(-1))
-        nav_layout.addWidget(previous)
-        next_button = QPushButton("下一字形")
-        next_button.setObjectName("compactButton")
-        next_button.clicked.connect(lambda: self._move_detail_selection(1))
-        nav_layout.addWidget(next_button)
-        layout.addWidget(nav)
-
         toolbar = QWidget()
         toolbar.setStyleSheet(
             "background: #1b2028; border-top: 1px solid #37404d; border-bottom: 1px solid #37404d;"
         )
-        toolbar_layout = QVBoxLayout(toolbar)
+        self._detail_toolbar = toolbar
+        toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(7, 5, 7, 5)
         toolbar_layout.setSpacing(4)
-        edit_row = QHBoxLayout()
-        edit_row.setSpacing(4)
-        self._undo_button = self._toolbar_button("撤销", "撤销（Ctrl+Z）")
+        self._undo_button = self._toolbar_button("↶", "撤销（Ctrl+Z）")
+        self._undo_button.setAccessibleName("撤销")
         self._undo_button.clicked.connect(self._detail_canvas_undo)
-        edit_row.addWidget(self._undo_button)
-        self._redo_button = self._toolbar_button("重做", "重做（Ctrl+Y）")
+        toolbar_layout.addWidget(self._undo_button)
+        self._redo_button = self._toolbar_button("↷", "重做（Ctrl+Y）")
+        self._redo_button.setAccessibleName("重做")
         self._redo_button.clicked.connect(self._detail_canvas_redo)
-        edit_row.addWidget(self._redo_button)
-        edit_row.addWidget(self._vertical_separator())
-        transform = self._toolbar_button("自由变换", "自由变换", checkable=True)
-        transform.setChecked(True)
-        edit_row.addWidget(transform)
-        edit_row.addStretch()
-        toolbar_layout.addLayout(edit_row)
+        toolbar_layout.addWidget(self._redo_button)
+        toolbar_layout.addWidget(self._vertical_separator())
+        self._detail_tool_group = QButtonGroup(self)
+        self._detail_tool_group.setExclusive(True)
+        self._detail_tool_buttons: dict[str, QToolButton] = {}
+        for label, tool, tip in (
+            ("变换", ReviewCanvas.TOOL_TRANSFORM, "移动、缩放、旋转或扭曲字形"),
+            ("画笔", ReviewCanvas.TOOL_BRUSH, "补充或修补字形像素"),
+            ("橡皮", ReviewCanvas.TOOL_ERASER, "清除多余字形像素"),
+        ):
+            button = self._toolbar_button(label, tip, checkable=True)
+            button.clicked.connect(
+                lambda _checked=False, value=tool: self._set_detail_tool(value)
+            )
+            self._detail_tool_group.addButton(button)
+            self._detail_tool_buttons[tool] = button
+            toolbar_layout.addWidget(button)
+        self._detail_tool_buttons[ReviewCanvas.TOOL_TRANSFORM].setChecked(True)
+        brush_label = QLabel("笔触大小")
+        brush_label.setProperty("role", "muted")
+        toolbar_layout.addWidget(brush_label)
+        self._detail_brush_size = QSlider(Qt.Orientation.Horizontal)
+        self._detail_brush_size.setRange(1, 100)
+        self._detail_brush_size.setValue(10)
+        self._detail_brush_size.setMinimumWidth(80)
+        self._detail_brush_size.setMaximumWidth(120)
+        self._detail_brush_size.setToolTip("调整画笔和橡皮擦的笔触大小")
+        self._detail_brush_size.setAccessibleName("笔触大小")
+        self._detail_brush_size.valueChanged.connect(self._set_detail_brush_size)
+        toolbar_layout.addWidget(self._detail_brush_size)
+        toolbar_layout.addStretch()
 
-        view_row = QHBoxLayout()
-        view_row.setSpacing(4)
-        fit = self._toolbar_button("适合窗口", "适合窗口")
+        fit = self._toolbar_button("适应", "适应窗口：完整显示当前画布")
         fit.clicked.connect(self._detail_canvas_fit)
-        view_row.addWidget(fit)
+        toolbar_layout.addWidget(fit)
         actual = self._toolbar_button("1:1", "按图像实际像素显示")
         actual.clicked.connect(self._detail_canvas_actual_size)
-        view_row.addWidget(actual)
-        self._source_button = self._toolbar_button("查看原稿", "按住查看原稿")
+        toolbar_layout.addWidget(actual)
+        self._source_button = self._toolbar_button("原稿", "按住查看原稿")
         self._source_button.pressed.connect(lambda: self._detail_canvas.set_source_preview_visible(True))
         self._source_button.released.connect(lambda: self._detail_canvas.set_source_preview_visible(False))
-        view_row.addWidget(self._source_button)
-        self._grid_button = self._toolbar_button("田字格", "显示或隐藏田字格", checkable=True)
+        toolbar_layout.addWidget(self._source_button)
+        self._grid_button = self._toolbar_button("网格", "显示或隐藏字格参考线", checkable=True)
         self._grid_button.setChecked(True)
         self._grid_button.toggled.connect(self._detail_canvas_set_grid)
-        view_row.addWidget(self._grid_button)
+        toolbar_layout.addWidget(self._grid_button)
         self._background_group = QButtonGroup(self)
         self._background_group.setExclusive(True)
-        self._white_button = self._toolbar_button("白底", "白色预览背景", checkable=True)
-        self._transparent_button = self._toolbar_button("透明底", "透明棋盘格背景", checkable=True)
+        self._white_button = self._toolbar_button("白底", "使用白色预览背景", checkable=True)
+        self._transparent_button = self._toolbar_button("透明", "使用透明棋盘格背景", checkable=True)
         self._white_button.setChecked(True)
         self._white_button.clicked.connect(
             lambda: self._detail_canvas.set_background_mode(ReviewCanvas.BACKGROUND_WHITE)
@@ -1696,10 +1854,8 @@ class ConsistencyPage(QWidget):
         )
         self._background_group.addButton(self._white_button)
         self._background_group.addButton(self._transparent_button)
-        view_row.addWidget(self._white_button)
-        view_row.addWidget(self._transparent_button)
-        view_row.addStretch()
-        toolbar_layout.addLayout(view_row)
+        toolbar_layout.addWidget(self._white_button)
+        toolbar_layout.addWidget(self._transparent_button)
         layout.addWidget(toolbar)
 
         self._detail_canvas = ReviewCanvas()
@@ -1707,8 +1863,18 @@ class ConsistencyPage(QWidget):
         self._detail_canvas.set_background_mode(ReviewCanvas.BACKGROUND_WHITE)
         self._detail_canvas.set_grid_visible(True)
         self._detail_canvas.transform_changed.connect(self._on_detail_transform_changed)
-        self._detail_canvas.changed.connect(lambda _dirty: self._refresh_current_labels())
+        self._detail_canvas.transform_interaction_started.connect(
+            self._on_detail_transform_started
+        )
+        self._detail_canvas.transform_interaction_finished.connect(
+            self._on_detail_transform_finished
+        )
+        self._detail_canvas.changed.connect(self._on_detail_canvas_changed)
+        self._detail_canvas.pixels_changed.connect(self._on_detail_pixels_changed)
         self._detail_canvas.history_changed.connect(self._update_history_buttons)
+        self._detail_canvas.brush_size_changed.connect(
+            lambda value: self._detail_brush_size.setValue(int(value))
+        )
         layout.addWidget(self._detail_canvas, 1)
 
         footer = QWidget()
@@ -1772,7 +1938,7 @@ class ConsistencyPage(QWidget):
         self._restore_button = QPushButton("还原本字")
         self._restore_button.clicked.connect(self._reset_selected)
         action_layout.addWidget(self._restore_button)
-        self._save_button = QPushButton("保存本页")
+        self._save_button = QPushButton("保存全部修改（0）")
         self._save_button.setProperty("role", "primary")
         self._save_button.clicked.connect(self._save_action)
         action_layout.addWidget(self._save_button)
@@ -1973,6 +2139,14 @@ class ConsistencyPage(QWidget):
         self._ink_baseline_label.setProperty("role", "muted")
         self._ink_baseline_label.setWordWrap(True)
         layout.addWidget(self._ink_baseline_label)
+        self._recalculate_baseline_button = QPushButton("重新计算全库基准")
+        self._recalculate_baseline_button.setToolTip(
+            "重新分析全部可协调字形；基准变化时会在同一事务中更新全库成品"
+        )
+        self._recalculate_baseline_button.clicked.connect(
+            self._recalculate_coordination_baseline
+        )
+        layout.addWidget(self._recalculate_baseline_button)
         self._ink_summary_label = QLabel("墨色达标 0　待确认 0　人工例外 0")
         self._ink_summary_label.setProperty("role", "muted")
         self._ink_summary_label.setWordWrap(True)
@@ -2302,6 +2476,8 @@ class ConsistencyPage(QWidget):
                 self._saved_adjustments[variant_id] = deepcopy(saved)
                 self._saved_signatures[variant_id] = self._adjustment_signature(saved)
                 self._saved_ink_signatures[variant_id] = self._stored_ink_signature(detail)
+        self._rebuild_dirty_variant_ids()
+        self._workflow_status_cache.clear()
         if selected not in self._variant_by_id:
             # 首次进入时交给筛选后的当前排序选择第一项，避免导入首项
             # 在拼音序中靠后而把比较墙直接带到后续页面。
@@ -2310,6 +2486,7 @@ class ConsistencyPage(QWidget):
 
     def _apply_filters(self, _value: object = None) -> None:
         self._finish_pending_comparison_transform()
+        self._update_search_placeholder()
         self._refresh_filtered_view()
 
     def _execute_search(self, _checked: bool = False) -> None:
@@ -2323,6 +2500,16 @@ class ConsistencyPage(QWidget):
 
         if not text.strip():
             self._apply_filters()
+
+    def _update_search_placeholder(self) -> None:
+        if not hasattr(self, "_search_edit") or not hasattr(self, "_filter_combo"):
+            return
+        status_filter = self._filter_combo.currentText()
+        if status_filter == PHASE_FILTER_ALL:
+            text = "搜索归属字、文件名或变体ID"
+        else:
+            text = f"在“{status_filter}”字形中搜索"
+        self._search_edit.setPlaceholderText(text)
 
     def _refresh_filtered_view(
         self,
@@ -2339,13 +2526,24 @@ class ConsistencyPage(QWidget):
         query = self._search_edit.text().strip().casefold()
         status_filter = self._filter_combo.currentText()
         list_filtered: list[dict[str, Any]] = []
+        search_matches_before_status: list[dict[str, Any]] = []
         for detail in self._list_variants:
             text = " ".join(
                 str(detail.get(key, ""))
-                for key in ("归属字", "原始文件", "导入前文件名", "中间文件", "审核文件")
+                for key in (
+                    "归属字",
+                    "变体序号",
+                    "变体ID",
+                    "原始文件",
+                    "导入前文件名",
+                    "中间文件",
+                    "审核文件",
+                    "成品文件",
+                )
             ).casefold()
             if query and query not in text:
                 continue
+            search_matches_before_status.append(detail)
             if not self._matches_status_filter(detail, status_filter):
                 continue
             list_filtered.append(detail)
@@ -2369,10 +2567,15 @@ class ConsistencyPage(QWidget):
                 else ""
             )
         selected_index = self._variant_index(self._selected_id)
-        self._page_index = selected_index // self._page_size() if selected_index >= 0 else 0
         self._populate_list()
         self._populate_reference_combo()
-        self._render_page()
+        self._render_virtual_view()
+        self._update_search_feedback(
+            query,
+            status_filter,
+            len(search_matches_before_status),
+            len(list_filtered),
+        )
         if self._selected_id:
             if reload_detail or self._selected_id != previous_selected_id:
                 self._load_detail_canvas(self._selected_id)
@@ -2381,6 +2584,45 @@ class ConsistencyPage(QWidget):
         else:
             self._clear_detail()
         self._refresh_statistics()
+
+    def _update_search_feedback(
+        self,
+        query: str,
+        status_filter: str,
+        all_matches: int,
+        visible_matches: int,
+    ) -> None:
+        """明确显示搜索和状态筛选叠加后的范围，避免零结果无提示。"""
+        self._show_all_matches_button.hide()
+        if query:
+            if visible_matches:
+                self._comparison_scope_label.setText(
+                    f"搜索范围：{status_filter} · 找到 {visible_matches} 个字形"
+                )
+            elif all_matches:
+                self._comparison_scope_label.setText(
+                    f"在“{status_filter}”中没有找到“{query}”"
+                    f" · 其他状态有 {all_matches} 个匹配字形"
+                )
+                self._show_all_matches_button.show()
+            else:
+                self._comparison_scope_label.setText(
+                    f"本阶段没有找到“{query}”"
+                )
+            return
+        if not visible_matches and status_filter != PHASE_FILTER_ALL:
+            self._comparison_scope_label.setText(
+                f"当前没有{status_filter}字形"
+            )
+        else:
+            self._comparison_scope_label.setText(
+                f"搜索范围：{status_filter} · 共 {visible_matches} 个字形"
+            )
+
+    def _show_all_search_matches(self) -> None:
+        if self._filter_combo.currentText() == PHASE_FILTER_ALL:
+            return
+        self._filter_combo.setCurrentText(PHASE_FILTER_ALL)
 
     def _sort_variants(self, variants: list[dict[str, Any]]) -> None:
         mode = self._order_combo.currentText()
@@ -2523,6 +2765,106 @@ class ConsistencyPage(QWidget):
         )
         self._schedule_list_thumbnail_loads()
 
+    def _refresh_variant_tree_status(self, variant_id: str) -> None:
+        """只刷新一个字形及其归属字分组，避免编辑后重建整棵树。"""
+        detail = self._list_variant_by_id.get(variant_id)
+        item = self._list_items_by_id.get(variant_id)
+        if detail is None or item is None:
+            return
+        projection = self._stage_projection(detail)
+        status = projection.status
+        markers = self._marker_text(projection)
+        char = str(detail.get("归属字", "")) or "?"
+        filename = str(detail.get("原始文件", ""))
+        position = 1
+        for candidate in self._list_variants:
+            if (str(candidate.get("归属字", "")) or "?") != char:
+                continue
+            if str(candidate.get("变体ID", "")) == variant_id:
+                break
+            position += 1
+        item.setToolTip(
+            0,
+            f"{char} · 字形{position}\n文件：{filename}\n"
+            f"整体协调：{status}\n提示：{markers}\n"
+            "协调：可编辑\n"
+            f"{self._ink_result_text(detail)}\n{variant_id}",
+        )
+        set_two_line_status(
+            item,
+            1,
+            status,
+            markers,
+            self._coordination_status_color(status),
+            self._marker_color(projection),
+        )
+
+        parent = item.parent()
+        if parent is None:
+            return
+        group_items = [
+            candidate
+            for candidate in self._list_variants
+            if (str(candidate.get("归属字", "")) or "?") == char
+        ]
+        projections = [self._stage_projection(candidate) for candidate in group_items]
+        coordinated_count = sum(result.completed for result in projections)
+        problem_count = sum(self._is_problem_status(result) for result in projections)
+        set_two_line_status(
+            parent,
+            1,
+            f"已协调 {coordinated_count}/{len(group_items)}",
+            f"问题 {problem_count}",
+            self._coordination_status_color(
+                STATUS_COORDINATED
+                if coordinated_count == len(group_items)
+                else STAGE_PENDING_COORDINATION
+            ),
+            QColor("#F2B84B" if problem_count else "#A6B0BE"),
+        )
+        parent.setToolTip(
+            0,
+            f"{char}：共 {len(group_items)} 个字形，当前显示 {parent.childCount()} 个\n"
+            f"已协调 {coordinated_count}，待协调 "
+            f"{len(group_items) - coordinated_count}\n"
+            f"有问题 {problem_count}",
+        )
+
+    def _refresh_variant_edit_state(
+        self,
+        variant_id: str,
+        *,
+        request_preview: bool,
+    ) -> None:
+        """局部刷新编辑状态；筛选集合变化时才执行完整刷新。"""
+        detail = self._variant_by_id.get(variant_id)
+        if detail is None:
+            return
+        self._workflow_status_cache.pop(variant_id, None)
+        status_filter = self._filter_combo.currentText()
+        if not self._matches_status_filter(detail, status_filter):
+            scroll_bar = self._comparison_scroll.verticalScrollBar()
+            scroll_value = scroll_bar.value()
+            self._refresh_filtered_view(
+                preserve_selection=True,
+                reload_detail=False,
+            )
+            scroll_bar.setValue(
+                max(scroll_bar.minimum(), min(scroll_bar.maximum(), scroll_value))
+            )
+            return
+
+        self._refresh_variant_tree_status(variant_id)
+        if request_preview:
+            self._clear_variant_preview_cache(variant_id)
+            self._update_card(variant_id, render_sync=False)
+        else:
+            self._update_card_metadata(variant_id)
+            if variant_id == self._selected_id:
+                self._sync_selected_card_controls(live=False)
+        self._refresh_current_labels()
+        self._render_status()
+
     def _populate_reference_combo(self) -> None:
         current = self._reference_variant_id
         reference_variants = sorted(
@@ -2552,95 +2894,233 @@ class ConsistencyPage(QWidget):
         return self._grid_columns * self._grid_rows
 
     def _page_variants(self) -> list[dict[str, Any]]:
-        start = self._page_index * self._page_size()
-        return self._variants[start:start + self._page_size()]
+        # 保留旧内部接口，取消分页后统一返回当前筛选结果。
+        return list(self._variants)
 
-    def _render_page(self) -> None:
-        self._discard_queued_card_previews()
-        tracked_columns = max(self._grid.columnCount(), self._grid_columns)
-        tracked_rows = max(self._grid.rowCount(), self._grid_rows)
-        while self._grid.count():
-            item = self._grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                # 保留比较墙父级直至延迟销毁。可见控件一旦 setParent(None)，
-                # Windows 会在 deleteLater 生效前把它短暂注册为独立任务栏窗口。
-                widget.hide()
-                widget.deleteLater()
-        # QGridLayout 会保留曾经出现过的行列轨道；缩为紧凑模式时必须显式
-        # 清零旧轨道，否则隐藏的第 5 列和第 3 行仍会分走可用空间。
-        for column in range(tracked_columns):
-            self._grid.setColumnStretch(column, 0)
-            self._grid.setColumnMinimumWidth(column, 0)
-        for row in range(tracked_rows):
-            self._grid.setRowStretch(row, 0)
-            self._grid.setRowMinimumHeight(row, 0)
-        self._cards.clear()
-        self._grid_slots.clear()
+    def _comparison_row_stride(self) -> int:
+        """返回比较网格相邻两行起点之间的真实像素距离。"""
+        return self.COMPARISON_CELL_HEIGHT + self.COMPARISON_ROW_GAP
 
-        total_pages = math.ceil(len(self._variants) / self._page_size()) if self._variants else 0
-        self._page_index = max(0, min(self._page_index, max(0, total_pages - 1)))
-        page = self._page_variants()
-        page_ids = {
-            str(detail.get("变体ID", ""))
-            for detail in page
-            if detail.get("变体ID")
-        }
-        for index in range(self._page_size()):
-            if index < len(page):
-                detail = page[index]
-                variant_id = str(detail.get("变体ID", ""))
-                slot: QWidget = GlyphPreviewCard(
-                    variant_id,
-                    (self._canvas_width, self._canvas_height),
+    def _replace_comparison_grid(self) -> None:
+        """清除 Qt 网格保留的历史行列，避免响应式换列后卡片被拉高。"""
+        old_container = self._grid_container
+        new_container = QWidget(self._grid_host)
+        new_container.setGeometry(old_container.geometry())
+        new_grid = QGridLayout(new_container)
+        new_grid.setContentsMargins(10, 10, 10, 10)
+        new_grid.setHorizontalSpacing(10)
+        new_grid.setVerticalSpacing(0)
+        for card in self._cards.values():
+            card.setParent(new_container)
+        self._retired_cards.clear()
+        self._grid_container = new_container
+        self._grid = new_grid
+        new_container.show()
+        old_container.hide()
+        old_container.deleteLater()
+
+    def _comparison_scroll_changed(self, _value: int) -> None:
+        """滚动时只在跨越虚拟缓冲区边界后调整卡片集合。"""
+        self._render_virtual_view(for_scroll=True)
+
+    def _retire_comparison_card(self, card: GlyphPreviewCard) -> None:
+        if card.hasFocus():
+            # 隐藏滚出缓冲区的焦点控件时，QScrollArea 会尝试把它重新滚回视口。
+            self._comparison_scroll.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._grid.removeWidget(card)
+        card.hide()
+        self._retired_cards.append(card)
+        while len(self._retired_cards) > 64:
+            self._retired_cards.pop(0).deleteLater()
+
+    def _discard_offscreen_card_previews(self, target_ids: set[str]) -> None:
+        """取消尚未开始且已经离开虚拟缓冲区的预览任务。"""
+        for variant_id, (_cache_key, worker) in list(self._preview_workers.items()):
+            if variant_id in target_ids:
+                continue
+            try:
+                removed = self._preview_pool.tryTake(worker)
+            except RuntimeError:
+                # Qt 可能先释放已结束的 QRunnable，再派发其完成信号。
+                self._preview_workers.pop(variant_id, None)
+                continue
+            if removed:
+                self._preview_workers.pop(variant_id, None)
+
+    def _render_virtual_view(self, *, for_scroll: bool = False) -> None:
+        """只创建可视区附近的比较卡片，列表数据本身不分页。"""
+        if not hasattr(self, "_grid") or self._virtual_rendering:
+            return
+        columns = max(1, int(self._grid_columns))
+        total_rows = math.ceil(len(self._variants) / columns) if self._variants else 0
+        grid_shape = (columns, total_rows)
+        grid_replaced = grid_shape != self._virtual_grid_shape
+        if grid_replaced:
+            self._replace_comparison_grid()
+            self._virtual_grid_shape = grid_shape
+        cell_height = self.COMPARISON_CELL_HEIGHT
+        row_stride = self._comparison_row_stride()
+        margins = self._grid.contentsMargins()
+        viewport = self._comparison_scroll.viewport()
+        host_width = max(viewport.width(), 1)
+        content_height = (
+            margins.top()
+            + margins.bottom()
+            + max(0, total_rows * row_stride - self.COMPARISON_ROW_GAP)
+        )
+        host_height = max(
+            content_height,
+            viewport.height(),
+        )
+        layout_signature = (columns, total_rows, host_width, host_height)
+        layout_changed = layout_signature != self._virtual_layout_signature
+        self._virtual_rendering = True
+        try:
+            if layout_changed:
+                old_columns = (
+                    self._virtual_layout_signature[0]
+                    if self._virtual_layout_signature is not None and not grid_replaced
+                    else self._grid.columnCount()
                 )
-                card = slot
-                card.selected.connect(self._select_variant_deferred)
-                card.edit_requested.connect(self._enter_detail)
-                card.transform_started.connect(self._begin_comparison_transform)
-                card.transform_changed.connect(self._apply_comparison_transform)
-                card.transform_finished.connect(self._finish_comparison_transform)
-                card.wheel_requested.connect(self._apply_comparison_wheel)
-                card.set_transform_interaction_handlers(
-                    lambda position, modifiers, target=card: (
-                        self._comparison_card_hit_test(
-                            target,
-                            position,
-                            modifiers,
-                        )
-                    ),
-                    self._detail_canvas.transform_cursor_for_hit,
+                old_rows = (
+                    self._virtual_layout_signature[1]
+                    if self._virtual_layout_signature is not None and not grid_replaced
+                    else self._grid.rowCount()
                 )
-                self._cards[variant_id] = card
-                self._update_card_metadata(variant_id)
-            else:
-                slot = QWidget()
-                slot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                slot.setStyleSheet("background: transparent;")
-            slot.setMinimumSize(112, 132)
-            slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self._grid_slots.append(slot)
-            self._grid.addWidget(slot, index // self._grid_columns, index % self._grid_columns)
-        if self._selected_id in page_ids:
-            self._update_card(self._selected_id, render_sync=False)
-        for variant_id in page_ids:
-            if variant_id != self._selected_id:
+                for column in range(columns, max(columns, old_columns)):
+                    self._grid.setColumnStretch(column, 0)
+                    self._grid.setColumnMinimumWidth(column, 0)
+                for row in range(total_rows, max(total_rows, old_rows)):
+                    self._grid.setRowStretch(row, 0)
+                    self._grid.setRowMinimumHeight(row, 0)
+                for row in range(total_rows):
+                    self._grid.setRowStretch(row, 0)
+                    row_height = (
+                        cell_height
+                        if row == total_rows - 1
+                        else row_stride
+                    )
+                    self._grid.setRowMinimumHeight(row, row_height)
+                for column in range(columns):
+                    self._grid.setColumnMinimumWidth(column, 0)
+                    self._grid.setColumnStretch(column, 1)
+                self._grid_host.setMinimumSize(host_width, host_height)
+                self._grid_container.setGeometry(0, 0, host_width, host_height)
+                self._virtual_layout_signature = layout_signature
+        except Exception:
+            self._virtual_rendering = False
+            raise
+
+        scroll_value = self._comparison_scroll.verticalScrollBar().value()
+        visible_height = max(1, viewport.height())
+        first_row = max(0, scroll_value // row_stride - 1)
+        last_row = min(
+            total_rows - 1,
+            (scroll_value + visible_height) // row_stride + 1,
+        ) if total_rows else -1
+        visible_indices = list(range(
+            first_row * columns,
+            min(len(self._variants), (last_row + 1) * columns),
+        )) if last_row >= first_row else []
+        target_items = [
+            (
+                item_index,
+                str(self._variants[item_index].get("变体ID", "")),
+            )
+            for item_index in visible_indices
+            if self._variants[item_index].get("变体ID")
+        ]
+        target_ids = {variant_id for _item_index, variant_id in target_items}
+        render_signature = (
+            columns,
+            total_rows,
+            first_row,
+            last_row,
+            tuple(variant_id for _item_index, variant_id in target_items),
+        )
+        if (
+            for_scroll
+            and not layout_changed
+            and render_signature == self._virtual_render_signature
+        ):
+            self._virtual_rendering = False
+            return
+
+        try:
+            for variant_id, card in list(self._cards.items()):
+                if variant_id in target_ids:
+                    continue
+                self._cards.pop(variant_id, None)
+                self._retire_comparison_card(card)
+            self._discard_offscreen_card_previews(target_ids)
+
+            ordered_cards: list[QWidget] = []
+            for item_index, variant_id in target_items:
+                card = self._cards.get(variant_id)
+                if card is None:
+                    card = GlyphPreviewCard(
+                        variant_id,
+                        (self._canvas_width, self._canvas_height),
+                    )
+                    card.selected.connect(self._select_variant_deferred)
+                    card.edit_requested.connect(self._enter_detail)
+                    card.transform_started.connect(self._begin_comparison_transform)
+                    card.transform_changed.connect(self._apply_comparison_transform)
+                    card.transform_finished.connect(self._finish_comparison_transform)
+                    card.wheel_requested.connect(self._apply_comparison_wheel)
+                    card.scroll_requested.connect(self._scroll_comparison)
+                    card.set_transform_interaction_handlers(
+                        lambda position, modifiers, target=card: (
+                            self._comparison_card_hit_test(target, position, modifiers)
+                        ),
+                        self._detail_canvas.transform_cursor_for_hit,
+                    )
+                    self._cards[variant_id] = card
+                card.setFixedHeight(cell_height)
+                row = item_index // columns
+                column = item_index % columns
+                self._grid.addWidget(
+                    card,
+                    row,
+                    column,
+                    alignment=Qt.AlignmentFlag.AlignTop,
+                )
+                card.show()
+                ordered_cards.append(card)
                 self._update_card(variant_id, render_sync=False)
-        for column in range(self._grid_columns):
-            self._grid.setColumnStretch(column, 1)
-        for row in range(self._grid_rows):
-            self._grid.setRowStretch(row, 1)
 
-        current_page = self._page_index + 1 if total_pages else 0
-        self._page_label.setText(f"第 {current_page} / {total_pages} 页")
-        self._previous_page_button.setEnabled(self._page_index > 0)
-        self._next_page_button.setEnabled(self._page_index + 1 < total_pages)
+            self._grid_slots = ordered_cards
+            self._virtual_first_row = first_row
+            self._virtual_last_row = last_row
+            self._virtual_render_signature = render_signature
+        finally:
+            self._virtual_rendering = False
+
+        # Qt 可能在隐藏焦点卡片时同步调整滚动条；必须按最终值重新对齐虚拟行。
+        if self._comparison_scroll.verticalScrollBar().value() != scroll_value:
+            self._render_virtual_view(for_scroll=True)
+            return
+
+        self._comparison_scroll_label.setText(
+            f"可滚动查看全部字形 · 当前 {len(self._variants)} 个"
+        )
         dirty = sum(
             self._is_dirty(str(item.get("变体ID", "")))
-            for item in page
+            for item in self._list_variants
         )
-        self._status_label.setText(f"本页 {len(page)} 字　未保存调整 {dirty} 字")
+        self._status_label.setText(
+            f"显示 {len(self._variants)} 个字形　未保存 {dirty} 个"
+        )
+        self._save_button.setText(f"保存全部修改（{dirty}）")
         self._refresh_selection()
+
+    def _render_page(self) -> None:
+        """兼容旧调用方；实际执行无分页虚拟列表刷新。"""
+        self._render_virtual_view()
+
+    def _render_page_legacy(self) -> None:
+        """保留旧实现入口名称，避免外部插件调用时报错。"""
+        self._render_virtual_view()
 
     def _discard_queued_card_previews(self) -> None:
         """翻页时丢弃尚未开始的旧预览；运行中的迟到结果由身份检查忽略。"""
@@ -2668,6 +3148,7 @@ class ConsistencyPage(QWidget):
             str(detail.get("归属字", "")),
             str(detail.get("原始文件", "")),
             self._coordination_status(detail),
+            self._is_dirty(variant_id),
         )
         card.set_selected(variant_id == self._selected_id)
 
@@ -2699,6 +3180,7 @@ class ConsistencyPage(QWidget):
             else:
                 self._request_card_preview(variant_id, cache_key)
         if image is not None:
+            self._comparison_preview_pending.discard(variant_id)
             card.set_preview(image, bounds)
             self._set_list_thumbnail_from_preview(variant_id, image)
         self._update_card_metadata(variant_id)
@@ -2773,6 +3255,7 @@ class ConsistencyPage(QWidget):
             return
         image, bounds = result
         self._store_preview(variant_id, cache_key, image, bounds)
+        self._comparison_preview_pending.discard(variant_id)
         card = self._cards.get(variant_id)
         if card is not None:
             card.set_preview(image, bounds)
@@ -2793,6 +3276,7 @@ class ConsistencyPage(QWidget):
         pending = self._preview_workers.get(variant_id)
         if pending is not None and pending == (cache_key, worker):
             self._preview_workers.pop(variant_id, None)
+            self._comparison_preview_pending.discard(variant_id)
 
     def _select_variant(
         self,
@@ -2807,19 +3291,19 @@ class ConsistencyPage(QWidget):
         selection_changed = variant_id != self._selected_id
         self._selected_id = variant_id
         target_index = self._variant_index(variant_id)
-        if target_index >= 0:
-            target_page = target_index // self._page_size()
-            if target_page != self._page_index:
-                self._page_index = target_page
-                self._render_page()
-            target_item = self._list_items_by_id.get(variant_id)
-            if target_item is not None:
-                self._glyph_list.blockSignals(True)
+        # 点击当前可视区内的卡片时保持滚动位置；只有从列表、搜索或其他入口
+        # 选中了虚拟列表当前未创建的卡片，才需要把它定位到比较区。
+        if target_index >= 0 and variant_id not in self._cards:
+            self._scroll_to_variant_index(target_index)
+        # 中间比较卡片和其他入口选中字形时，左侧列表也必须同步选中并定位。
+        # 列表自身发起选择时目标通常已经可见，这段逻辑不会改变比较区滚动位置。
+        target_item = self._list_items_by_id.get(variant_id)
+        if target_item is not None:
+            with QSignalBlocker(self._glyph_list):
                 if target_item.parent() is not None:
                     target_item.parent().setExpanded(True)
                 self._glyph_list.setCurrentItem(target_item)
                 self._glyph_list.scrollToItem(target_item)
-                self._glyph_list.blockSignals(False)
         if not self._reference_pin_button.isChecked() and self._reference_variant_id == variant_id:
             self._reference_variant_id = ""
             self._populate_reference_combo()
@@ -2830,6 +3314,16 @@ class ConsistencyPage(QWidget):
         ):
             self._load_detail_canvas(variant_id)
         self._refresh_selection()
+
+    def _scroll_to_variant_index(self, index: int) -> None:
+        """把目标字形滚动到可视区，并触发附近卡片按需创建。"""
+        if index < 0:
+            return
+        row_stride = self._comparison_row_stride()
+        row = index // max(1, self._grid_columns)
+        target = max(0, row * row_stride - row_stride)
+        self._comparison_scroll.verticalScrollBar().setValue(target)
+        self._render_virtual_view(for_scroll=True)
 
     def _select_variant_deferred(self, variant_id: str) -> None:
         """先完成选择反馈，再在后台准备精调画布。"""
@@ -2964,7 +3458,7 @@ class ConsistencyPage(QWidget):
             QPointF(),
             1.0,
         )
-        if live:
+        if live or self._selected_id in self._comparison_preview_pending:
             card.set_live_control_polygon(polygon)
         else:
             card.set_transform(self._detail_canvas.transform())
@@ -3004,6 +3498,7 @@ class ConsistencyPage(QWidget):
             self._load_detail_canvas(variant_id)
         self._view_stack.setCurrentWidget(self._detail_view)
         self._detail_mode_button.setChecked(True)
+        self._detail_navigation.show()
         self._save_button.setText("保存本字")
         self._save_next_button.show()
         self._restore_button.setEnabled(bool(self._selected_id))
@@ -3013,10 +3508,15 @@ class ConsistencyPage(QWidget):
         self._detail_canvas.set_source_preview_visible(False)
         self._view_stack.setCurrentWidget(self._comparison_view)
         self._comparison_mode_button.setChecked(True)
-        self._save_button.setText("保存本页")
+        self._detail_navigation.hide()
+        dirty = sum(
+            self._is_dirty(str(item.get("变体ID", "")))
+            for item in self._list_variants
+        )
+        self._save_button.setText(f"保存全部修改（{dirty}）")
         self._save_next_button.hide()
         if self._selected_id:
-            self._update_card(self._selected_id)
+            self._update_card(self._selected_id, render_sync=False)
         self._schedule_capacity_update()
 
     def _load_detail_canvas(self, variant_id: str) -> None:
@@ -3173,6 +3673,26 @@ class ConsistencyPage(QWidget):
         if variant_id != self._selected_id:
             return
         source_image, working_image, content_size, path = data
+        if (
+            variant_id not in self._saved_pixel_signatures
+            and variant_id not in self._pixel_drafts
+        ):
+            self._saved_pixel_signatures[variant_id] = self._image_signature(
+                working_image
+            )
+        draft = self._pixel_drafts.get(variant_id)
+        if draft is not None and not draft.isNull():
+            working_image = draft.copy()
+            draft_pil = self._qimage_to_pil(working_image)
+            try:
+                non_empty = draft_pil.getchannel("A").getbbox()
+                if non_empty:
+                    content_size = (
+                        max(1, non_empty[2] - non_empty[0]),
+                        max(1, non_empty[3] - non_empty[1]),
+                    )
+            finally:
+                draft_pil.close()
         self._content_sizes[variant_id] = content_size
 
         saved = deepcopy(self._saved_adjustments.get(variant_id, self._default_adjustment()))
@@ -3184,6 +3704,7 @@ class ConsistencyPage(QWidget):
         self._saved_adjustments[variant_id] = deepcopy(canonical_saved)
         self._saved_signatures[variant_id] = self._adjustment_signature(canonical_saved)
         self._adjustments[variant_id] = deepcopy(canonical_current)
+        self._sync_dirty_variant(variant_id)
 
         self._loading_detail = True
         self._loaded_detail_id = variant_id
@@ -3207,12 +3728,65 @@ class ConsistencyPage(QWidget):
             self._loading_detail = False
         self._sync_transform_controls(self._detail_canvas.transform())
         self._sync_selected_card_controls(live=False)
+        card = self._cards.get(variant_id)
+        if card is not None:
+            card.resume_pending_transform()
         self._update_reference_overlay()
         stage = "手工审核稿" if os.path.dirname(path) == self._glyph.get_workflow_dirs()["手工审核"] else "自动优化稿"
         self._detail_source_label.setText(f"来源：{stage} · {os.path.basename(path)}")
         self._refresh_current_labels()
 
+    @staticmethod
+    def _image_signature(image: QImage | None) -> str:
+        if image is None or image.isNull():
+            return ""
+        normalized = image.convertToFormat(QImage.Format.Format_ARGB32)
+        payload = bytes(normalized.bits())
+        digest = hashlib.sha256()
+        digest.update(str(normalized.width()).encode("ascii"))
+        digest.update(b"x")
+        digest.update(str(normalized.height()).encode("ascii"))
+        digest.update(payload)
+        return digest.hexdigest()
+
+    def _on_detail_canvas_changed(self, dirty: bool) -> None:
+        if not self._loading_detail and self._selected_id:
+            if self._comparison_transform_active:
+                # 变换拖动的首帧会同步发出 changed 和 transform_changed。
+                # 拖动期间禁止刷新虚拟列表，避免正在持有鼠标序列的卡片被重建。
+                self._refresh_current_labels()
+                return
+            if self._detail_canvas.tool in {
+                ReviewCanvas.TOOL_BRUSH,
+                ReviewCanvas.TOOL_ERASER,
+            }:
+                self._refresh_current_labels()
+                return
+            self._clear_variant_preview_cache(self._selected_id)
+            # transform_changed 随后会更新参数模型并执行单字局部刷新。
+            # 此处不能提前重建筛选列表，否则会阻塞切换并销毁当前卡片。
+        self._refresh_current_labels()
+
+    def _on_detail_pixels_changed(self) -> None:
+        if self._loading_detail or not self._selected_id or not self._detail_canvas.has_image:
+            return
+        image = self._detail_canvas.image()
+        signature = self._image_signature(image)
+        saved_signature = self._saved_pixel_signatures.get(self._selected_id, "")
+        if signature and signature != saved_signature:
+            self._pixel_drafts[self._selected_id] = image
+        elif signature == saved_signature:
+            self._pixel_drafts.pop(self._selected_id, None)
+        self._sync_dirty_variant(self._selected_id)
+        self._clear_variant_preview_cache(self._selected_id)
+        self._refresh_variant_edit_state(
+            self._selected_id,
+            request_preview=False,
+        )
+
     def _clear_detail(self) -> None:
+        self._detail_transform_active = False
+        self._detail_transform_variant_id = ""
         self._loaded_detail_id = ""
         self._loading_detail = True
         try:
@@ -3232,28 +3806,67 @@ class ConsistencyPage(QWidget):
         self._ink_strategy_combo.setEnabled(False)
         self._set_transform_controls_enabled(False)
 
+    def _on_detail_transform_started(self) -> None:
+        """进入单字精调拖动会话，暂停整库刷新并切换到快速墨色预览。"""
+
+        if (
+            self._loading_detail
+            or self._comparison_transform_active
+            or self._view_stack.currentWidget() is not self._detail_view
+            or not self._selected_id
+        ):
+            return
+        self._detail_transform_active = True
+        self._detail_transform_variant_id = self._selected_id
+        self._preview_timer.stop()
+        self._set_detail_interactive_ink_postprocessor(
+            self._current_ink_config(self._selected_id),
+        )
+
+    def _on_detail_transform_finished(self, changed: bool) -> None:
+        """结束单字精调拖动后恢复精确墨色，并一次性提交界面状态。"""
+
+        if self._comparison_transform_active or not self._detail_transform_active:
+            return
+        variant_id = self._detail_transform_variant_id
+        self._detail_transform_active = False
+        self._detail_transform_variant_id = ""
+        if not variant_id or variant_id != self._selected_id:
+            return
+        self._set_detail_ink_postprocessor(
+            variant_id,
+            self._current_ink_config(variant_id),
+        )
+        if changed:
+            self._refresh_variant_edit_state(
+                variant_id,
+                request_preview=True,
+            )
+
     def _on_detail_transform_changed(self, transform: dict[str, Any]) -> None:
         if self._loading_detail or not self._selected_id:
             return
-        was_dirty = self._is_dirty(self._selected_id)
+        was_dirty = self._selected_id in self._dirty_variant_ids
         self._adjustments[self._selected_id] = (
             self._adjustment_service.coordination_from_canvas_transform(transform)
         )
-        is_dirty = self._is_dirty(self._selected_id)
+        is_dirty = self._sync_dirty_variant(self._selected_id)
         self._sync_transform_controls(transform)
         if self._comparison_transform_active:
             card = self._cards.get(self._selected_id)
             if card is not None:
                 self._sync_selected_card_controls(live=True)
+        elif self._detail_transform_active:
+            return
         elif was_dirty != is_dirty:
-            self._refresh_filtered_view(
-                preserve_selection=True,
-                reload_detail=False,
+            self._refresh_variant_edit_state(
+                self._selected_id,
+                request_preview=False,
             )
         else:
             self._refresh_current_labels()
             self._render_status()
-        if not self._comparison_transform_active:
+        if not self._comparison_transform_active and not self._detail_transform_active:
             self._schedule_selected_preview_refresh()
 
     def _begin_comparison_transform(
@@ -3288,6 +3901,13 @@ class ConsistencyPage(QWidget):
             if isinstance(modifiers, Qt.KeyboardModifier)
             else Qt.KeyboardModifier.NoModifier
         )
+        self._preview_timer.stop()
+        # 先标记拖动状态，再调用画布变换。该调用可能同步发出变换信号，
+        # 必须避免被误判为普通修改而触发筛选和虚拟卡片重建。
+        self._comparison_transform_active = True
+        self._comparison_transform_mode = "drag"
+        self._comparison_transform_changed = carried_change
+        self._comparison_transform_start_dirty = start_dirty
         kind = self._detail_canvas.begin_external_transform(
             position,
             origin,
@@ -3295,16 +3915,15 @@ class ConsistencyPage(QWidget):
             modifier_flags,
         )
         if not kind:
+            self._comparison_transform_active = False
+            self._comparison_transform_mode = ""
+            self._comparison_transform_changed = False
+            self._comparison_transform_start_dirty = False
             if wheel_handoff:
                 self._comparison_wheel_timer.start()
             else:
                 card.finish_live_preview()
             return
-        self._preview_timer.stop()
-        self._comparison_transform_active = True
-        self._comparison_transform_mode = "drag"
-        self._comparison_transform_changed = carried_change
-        self._comparison_transform_start_dirty = start_dirty
 
     def _apply_comparison_transform(
         self,
@@ -3343,6 +3962,20 @@ class ConsistencyPage(QWidget):
             self._comparison_transform_changed or changed
         )
         self._complete_comparison_transform(variant_id)
+
+    def _scroll_comparison(self, delta: float, is_pixel_delta: bool) -> None:
+        """处理比较卡片的普通滚轮，保持滚轮只负责列表滚动。"""
+        if not math.isfinite(delta) or delta == 0.0:
+            return
+        self._finish_pending_comparison_transform()
+        scroll_bar = self._comparison_scroll.verticalScrollBar()
+        if is_pixel_delta:
+            amount = delta
+        else:
+            # 与 Qt 常见的三行滚动步长一致；小步长控件也保留足够的滚动距离。
+            amount = delta / 120.0 * max(3 * scroll_bar.singleStep(), 48)
+        target = scroll_bar.value() - int(round(amount))
+        scroll_bar.setValue(max(scroll_bar.minimum(), min(scroll_bar.maximum(), target)))
 
     def _apply_comparison_wheel(self, variant_id: str, delta: float) -> None:
         if variant_id != self._selected_id or not math.isfinite(delta) or delta == 0.0:
@@ -3405,21 +4038,18 @@ class ConsistencyPage(QWidget):
         self._comparison_transform_changed = False
         self._comparison_transform_start_dirty = False
         card = self._cards.get(variant_id)
+        if changed:
+            self._comparison_preview_pending.add(variant_id)
         if card is not None:
-            card.cancel_transform_interaction()
+            card.cancel_transform_interaction(keep_live_preview=changed)
         if not changed:
             self._sync_selected_card_controls(live=False)
             return
         self._preview_timer.stop()
-        if start_dirty != self._is_dirty(variant_id):
-            self._refresh_filtered_view(
-                preserve_selection=True,
-                reload_detail=False,
-            )
-        else:
-            self._update_card(variant_id)
-            self._refresh_current_labels()
-            self._render_status()
+        self._refresh_variant_edit_state(
+            variant_id,
+            request_preview=True,
+        )
 
     def _schedule_selected_preview_refresh(self) -> None:
         if self._comparison_transform_active:
@@ -3428,7 +4058,7 @@ class ConsistencyPage(QWidget):
 
     def _refresh_selected_preview(self) -> None:
         if not self._comparison_transform_active and self._selected_id in self._cards:
-            self._update_card(self._selected_id)
+            self._update_card(self._selected_id, render_sync=False)
 
     def _apply_transform_field(self, field: str, value: float) -> None:
         if self._updating_controls or not self._detail_canvas.has_image:
@@ -3547,11 +4177,13 @@ class ConsistencyPage(QWidget):
     def _ink_mode_changed(self, _checked: bool) -> None:
         self._finish_pending_comparison_transform()
         self._clear_preview_cache()
+        self._rebuild_dirty_variant_ids()
         self._refresh_filtered_view(
             preserve_selection=True,
             reload_detail=True,
         )
         self._update_reference_overlay()
+        self._update_recalculate_baseline_button()
 
     def _set_detail_ink_postprocessor(
         self,
@@ -3582,6 +4214,51 @@ class ConsistencyPage(QWidget):
 
         self._detail_canvas.set_render_postprocessor(process_rendered)
 
+    def _set_detail_interactive_ink_postprocessor(
+        self,
+        ink_config: dict[str, Any],
+    ) -> None:
+        """拖动时用单次比例增益预览墨色，松手后再恢复正式复测算法。"""
+
+        profile = dict(ink_config)
+        if not bool(profile.get("启用", False)):
+            self._detail_canvas.set_render_postprocessor(None)
+            return
+        mode = str(profile.get("模式", AdjustmentService.INK_MODE_FOLLOW))
+        target = profile.get("基准")
+        if mode != AdjustmentService.INK_MODE_FOLLOW or target is None:
+            self._detail_canvas.set_render_postprocessor(None)
+            return
+        try:
+            target_value = float(target)
+        except (TypeError, ValueError):
+            self._detail_canvas.set_render_postprocessor(None)
+            return
+        if not math.isfinite(target_value):
+            self._detail_canvas.set_render_postprocessor(None)
+            return
+        target_value = max(1.0, min(255.0, target_value))
+        threshold = int(AdjustmentService.INK_CORE_THRESHOLD)
+
+        def process_rendered(pixels: np.ndarray) -> np.ndarray:
+            output = np.ascontiguousarray(pixels, dtype=np.uint8)
+            alpha = output[..., 3]
+            support = alpha >= threshold
+            if not np.any(support):
+                support = alpha > 0
+            values = alpha[support]
+            if not values.size:
+                return output
+            current = float(np.percentile(values, 70))
+            if current <= 0.0:
+                return output
+            scaled = np.rint(alpha.astype(np.float32) * (target_value / current))
+            scaled = np.clip(scaled, 0.0, 255.0).astype(np.uint8)
+            alpha[support] = np.maximum(scaled[support], 1)
+            return output
+
+        self._detail_canvas.set_render_postprocessor(process_rendered)
+
     def _ink_strategy_changed(self, mode: str) -> None:
         if self._updating_controls or not self._selected_id or mode not in self.INK_MODES:
             return
@@ -3591,6 +4268,7 @@ class ConsistencyPage(QWidget):
             return
         self._finish_pending_comparison_transform()
         self._ink_modes[variant_id] = mode
+        self._sync_dirty_variant(variant_id)
         self._clear_variant_preview_cache(variant_id)
         self._refresh_filtered_view(
             preserve_selection=True,
@@ -3603,8 +4281,9 @@ class ConsistencyPage(QWidget):
             return
         self._finish_pending_comparison_transform()
         self._adjustments[self._selected_id] = self._default_adjustment()
+        self._sync_dirty_variant(self._selected_id)
         self._load_detail_canvas(self._selected_id)
-        self._update_card(self._selected_id)
+        self._update_card(self._selected_id, render_sync=False)
         self._populate_list()
         self._render_status()
 
@@ -3639,7 +4318,43 @@ class ConsistencyPage(QWidget):
             variant_id,
             current_ink_signature,
         )
-        return geometry_dirty or ink_dirty
+        pixel_signature = self._image_signature(self._pixel_drafts.get(variant_id))
+        pixel_dirty = bool(pixel_signature) and pixel_signature != self._saved_pixel_signatures.get(
+            variant_id,
+            "",
+        )
+        return geometry_dirty or ink_dirty or pixel_dirty
+
+    def _sync_dirty_variant(self, variant_id: str) -> bool:
+        """同步一个字形的未保存集合，并仅在边界变化时清除状态缓存。"""
+
+        if not variant_id:
+            return False
+        dirty = self._is_dirty(variant_id)
+        previous = variant_id in self._dirty_variant_ids
+        if dirty:
+            self._dirty_variant_ids.add(variant_id)
+        else:
+            self._dirty_variant_ids.discard(variant_id)
+        if dirty != previous:
+            self._workflow_status_cache.pop(variant_id, None)
+        return dirty
+
+    def _rebuild_dirty_variant_ids(self) -> None:
+        """在载入、全局墨色切换等离散操作后重建未保存集合。"""
+
+        self._dirty_variant_ids = {
+            variant_id
+            for variant_id in self._variant_by_id
+            if variant_id in self._saved_signatures and self._is_dirty(variant_id)
+        }
+
+    def _pixel_drafts_for_ids(self, variant_ids: set[str]) -> dict[str, Image.Image]:
+        return {
+            variant_id: self._qimage_to_pil(image)
+            for variant_id, image in self._pixel_drafts.items()
+            if variant_id in variant_ids and not image.isNull()
+        }
 
     def _save_action(self) -> None:
         if self._view_stack.currentWidget() is self._detail_view:
@@ -3652,21 +4367,23 @@ class ConsistencyPage(QWidget):
                     navigation="stay",
                 )
         else:
-            saved_page_index = self._page_index
-            page_variants = self._page_variants()
-            next_page_start = (saved_page_index + 1) * self._page_size()
-            next_variant_id = (
-                str(self._variants[next_page_start].get("变体ID", ""))
-                if next_page_start < len(self._variants)
-                else ""
-            )
+            dirty_variants = [
+                detail
+                for detail in self._list_variants
+                if self._is_dirty(str(detail.get("变体ID", "")))
+            ]
+            if not dirty_variants:
+                QMessageBox.information(
+                    self,
+                    "保存整体协调结果",
+                    "当前没有未保存的整体协调修改。",
+                )
+                return
             self._start_interactive_save(
-                page_variants,
-                title="保存本页",
+                dirty_variants,
+                title="保存全部修改",
                 show_success=True,
-                navigation="page",
-                saved_page_index=saved_page_index,
-                next_variant_id=next_variant_id,
+                navigation="stay",
             )
 
     def _save_selected(self, show_success: bool = True) -> bool:
@@ -3676,22 +4393,16 @@ class ConsistencyPage(QWidget):
         return self._save_variants([detail], show_success=show_success, title="保存本字")
 
     def _save_current_page(self, show_success: bool = True) -> bool:
-        saved_page_index = self._page_index
-        page_variants = self._page_variants()
-        next_page_start = (saved_page_index + 1) * self._page_size()
-        next_variant_id = (
-            str(self._variants[next_page_start].get("变体ID", ""))
-            if next_page_start < len(self._variants)
-            else ""
-        )
+        dirty_variants = [
+            detail
+            for detail in self._list_variants
+            if self._is_dirty(str(detail.get("变体ID", "")))
+        ]
         saved = self._save_variants(
-            page_variants,
+            dirty_variants,
             show_success=show_success,
-            title="保存本页",
+            title="保存全部修改",
         )
-        if not saved:
-            return False
-        self._advance_after_page_save(saved_page_index, next_variant_id)
         return saved
 
     def _advance_after_page_save(
@@ -3699,25 +4410,8 @@ class ConsistencyPage(QWidget):
         saved_page_index: int,
         next_variant_id: str,
     ) -> None:
-        next_variant_index = self._variant_index(next_variant_id)
-        if next_variant_index >= 0:
-            self._select_variant(next_variant_id)
-            return
-
-        if not self._variants:
-            return
-        last_page_index = math.ceil(len(self._variants) / self._page_size()) - 1
-        target_page_index = min(saved_page_index, last_page_index)
-        selected_index = self._variant_index(self._selected_id)
-        selected_page_index = (
-            selected_index // self._page_size() if selected_index >= 0 else -1
-        )
-        if selected_page_index == target_page_index:
-            return
-        target_index = target_page_index * self._page_size()
-        target_variant_id = str(self._variants[target_index].get("变体ID", ""))
-        if target_variant_id:
-            self._select_variant(target_variant_id)
+        # 无分页后保存不改变滚动位置或当前选择。
+        return
 
     def _save_variants(
         self,
@@ -3741,18 +4435,22 @@ class ConsistencyPage(QWidget):
         }
         self._save_button.setEnabled(False)
         self._complete_button.setEnabled(False)
+        pixel_drafts = self._pixel_drafts_for_ids(requested_ids)
         try:
             result = self._adjustment_service.save_coordinated_variants(
                 variants_to_save,
                 adjustments_to_save,
                 self._current_ink_config(variant_ids=requested_ids),
                 self._coordination_baseline,
+                source_images_by_id=pixel_drafts,
             )
         except Exception as exc:
             self._reload_variants()
             QMessageBox.critical(self, title, f"整体协调结果保存失败：{exc}")
             return False
         finally:
+            for image in pixel_drafts.values():
+                image.close()
             self._save_button.setEnabled(True)
             self._complete_button.setEnabled(True)
 
@@ -3769,6 +4467,11 @@ class ConsistencyPage(QWidget):
             self._saved_signatures[variant_id] = self._adjustment_signature(saved)
             self._ink_modes[variant_id] = self._stored_ink_mode(detail)
             self._saved_ink_signatures[variant_id] = self._stored_ink_signature(detail)
+            draft = self._pixel_drafts.pop(variant_id, None)
+            if draft is not None:
+                self._saved_pixel_signatures[variant_id] = self._image_signature(draft)
+                draft = None
+            self._sync_dirty_variant(variant_id)
         if (
             self._selected_id in successful_ids
             and self._selected_id in requested_ids
@@ -3983,6 +4686,7 @@ class ConsistencyPage(QWidget):
         if not variant_ids:
             return
         requested_ids = set(variant_ids)
+        pixel_drafts = self._pixel_drafts_for_ids(requested_ids)
         task = _CoordinationTask(
             self._glyph.ziku_name,
             self._glyph.ziku_dir,
@@ -3994,6 +4698,7 @@ class ConsistencyPage(QWidget):
             },
             deepcopy(self._current_ink_config(variant_ids=requested_ids)),
             deepcopy(self._coordination_baseline),
+            pixel_drafts,
             return_full_state=False,
         )
         self._coordination_task = task
@@ -4049,7 +4754,6 @@ class ConsistencyPage(QWidget):
             str(detail.get("变体ID", "")) for detail in pending_variants
         ]
         ink_config = deepcopy(self._current_ink_config(variant_ids=set(variant_ids)))
-        ink_config["重算几何后基准"] = True
         zero_signature = self._zero_signature()
         default_count = sum(
             self._adjustment_signature(self._get_adjustment(variant_id))
@@ -4062,6 +4766,51 @@ class ConsistencyPage(QWidget):
             bool(ink_config.get("启用", False)),
         ):
             return
+        self._start_coordination_batch(
+            variant_ids,
+            ink_config,
+            task_type="批量协调",
+        )
+
+    def _recalculate_coordination_baseline(self) -> None:
+        """经用户确认后重新计算全库基准，并以全库事务提交新契约。"""
+
+        self._finish_pending_comparison_transform()
+        if (
+            self._coordination_busy
+            or self._baseline_analysis_pending
+            or not self._all_variants
+            or not self._ink_check.isChecked()
+        ):
+            return
+        variant_ids = [
+            str(detail.get("变体ID", ""))
+            for detail in self._all_variants
+            if str(detail.get("变体ID", ""))
+        ]
+        if not variant_ids or not self._confirm_recalculate_coordination_baseline(
+            len(variant_ids)
+        ):
+            return
+        ink_config = deepcopy(
+            self._current_ink_config(variant_ids=set(variant_ids))
+        )
+        ink_config["重算几何后基准"] = True
+        self._start_coordination_batch(
+            variant_ids,
+            ink_config,
+            task_type="全库基准重算",
+        )
+
+    def _start_coordination_batch(
+        self,
+        variant_ids: list[str],
+        ink_config: dict[str, Any],
+        *,
+        task_type: str,
+    ) -> None:
+        """启动普通待协调批次或显式全库基准重算。"""
+
         task = _CoordinationTask(
             self._glyph.ziku_name,
             self._glyph.ziku_dir,
@@ -4070,13 +4819,15 @@ class ConsistencyPage(QWidget):
             deepcopy(self._adjustments),
             ink_config,
             deepcopy(self._coordination_baseline),
+            self._pixel_drafts_for_ids(set(variant_ids)),
         )
         self._coordination_task = task
         self._coordination_task_total = len(variant_ids)
         self._coordination_task_ink = ink_config
         self._coordination_task_context = {
-            "类型": "批量协调",
+            "类型": task_type,
             "开始时间": time.perf_counter(),
+            "原墨色基准": self._ink_baseline,
         }
         task.signals.progress.connect(self._coordination_progress_changed)
         task.signals.finished.connect(self._coordination_finished)
@@ -4100,6 +4851,32 @@ class ConsistencyPage(QWidget):
         except Exception as exc:
             self._coordination_failed(str(exc))
 
+    def _confirm_recalculate_coordination_baseline(self, total: int) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("重新计算全库墨色基准")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(
+            f"将重新分析并核对当前字库的全部 {total} 个可协调字形。"
+        )
+        dialog.setInformativeText(
+            f"当前墨色基准：{self._ink_baseline:.2f}\n\n"
+            "如果新旧基准相同，将复用未变化的成品；如果基准发生变化，"
+            "将按新基准重新生成全库成品。全部图片和数据库记录会在同一事务中提交，"
+            "任一失败都会完整回滚。"
+        )
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        confirm_button = dialog.button(QMessageBox.StandardButton.Ok)
+        cancel_button = dialog.button(QMessageBox.StandardButton.Cancel)
+        if confirm_button is not None:
+            confirm_button.setText("重新计算")
+        if cancel_button is not None:
+            cancel_button.setText("取消")
+            dialog.setEscapeButton(cancel_button)
+        return dialog.exec() == QMessageBox.StandardButton.Ok.value
+
     def _confirm_complete_coordination(
         self,
         total: int,
@@ -4114,7 +4891,7 @@ class ConsistencyPage(QWidget):
             f"其中 {default_count} 个使用默认变换参数。"
         )
         ink_message = (
-            "当前已启用墨色统一，将对全部字形批量调整墨色。"
+            "当前已启用墨色统一，将沿用固定全库基准处理本批字形。"
             if ink_enabled
             else "当前未启用墨色统一；启用后会对全部字形批量调整墨色。"
         )
@@ -4265,6 +5042,13 @@ class ConsistencyPage(QWidget):
         if self._coordination_task_context.get("类型") == "交互保存":
             self._interactive_save_finished(payload)
             return
+        task_context = dict(self._coordination_task_context)
+        task_type = str(task_context.get("类型", "批量协调"))
+        recalculated = task_type == "全库基准重算"
+        old_baseline = self._number(
+            task_context.get("原墨色基准"),
+            self._ink_baseline,
+        )
         elapsed_text = self._coordination_elapsed_text()
         raw_data = payload.get("结果")
         data = raw_data if isinstance(raw_data, dict) else {}
@@ -4379,6 +5163,10 @@ class ConsistencyPage(QWidget):
                 self._saved_adjustments[variant_id] = deepcopy(saved)
                 self._saved_signatures[variant_id] = self._adjustment_signature(saved)
                 self._saved_ink_signatures[variant_id] = self._stored_ink_signature(detail)
+                draft = self._pixel_drafts.pop(variant_id, None)
+                if draft is not None:
+                    self._saved_pixel_signatures[variant_id] = self._image_signature(draft)
+            self._rebuild_dirty_variant_ids()
             self._apply_filters()
         except Exception as exc:
             self._finish_coordination_task(False, "批次已提交，页面刷新失败")
@@ -4431,8 +5219,13 @@ class ConsistencyPage(QWidget):
             self.summary_changed.emit(self._glyph)
             QMessageBox.warning(
                 self,
-                "批量整体协调完成，需核对",
+                (
+                    "重新计算全库墨色基准完成，需核对"
+                    if recalculated
+                    else "批量整体协调完成，需核对"
+                ),
                 f"本次已生成 {success} 个成品，处理进度为 100%。\n"
+                f"全库墨色基准：{self._ink_baseline:.2f}。\n"
                 f"当前已协调 {coordinated_count} 个，仍有 {remaining_count} 个待协调："
                 f"{reason_text}。\n\n"
                 "请在字形列表中核对这些字形；确认可接受的墨色例外后，"
@@ -4445,10 +5238,33 @@ class ConsistencyPage(QWidget):
             f"{success} / {self._coordination_task_total} · 批次提交完成",
         )
         self.summary_changed.emit(self._glyph)
+        reused = self._result_count(data.get("复用"))
+        regenerated = self._result_count(data.get("重新生成"))
+        total_count = len(self._list_variants)
+        if recalculated:
+            title = "重新计算全库墨色基准完成"
+            message = (
+                f"原墨色基准：{old_baseline:.2f}\n"
+                f"新墨色基准：{self._ink_baseline:.2f}\n"
+                f"本次核对：{success} 个\n"
+                f"重新生成：{regenerated} 个\n"
+                f"复用成品：{reused} 个\n"
+                f"全库已协调：{total_count} / {total_count}\n"
+                f"待协调：0\n\n{elapsed_text}"
+            )
+        else:
+            title = "完成整体协调"
+            message = (
+                "全库整体协调结果已生成。\n\n"
+                f"本次处理：{success} 个\n"
+                f"复用全库墨色基准：{self._ink_baseline:.2f}\n"
+                f"全库已协调：{total_count} / {total_count}\n"
+                f"待协调：0\n\n{elapsed_text}"
+            )
         QMessageBox.information(
             self,
-            "完成整体协调",
-            f"全库整体协调结果已生成。\n\n{elapsed_text}",
+            title,
+            message,
         )
 
     def _interactive_save_finished(self, payload: dict[str, Any]) -> None:
@@ -4522,6 +5338,10 @@ class ConsistencyPage(QWidget):
                 self._saved_ink_signatures[variant_id] = self._stored_ink_signature(
                     detail
                 )
+                draft = self._pixel_drafts.pop(variant_id, None)
+                if draft is not None:
+                    self._saved_pixel_signatures[variant_id] = self._image_signature(draft)
+                self._sync_dirty_variant(variant_id)
             self._initial_ink_enabled = self._ink_check.isChecked()
             self._refresh_after_saved_variants(successful_ids)
         except Exception as exc:
@@ -4673,6 +5493,22 @@ class ConsistencyPage(QWidget):
                 for detail in self._all_variants
             )
         )
+        self._update_recalculate_baseline_button()
+
+    def _update_recalculate_baseline_button(self) -> None:
+        button = getattr(self, "_recalculate_baseline_button", None)
+        if button is None:
+            return
+        ink_count = int(self._coordination_baseline.get("墨色有效数", 0) or 0)
+        button.setEnabled(
+            not self._coordination_busy
+            and not self._baseline_analysis_pending
+            and bool(self._all_variants)
+            and ink_count > 0
+            and self._ink_check.isEnabled()
+            and self._ink_check.isChecked()
+        )
+
     @staticmethod
     def _result_count(value: object) -> int:
         try:
@@ -4705,7 +5541,7 @@ class ConsistencyPage(QWidget):
         dirty_ids = [
             str(detail.get("变体ID", ""))
             for detail in self._all_variants
-            if self._is_dirty(str(detail.get("变体ID", "")))
+            if str(detail.get("变体ID", "")) in self._dirty_variant_ids
         ]
         if not dirty_ids:
             return True
@@ -4751,21 +5587,19 @@ class ConsistencyPage(QWidget):
             self._adjustments[variant_id] = deepcopy(saved)
             self._saved_adjustments[variant_id] = deepcopy(saved)
             self._saved_signatures[variant_id] = self._adjustment_signature(saved)
+            self._pixel_drafts.pop(variant_id, None)
             if detail is not None:
                 self._ink_modes[variant_id] = self._stored_ink_mode(detail)
                 self._saved_ink_signatures[variant_id] = self._stored_ink_signature(detail)
+            self._sync_dirty_variant(variant_id)
         self._preview_timer.stop()
         self._clear_preview_cache()
         self._apply_filters()
         return True
 
     def _change_page(self, offset: int) -> None:
-        self._finish_pending_comparison_transform()
-        total = math.ceil(len(self._variants) / self._page_size()) if self._variants else 0
-        target = self._page_index + offset
-        if 0 <= target < total:
-            self._page_index = target
-            self._render_page()
+        # 无分页模式下由滚动条负责浏览，保留方法仅兼容旧快捷入口。
+        return
 
     def _move_detail_selection(self, offset: int) -> None:
         index = self._variant_index(self._selected_id)
@@ -4802,28 +5636,73 @@ class ConsistencyPage(QWidget):
         self._finish_pending_comparison_transform()
         columns, rows = self._layout_mode_for_size(self._view_stack.size())
         if (columns, rows) == (self._grid_columns, self._grid_rows):
+            self._render_virtual_view()
             return
-        selected_index = self._variant_index(self._selected_id)
+        scroll_bar = self._comparison_scroll.verticalScrollBar()
+        old_scroll = scroll_bar.value()
+        old_columns = max(1, self._grid_columns)
+        row_stride = self._comparison_row_stride()
+        anchor_index = (old_scroll // row_stride) * old_columns
+        row_offset = old_scroll % row_stride
         self._grid_columns = columns
         self._grid_rows = rows
-        self._page_index = selected_index // self._page_size() if selected_index >= 0 else 0
-        self._render_page()
+        self._render_virtual_view()
+        target_row = anchor_index // max(1, columns)
+        target = target_row * row_stride + row_offset
+        scroll_bar.setValue(
+            max(scroll_bar.minimum(), min(scroll_bar.maximum(), target))
+        )
 
     def _layout_mode_for_size(self, size: QSize) -> tuple[int, int]:
-        if (
-            size.width() >= self.LARGE_VIEWPORT_WIDTH
-            and size.height() >= self.LARGE_VIEWPORT_HEIGHT
-        ):
-            return self.LARGE_COLUMNS, self.LARGE_ROWS
-        return self.COMPACT_COLUMNS, self.COMPACT_ROWS
+        """按比较区真实可用尺寸计算列数和可视行容量。"""
+        viewport = (
+            self._comparison_scroll.viewport()
+            if hasattr(self, "_comparison_scroll")
+            else None
+        )
+        comparison_visible = (
+            hasattr(self, "_view_stack")
+            and hasattr(self, "_comparison_view")
+            and self._view_stack.currentWidget() is self._comparison_view
+        )
+        width = (
+            viewport.width()
+            if viewport is not None and comparison_visible
+            else size.width()
+        )
+        height = (
+            viewport.height()
+            if viewport is not None and comparison_visible
+            else size.height()
+        )
+        if width <= 0:
+            width = size.width()
+        if height <= 0:
+            height = size.height()
+        margins = self._grid.contentsMargins() if hasattr(self, "_grid") else None
+        horizontal_margins = (
+            margins.left() + margins.right() if margins is not None else 20
+        )
+        spacing = self._grid.horizontalSpacing() if hasattr(self, "_grid") else 10
+        spacing = max(0, spacing)
+        usable_width = max(1, width - horizontal_margins)
+        columns = max(
+            self.COMPARISON_MIN_COLUMNS,
+            (usable_width + spacing)
+            // (self.COMPARISON_CARD_MIN_WIDTH + spacing),
+        )
+        rows = max(1, math.ceil(max(1, height) / self._comparison_row_stride()))
+        return int(columns), int(rows)
 
     def _render_status(self) -> None:
-        page = self._page_variants()
         dirty = sum(
-            self._is_dirty(str(item.get("变体ID", "")))
-            for item in page
+            str(item.get("变体ID", "")) in self._dirty_variant_ids
+            for item in self._list_variants
         )
-        self._status_label.setText(f"本页 {len(page)} 字　未保存调整 {dirty} 字")
+        self._status_label.setText(
+            f"显示 {len(self._variants)} 个字形　未保存 {dirty} 个"
+        )
+        self._save_button.setText(f"保存全部修改（{dirty}）")
         self._refresh_statistics()
 
     def _refresh_statistics(self) -> None:
@@ -4876,6 +5755,7 @@ class ConsistencyPage(QWidget):
         self._complete_button.setEnabled(
             bool(pending) and not self._coordination_busy
         )
+        self._update_recalculate_baseline_button()
 
     def _refresh_current_labels(self) -> None:
         detail = self._variant_by_id.get(self._selected_id)
@@ -4939,9 +5819,7 @@ class ConsistencyPage(QWidget):
         detail: dict[str, Any],
     ) -> WorkflowStageProjection:
         variant_id = str(detail.get("变体ID", ""))
-        dirty = bool(
-            variant_id in self._saved_signatures and self._is_dirty(variant_id)
-        )
+        dirty = variant_id in self._dirty_variant_ids
         cached = self._workflow_status_cache.get(variant_id)
         if variant_id and cached is not None and cached[0] == dirty:
             return cached[1]
@@ -5402,6 +6280,17 @@ class ConsistencyPage(QWidget):
         self._finish_pending_comparison_transform()
         self._detail_canvas.redo()
 
+    def _set_detail_tool(self, tool: str) -> None:
+        self._finish_pending_comparison_transform()
+        self._detail_canvas.set_tool(tool)
+        button = self._detail_tool_buttons.get(tool)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+    def _set_detail_brush_size(self, value: int) -> None:
+        if hasattr(self, "_detail_canvas"):
+            self._detail_canvas.set_brush_size(int(value))
+
     def _detail_canvas_fit(self) -> None:
         self._detail_canvas.fit_to_view()
 
@@ -5433,7 +6322,16 @@ class ConsistencyPage(QWidget):
         for detail in self._all_variants:
             text = " ".join(
                 str(detail.get(key, ""))
-                for key in ("归属字", "原始文件", "导入前文件名", "中间文件", "审核文件")
+                for key in (
+                    "归属字",
+                    "变体序号",
+                    "变体ID",
+                    "原始文件",
+                    "导入前文件名",
+                    "中间文件",
+                    "审核文件",
+                    "成品文件",
+                )
             ).casefold()
             if not query or query in text:
                 ordered.append(detail)
@@ -5535,6 +6433,15 @@ class ConsistencyPage(QWidget):
         ).copy()
 
     @staticmethod
+    def _qimage_to_pil(image: QImage) -> Image.Image:
+        normalized = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        return Image.frombytes(
+            "RGBA",
+            (normalized.width(), normalized.height()),
+            bytes(normalized.bits()),
+        )
+
+    @staticmethod
     def _segment_button(text: str) -> QPushButton:
         button = QPushButton(text)
         button.setCheckable(True)
@@ -5549,6 +6456,8 @@ class ConsistencyPage(QWidget):
         button.setToolTip(tooltip)
         button.setCheckable(checkable)
         button.setMinimumHeight(30)
+        width = button.fontMetrics().horizontalAdvance(text) + 22
+        button.setFixedWidth(width)
         button.setStyleSheet(
             "QToolButton { padding: 0 8px; border: 1px solid #37404d; border-radius: 5px; background: #282f3a; }"
             "QToolButton:hover { border-color: #4da3ff; background: #303947; }"

@@ -860,6 +860,83 @@ class AdjustmentServiceTests(unittest.TestCase):
                 self.assertEqual(record["基准"], expected["墨色基准"])
                 self.assertTrue(record["是否达标"])
 
+    def test_partial_batch_keeps_existing_library_ink_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (90, 210))
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            baseline["墨色基准"] = 197.0
+            ink_config = {"启用": True, "基准": 197.0}
+            service.save_coordinated_variants(variants, {}, ink_config, baseline)
+
+            changed = variants[0]
+            filename = str(changed["中间文件"])
+            reviewed_path = Path(glyph.get_workflow_dirs()["手工审核"]) / filename
+            Image.new("RGBA", (40, 40), (0, 0, 0, 240)).save(reviewed_path)
+            glyph.mark_manual_saved(
+                str(changed["变体ID"]),
+                filename,
+                "modified-review-md5",
+            )
+            self.assertTrue(glyph.approve_manual_review(str(changed["变体ID"])))
+
+            result = service.save_coordinated_variants(
+                [changed],
+                {},
+                ink_config,
+                baseline,
+            )
+            summary = glyph.get_coordination_summary()
+
+            self.assertEqual(result["成功"], 1)
+            self.assertEqual(summary["墨色基准"], 197.0)
+            self.assertTrue(summary["几何协调完成"])
+            self.assertTrue(summary["墨色统一完成"])
+            self.assertEqual(summary["墨色统计"]["已达标"], 2)
+            self.assertTrue(
+                all(
+                    detail["整体协调参数"]["墨色协调"]["基准"] == 197.0
+                    for detail in variants
+                )
+            )
+
+    def test_partial_batch_cannot_recalculate_or_replace_library_ink_baseline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (90, 210))
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            baseline["墨色基准"] = 197.0
+            service.save_coordinated_variants(
+                variants,
+                {},
+                {"启用": True, "基准": 197.0},
+                baseline,
+            )
+            state_before = glyph.snapshot_state()
+
+            with self.assertRaisesRegex(ValueError, "必须提交全部可协调字形"):
+                service.save_coordinated_variants(
+                    [variants[0]],
+                    {},
+                    {
+                        "启用": True,
+                        "基准": 197.0,
+                        "重算几何后基准": True,
+                    },
+                    baseline,
+                )
+            with self.assertRaisesRegex(ValueError, "必须提交全部可协调字形"):
+                service.save_coordinated_variants(
+                    [variants[0]],
+                    {},
+                    {"启用": True, "基准": 198.0},
+                    {**baseline, "墨色基准": 198.0},
+                )
+
+            self.assertEqual(glyph.snapshot_state(), state_before)
+
     def test_resave_with_ink_disabled_uses_reviewed_source_not_old_finished_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             glyph, variants = self._build_reviewed_library(Path(directory), (95,))
@@ -1466,6 +1543,56 @@ class AdjustmentServiceTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), file_bytes)
             self.assertFalse(list(finished_dir.glob(".fonteditor_coordination_*")))
 
+    def test_full_baseline_recalculation_failure_rolls_back_summary_and_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (85, 155))
+            service = AdjustmentService(glyph)
+            baseline = service.analyze()
+            baseline["墨色基准"] = 197.0
+            initial = service.save_coordinated_variants(
+                variants,
+                {},
+                {"启用": True, "基准": 197.0},
+                baseline,
+            )
+            self.assertEqual(initial["成功"], len(variants))
+
+            finished_dir = Path(glyph.get_workflow_dirs()["成品"])
+            state_before = glyph.snapshot_state()
+            database_before = LibraryDatabase.open(glyph.ziku_dir).load_data()
+            files_before = {
+                path.name: path.read_bytes() for path in finished_dir.glob("*.png")
+            }
+
+            with patch.object(glyph, "save", side_effect=OSError("模拟全库重算提交失败")):
+                with self.assertRaisesRegex(OSError, "模拟全库重算提交失败"):
+                    service.save_coordinated_variants(
+                        variants,
+                        {
+                            str(variants[0]["变体ID"]): {"移动X": 3.0},
+                            str(variants[1]["变体ID"]): {"移动X": -3.0},
+                        },
+                        {
+                            "启用": True,
+                            "基准": 197.0,
+                            "重算几何后基准": True,
+                        },
+                        baseline,
+                    )
+
+            self.assertEqual(glyph.snapshot_state(), state_before)
+            self.assertEqual(
+                LibraryDatabase.open(glyph.ziku_dir).load_data(),
+                database_before,
+            )
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in finished_dir.glob("*.png")},
+                files_before,
+            )
+            self.assertFalse(list(finished_dir.glob(".fonteditor_coordination_*")))
+
     def test_legacy_json_receives_complete_coordination_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1496,6 +1623,31 @@ class AdjustmentServiceTests(unittest.TestCase):
             self.assertFalse(summary["几何协调完成"])
             self.assertFalse(summary["墨色统一完成"])
             self.assertEqual(glyph.get_variant("old-1")["整体协调参数"], {})
+
+    def test_pixel_draft_is_committed_with_review_and_finished_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            glyph, variants = self._build_reviewed_library(Path(directory), (100,))
+            detail = variants[0]
+            variant_id = str(detail["变体ID"])
+            draft = Image.new("RGBA", (6, 6), (0, 0, 0, 0))
+            draft.putpixel((1, 1), (0, 0, 0, 255))
+
+            result = AdjustmentService(glyph).save_coordinated_variants(
+                [detail],
+                {variant_id: {}},
+                {"启用": False, "基准": 220.0},
+                source_images_by_id={variant_id: draft},
+            )
+
+            self.assertEqual(result["失败"], 0)
+            saved = glyph.get_variant(variant_id)
+            self.assertTrue(saved["审核文件"])
+            self.assertTrue(
+                Path(glyph.get_workflow_dirs()["手工审核"], saved["审核文件"]).is_file()
+            )
+            self.assertTrue(
+                Path(glyph.get_workflow_dirs()["成品"], saved["成品文件"]).is_file()
+            )
 
     @staticmethod
     def _build_reviewed_library(

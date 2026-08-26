@@ -28,6 +28,7 @@ from services.export_service import (
     ExportService,
 )
 from services.glyph_service import GlyphService
+from services.settings_service import ApplicationSettings
 import ui.pages.export_page as export_page_module
 from ui.pages.export_page import ExportPage
 from ui.theme import apply_theme
@@ -41,6 +42,16 @@ class ExportPageTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
         apply_theme(cls.app)
+
+    def test_export_directory_uses_program_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as output_directory, patch(
+            "ui.pages.export_page.SettingsService.load",
+            return_value=ApplicationSettings(
+                default_export_directory=output_directory
+            ),
+        ):
+            with self._page_with_variants(total=1) as (page, _ids, _root):
+                self.assertEqual(page._directory_edit.text(), output_directory)
 
     @contextmanager
     def _page_with_variants(

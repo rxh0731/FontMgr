@@ -675,7 +675,8 @@ class ExportGallery(QListView):
         self.verticalScrollBar().setValue(0)
         self._last_requested_count = 0
         self._layout_timer.start(0)
-        self._load_timer.start(0)
+        # 首批可见项不能被随后到达的布局事件反复推迟。
+        self._schedule_visible_loads()
 
     def set_canvas_size(self, width: int, height: int) -> None:
         """设置字库田字格尺寸；外围工作区由委托按两轴 130% 推导。"""

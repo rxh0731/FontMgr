@@ -43,6 +43,7 @@ from services.export_service import (
     ExportService,
 )
 from services.glyph_service import GlyphService
+from services.settings_service import SettingsService
 from services.workflow_status_service import (
     COORDINATION_STATUS_FILTERS,
     MARKER_FILE_ERROR,
@@ -209,6 +210,16 @@ class ExportPage(QWidget):
         self._thumbnail_timer.timeout.connect(self._load_visible_list_thumbnails)
 
         self._build_ui()
+        settings_service = SettingsService()
+        try:
+            default_export_directory = (
+                settings_service.load().default_export_directory
+            )
+        except (OSError, RuntimeError, ValueError):
+            default_export_directory = ""
+        self._directory_edit.setText(
+            SettingsService.usable_directory(default_export_directory)
+        )
         self._reload_variants()
 
     def _build_ui(self) -> None:
@@ -1244,6 +1255,7 @@ class ExportPage(QWidget):
         if source is not None and cached[0] == source[1]:
             self._thumbnail_cache.move_to_end(variant_id)
             return cached[1]
+        self._thumbnail_cache.pop(variant_id, None)
         return self._placeholder_icon()
 
     def _set_gallery_columns(self, columns: int) -> None:

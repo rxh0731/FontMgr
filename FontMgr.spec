@@ -2,8 +2,11 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files
+
 
 project_root = Path(SPEC).resolve().parent
+rapidocr_datas = collect_data_files("rapidocr")
 
 a = Analysis(
     [str(project_root / "main.py")],
@@ -15,8 +18,12 @@ a = Analysis(
             str(project_root / "assets" / "font_editor_icon_color_blocks.png"),
             "assets",
         ),
+        *rapidocr_datas,
     ],
-    hiddenimports=[],
+    hiddenimports=[
+        "rapidocr.main",
+        "rapidocr.inference_engine.onnxruntime",
+    ],
     hookspath=[],
     hooksconfig={},
     excludes=[],

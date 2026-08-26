@@ -5,12 +5,17 @@ from __future__ import annotations
 import unittest
 import tempfile
 from collections.abc import Callable
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from services.glyph_service import GlyphService
+from services.settings_service import (
+    PERFORMANCE_AUTO,
+    PERFORMANCE_CONSERVATIVE,
+    ApplicationSettings,
+)
 from ui.main_window import (
     LibraryScanResult,
     MainWindow,
@@ -861,11 +866,80 @@ class MainWindowNavigationTests(unittest.TestCase):
             self.assertIsNone(window._optimization_page)
             self.assertIsNone(window._scripture_layout_page)
             self.assertIsNone(window._custom_scripture_layout_page)
-            self.assertEqual(len(window._page_placeholders), 5)
+            self.assertIsNone(window._settings_page)
+            self.assertIsNone(window._help_page)
+            self.assertEqual(len(window._page_placeholders), 8)
         finally:
             window.close()
             window.deleteLater()
             self.app.processEvents()
+
+    def test_settings_tool_opens_real_page(self) -> None:
+        with patch(
+            "ui.main_window.LibrarySummaryStore.load",
+            return_value=[],
+        ):
+            window = MainWindow()
+        try:
+            window._open_tool("settings")
+
+            self.assertIsNotNone(window._settings_page)
+            self.assertIs(window._stack.currentWidget(), window._settings_page)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_help_tool_opens_searchable_page(self) -> None:
+        with patch(
+            "ui.main_window.LibrarySummaryStore.load",
+            return_value=[],
+        ):
+            window = MainWindow()
+        try:
+            window._open_tool("help")
+
+            self.assertIsNotNone(window._help_page)
+            self.assertIs(window._stack.currentWidget(), window._help_page)
+            self.assertGreater(window._help_page._topic_list.count(), 10)
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_image_lab_opens_independent_workspace(self) -> None:
+        with patch(
+            "ui.main_window.LibrarySummaryStore.load",
+            return_value=[],
+        ):
+            window = MainWindow()
+            try:
+                window._open_tool("image_lab")
+                self.assertIsNotNone(window._image_lab_page)
+                self.assertIs(window._stack.currentWidget(), window._image_lab_page)
+                self.assertIsNone(window._image_lab_page._project)
+            finally:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+
+    def test_performance_modes_only_adjust_global_pool_limit(self) -> None:
+        window = MagicMock()
+        window._automatic_thread_count = 8
+
+        MainWindow._apply_performance_settings(
+            window,
+            ApplicationSettings(performance_mode=PERFORMANCE_AUTO),
+        )
+        MainWindow._apply_performance_settings(
+            window,
+            ApplicationSettings(performance_mode=PERFORMANCE_CONSERVATIVE),
+        )
+
+        self.assertEqual(
+            window._thread_pool.setMaxThreadCount.call_args_list,
+            [call(8), call(4)],
+        )
 
 
 if __name__ == "__main__":

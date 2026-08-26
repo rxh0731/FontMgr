@@ -1,14 +1,33 @@
-# 简繁识别服务.py — 保守识别文件名字符的简繁关系
+# 简繁识别服务.py - 保守识别文件名字符的简繁关系
 
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
 from typing import Literal
 
 try:
-    from zhconv import convert as _convert
+    from opencc import OpenCC
 except ImportError:
-    _convert = None
+    OpenCC = None  # type: ignore[assignment,misc]
 
 
 ClassificationType = Literal["正确", "一对一", "歧义"]
+
+OPENCC_PROFILES: tuple[tuple[str, str], ...] = (
+    ("s2t", "s2t（通用繁体）"),
+    ("s2tw", "s2tw（台湾用字）"),
+    ("s2hk", "s2hk（香港用字）"),
+)
+
+
+@dataclass(frozen=True)
+class CharacterIdentification:
+    """一个字符的保守分类、候选字及每个候选的来源。"""
+
+    category: ClassificationType
+    candidates: tuple[str, ...]
+    candidate_sources: dict[str, tuple[str, ...]]
 
 # 只有人工确认不存在一简多繁、古今字义冲突的字符才放入此表。
 UNAMBIGUOUS_MAP: dict[str, str] = {
@@ -48,7 +67,7 @@ UNAMBIGUOUS_MAP: dict[str, str] = {
     "状": "狀", "总": "總", "钻": "鑽",
 }
 
-# 这里仅提供常见候选；保守策略会把所有“转换后不同但不在明确表”的字符归入歧义栏。
+# 这里提供常见一简多繁和古今字候选，OpenCC 三套结果会继续补充候选。
 COMMON_AMBIGUOUS_CANDIDATES: dict[str, tuple[str, ...]] = {
     "发": ("發", "髮"), "后": ("後", "后"), "干": ("乾", "幹", "干"), "台": ("臺", "檯", "颱", "台"),
     "里": ("裡", "裏", "里"), "面": ("麵", "面"), "复": ("復", "複", "覆"), "征": ("徵", "征"),
@@ -58,20 +77,77 @@ COMMON_AMBIGUOUS_CANDIDATES: dict[str, tuple[str, ...]] = {
     "签": ("簽", "籤"), "舍": ("捨", "舍"), "余": ("餘", "余"), "御": ("禦", "御"),
     "蒙": ("矇", "濛", "蒙"), "汇": ("匯", "彙"), "采": ("採", "采"), "游": ("遊", "游"),
     "系": ("係", "繫", "系"), "制": ("製", "制"), "别": ("彆", "別"), "冲": ("衝", "沖"),
+    "吣": ("唚", "吣"), "喂": ("餵", "喂"), "托": ("託", "托"), "栗": ("慄", "栗"),
+    "沄": ("澐", "沄"), "漤": ("灠", "漤"), "痳": ("痲", "痳"), "硷": ("礆", "硷"),
+    "苎": ("苧", "薴", "苎"), "踊": ("踴", "踊"), "鼗": ("鞀", "鼗"), "鿭": ("鉨", "鿭"),
 }
 
 
-def identify_character(char: str) -> tuple[ClassificationType, tuple[str, ...]]:
-    """保守返回字符分类及可选繁体；无法证明唯一时一律归入歧义。"""
+_thread_local = threading.local()
+
+
+def _get_converters() -> dict[str, object]:
+    """为每个扫描线程懒加载转换器，避免共享原生转换器状态。"""
+    if OpenCC is None:
+        raise RuntimeError("缺少 OpenCC，无法执行简繁候选识别，请重新安装项目依赖。")
+    converters = getattr(_thread_local, "opencc_converters", None)
+    if converters is None:
+        converters = {profile: OpenCC(profile) for profile, _label in OPENCC_PROFILES}
+        _thread_local.opencc_converters = converters
+    return converters
+
+
+def _append_source(
+    candidates: list[str],
+    sources: dict[str, list[str]],
+    candidate: str,
+    source: str,
+) -> None:
+    """按业务优先级合并候选，并保留所有去重后的来源。"""
+    if len(candidate) != 1:
+        return
+    if candidate not in sources:
+        candidates.append(candidate)
+        sources[candidate] = []
+    if source not in sources[candidate]:
+        sources[candidate].append(source)
+
+
+def identify_character_with_sources(char: str) -> CharacterIdentification:
+    """合并项目规则及 OpenCC 三套配置，无法证明唯一时进入人工复核。"""
+    candidates: list[str] = []
+    sources: dict[str, list[str]] = {}
+
     if char in UNAMBIGUOUS_MAP:
-        return "一对一", (UNAMBIGUOUS_MAP[char],)
+        _append_source(candidates, sources, UNAMBIGUOUS_MAP[char], "项目明确映射")
     if char in COMMON_AMBIGUOUS_CANDIDATES:
-        return "歧义", COMMON_AMBIGUOUS_CANDIDATES[char]
-    if _convert is not None:
-        try:
-            converted = _convert(char, "zh-hant")
-        except Exception:
-            converted = char
-        if converted != char:
-            return "歧义", tuple(dict.fromkeys((converted, char)))
-    return "正确", (char,)
+        for candidate in COMMON_AMBIGUOUS_CANDIDATES[char]:
+            _append_source(candidates, sources, candidate, "项目歧义表")
+
+    converters = _get_converters()
+    for profile, label in OPENCC_PROFILES:
+        converted = converters[profile].convert(char)
+        _append_source(candidates, sources, converted, label)
+
+    _append_source(candidates, sources, char, "保留原字")
+    converted_candidates = tuple(candidate for candidate in candidates if candidate != char)
+    if char in COMMON_AMBIGUOUS_CANDIDATES or len(converted_candidates) > 1:
+        category: ClassificationType = "歧义"
+    elif char in UNAMBIGUOUS_MAP:
+        category = "一对一"
+    elif converted_candidates:
+        category = "歧义"
+    else:
+        category = "正确"
+
+    return CharacterIdentification(
+        category=category,
+        candidates=tuple(candidates),
+        candidate_sources={candidate: tuple(values) for candidate, values in sources.items()},
+    )
+
+
+def identify_character(char: str) -> tuple[ClassificationType, tuple[str, ...]]:
+    """兼容原调用方式，返回字符分类及去重后的候选字。"""
+    result = identify_character_with_sources(char)
+    return result.category, result.candidates

@@ -1071,6 +1071,49 @@ class ReviewCanvasTests(unittest.TestCase):
         self.assertEqual(color, QColor(42, 76, 108, 255))
         self.assertLess(min(durations), 0.05)
 
+    def test_brush_matches_nearby_visual_ink_coverage(self) -> None:
+        image = QImage(80, 60, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        source_color = QColor(40, 40, 40, 160)
+        for y in range(20, 41):
+            for x in range(18, 25):
+                image.setPixelColor(x, y, source_color)
+        self.canvas.set_image(image)
+        self.canvas.set_tool(ReviewCanvas.TOOL_BRUSH)
+        self.canvas.set_brush_size(8)
+
+        self.canvas._begin_stroke(QPoint(29, 30), ReviewCanvas.TOOL_BRUSH, 8.0)
+        self.canvas._end_stroke()
+
+        painted = self.canvas.image().pixelColor(29, 30)
+        self.assertLess(painted.alpha(), 255)
+        self.assertAlmostEqual(
+            self.canvas._color_visual_coverage(painted),
+            self.canvas._color_visual_coverage(source_color),
+            delta=2,
+        )
+
+    def test_brush_overlap_does_not_accumulate_beyond_sampled_ink(self) -> None:
+        image = QImage(80, 60, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        source_color = QColor(0, 0, 0, 176)
+        for y in range(20, 41):
+            for x in range(18, 25):
+                image.setPixelColor(x, y, source_color)
+        self.canvas.set_image(image)
+        self.canvas.set_tool(ReviewCanvas.TOOL_BRUSH)
+        self.canvas.set_brush_size(10)
+
+        point = QPoint(30, 30)
+        self.canvas._begin_stroke(point, ReviewCanvas.TOOL_BRUSH, 10.0)
+        first = self.canvas.image().pixelColor(point).alpha()
+        for _index in range(6):
+            self.canvas._draw_line(point, point, 10.0, 10.0, ReviewCanvas.TOOL_BRUSH)
+        self.canvas._end_stroke()
+
+        self.assertEqual(self.canvas.image().pixelColor(point).alpha(), first)
+        self.assertAlmostEqual(first, source_color.alpha(), delta=2)
+
     def test_opaque_white_background_is_not_sampled_as_ink(self) -> None:
         image = QImage(30, 30, QImage.Format.Format_ARGB32)
         image.fill(Qt.GlobalColor.white)
@@ -1468,6 +1511,27 @@ class ReviewCanvasTests(unittest.TestCase):
         self.assertEqual(self.canvas.transform(), self._default_transform())
         self.canvas.redo()
         self.assertEqual(self.canvas.transform(), moved)
+
+    def test_transform_interaction_reports_start_and_single_finish(self) -> None:
+        self._prepare_transform_canvas()
+        origin, scale = self._external_transform_view()
+        polygon, _handles, _rotate = self.canvas.transform_controls_in_view(origin, scale)
+        start = self.canvas._polygon_center(tuple(polygon.at(i) for i in range(4)))
+        started: list[bool] = []
+        finished: list[bool] = []
+        self.canvas.transform_interaction_started.connect(lambda: started.append(True))
+        self.canvas.transform_interaction_finished.connect(finished.append)
+
+        self.assertEqual(
+            self.canvas.begin_external_transform(start, origin, scale),
+            "move",
+        )
+        self.assertTrue(self.canvas.update_external_transform(start + QPointF(20.0, 8.0)))
+        self.assertTrue(self.canvas.end_external_transform())
+        self.assertFalse(self.canvas.end_external_transform())
+
+        self.assertEqual(started, [True])
+        self.assertEqual(finished, [True])
 
     def test_external_shift_move_and_shift_rotation_constraints(self) -> None:
         self._prepare_transform_canvas()
