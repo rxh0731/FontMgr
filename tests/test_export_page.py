@@ -209,20 +209,28 @@ class ExportPageTests(unittest.TestCase):
             header = tree.header()
             self.assertEqual(
                 header.sectionResizeMode(0),
-                QHeaderView.ResizeMode.Stretch,
+                QHeaderView.ResizeMode.Interactive,
             )
             self.assertEqual(
                 header.sectionResizeMode(1),
-                QHeaderView.ResizeMode.Fixed,
+                QHeaderView.ResizeMode.Interactive,
             )
             self.assertEqual(
                 header.sectionResizeMode(2),
-                QHeaderView.ResizeMode.Fixed,
+                QHeaderView.ResizeMode.Interactive,
             )
             self.assertEqual(
                 header.sectionResizeMode(3),
-                QHeaderView.ResizeMode.Fixed,
+                QHeaderView.ResizeMode.Interactive,
             )
+            self.assertTrue(page._main_splitter.childrenCollapsible())
+            initial_widths = [header.sectionSize(column) for column in range(4)]
+            self.assertGreaterEqual(initial_widths[0], 96)
+            self.assertGreaterEqual(initial_widths[1], 56)
+            self.assertGreaterEqual(initial_widths[2], 48)
+            self.assertGreaterEqual(initial_widths[3], 52)
+            header.resizeSection(0, initial_widths[0] + 40)
+            self.assertEqual(header.sectionSize(0), initial_widths[0] + 40)
             self.assertEqual(tree.topLevelItemCount(), 18)
             first_group = tree.topLevelItem(0)
             first_detail = page._visible_variants[0]
@@ -237,12 +245,21 @@ class ExportPageTests(unittest.TestCase):
             self.assertEqual(first_group.childCount(), 1)
             self.assertEqual(
                 first_group.child(0).text(0),
-                f"字形1 · {first_filename}",
+                f"字形1\n{first_filename}",
             )
             self.assertEqual(first_group.child(0).text(1), "已协调")
             self.assertEqual(first_group.child(0).text(2), "无")
             self.assertEqual(first_group.child(0).text(3), "可导出")
             self.assertEqual(first_group.child(0).sizeHint(0).height(), 52)
+            self.assertGreaterEqual(
+                header.sectionSize(0),
+                max(
+                    tree.fontMetrics().horizontalAdvance(line)
+                    for line in first_group.child(0).text(0).splitlines()
+                )
+                + page.LIST_THUMBNAIL_SIZE
+                + 46,
+            )
             self.assertIn("整体协调：已协调", first_group.child(0).toolTip(0))
             self.assertNotIn("阶段：", first_group.child(0).toolTip(0))
             self.assertEqual(page._list_count_label.text(), "显示 / 本阶段：18 / 18")
@@ -312,9 +329,9 @@ class ExportPageTests(unittest.TestCase):
             self.assertEqual(
                 [first_group.child(index).text(0) for index in range(3)],
                 [
-                    "字形1 · 甲-0001.png",
-                    "字形2 · 甲-0002.png",
-                    "字形3 · 甲-0003.png",
+                    "字形1\n甲-0001.png",
+                    "字形2\n甲-0002.png",
+                    "字形3\n甲-0003.png",
                 ],
             )
             self.assertEqual(second_group.text(0), "乙（2个字形）")
@@ -326,6 +343,11 @@ class ExportPageTests(unittest.TestCase):
 
             page._search_edit.setText("甲-0002")
             self.app.processEvents()
+            self.assertEqual(tree.topLevelItemCount(), 2)
+            self.assertEqual(page._list_count_label.text(), "显示 / 本阶段：5 / 5")
+            self.assertEqual(page._search_button.text(), "搜索")
+            page._search_button.click()
+            self.app.processEvents()
             self.assertEqual(tree.topLevelItemCount(), 1)
             matched_group = tree.topLevelItem(0)
             self.assertEqual(matched_group.text(0), "甲（3个字形）")
@@ -335,6 +357,24 @@ class ExportPageTests(unittest.TestCase):
                 variant_ids[1],
             )
             self.assertEqual(page._list_count_label.text(), "显示 / 本阶段：1 / 5")
+
+            page._search_edit.setText("乙-0005")
+            self.app.processEvents()
+            self.assertEqual(matched_group.childCount(), 1)
+            page._search_edit.returnPressed.emit()
+            self.app.processEvents()
+            self.assertEqual(tree.topLevelItemCount(), 1)
+            self.assertEqual(tree.topLevelItem(0).text(0), "乙（2个字形）")
+            self.assertEqual(tree.topLevelItem(0).childCount(), 1)
+            self.assertEqual(
+                tree.topLevelItem(0).child(0).data(0, Qt.ItemDataRole.UserRole),
+                variant_ids[4],
+            )
+
+            page._search_edit.clear()
+            self.app.processEvents()
+            self.assertEqual(tree.topLevelItemCount(), 2)
+            self.assertEqual(page._list_count_label.text(), "显示 / 本阶段：5 / 5")
 
     def test_filtering_and_selection_stay_synchronized(self) -> None:
         with self._page_with_variants(total=8, finished=5, summary_completed=False) as (
@@ -574,6 +614,9 @@ class ExportPageTests(unittest.TestCase):
             options = page._build_options()
             self.assertIsInstance(options, ExportOptions)
             self.assertEqual(options.mode, ExportService.MODE_LIBRARY_SPEC)
+            self.assertEqual(options.sequence_mode, "普通序号")
+            self.assertEqual(options.image_format, "PNG")
+            self.assertIn("透明背景", page._format_hint_label.text())
             self.assertFalse(page._custom_panel.isVisible())
             self.assertTrue(page._library_spec_label.isVisible())
 
@@ -581,26 +624,35 @@ class ExportPageTests(unittest.TestCase):
             self.app.processEvents()
             options = page._build_options()
             self.assertEqual(options.mode, ExportService.MODE_TRIM_TRANSPARENT)
-            self.assertFalse(options.include_transparent_area)
             self.assertIn("裁掉", page._option_summary_label.text())
 
             page._mode_buttons[ExportService.MODE_CUSTOM_SPEC].click()
             page._dpi_spin.setValue(1200)
-            page._width_spin.setValue(640)
-            page._height_spin.setValue(720)
-            page._include_transparent_check.setChecked(False)
-            page._name_mode_combo.setCurrentIndex(1)
+            page._width_spin.setValue(480)
+            self.assertEqual(page._height_spin.value(), 560)
+            page._height_spin.setValue(840)
+            self.assertEqual(page._width_spin.value(), 720)
+            page._sequence_mode_combo.setCurrentIndex(1)
+            page._format_combo.setCurrentText("TIFF")
             self.app.processEvents()
             options = page._build_options()
             self.assertEqual(options.mode, ExportService.MODE_CUSTOM_SPEC)
             self.assertEqual(options.dpi, 1200)
-            self.assertEqual(options.width, 640)
-            self.assertEqual(options.height, 720)
-            self.assertFalse(options.include_transparent_area)
-            self.assertEqual(options.name_mode, "原文件名")
+            self.assertEqual(options.width, 720)
+            self.assertEqual(options.height, 840)
+            self.assertFalse(options.allow_upscale)
+            self.assertTrue(page._enlarge_panel.isVisible())
+            self.assertIn("不放大", page._option_summary_label.text())
+            self.assertIn("最小透明画布", page._option_summary_label.text())
+            page._enlarge_mode_combo.setCurrentIndex(1)
+            options = page._build_options()
+            self.assertTrue(options.allow_upscale)
+            self.assertEqual(options.sequence_mode, "自动等宽序号")
+            self.assertEqual(options.image_format, "TIFF")
+            self.assertFalse(hasattr(page, "_name_mode_combo"))
             self.assertTrue(page._custom_panel.isVisible())
             self.assertFalse(page._library_spec_label.isVisible())
-            self.assertIn("实际文字（不包含透明区）", page._option_summary_label.text())
+            self.assertIn("等比放大", page._option_summary_label.text())
 
     def test_readiness_badge_requires_files_and_coordination_summary(self) -> None:
         with self._page_with_variants(total=5) as (page, _variant_ids, _root):
@@ -676,7 +728,7 @@ class ExportPageTests(unittest.TestCase):
                 worker._eligible_variant_ids,
                 frozenset((variant_ids[0], variant_ids[2])),
             )
-            page._active_worker = None
+            page._prepare_worker = None
 
     def test_verified_audit_keeps_safe_ink_pending_product_exportable(self) -> None:
         with self._page_with_variants(total=3) as (page, variant_ids, _root):
@@ -727,6 +779,22 @@ class ExportPageTests(unittest.TestCase):
             self.assertTrue(callable(kwargs["cancel_check"]))
             self.assertFalse(page._audit_in_progress)
 
+    def test_readiness_progress_is_visible_and_tracks_audit(self) -> None:
+        with self._page_with_variants(total=2) as (page, _variant_ids, _root):
+            page._audit_progress.setVisible(False)
+            page._audit_in_progress = True
+            page._show_audit_pending()
+            self.assertTrue(page._audit_progress.isVisible())
+            self.assertEqual(page._audit_progress.maximum(), 2)
+            page.audit_progress.emit("核对：天", 1, 2)
+            self.app.processEvents()
+            self.assertEqual(page._audit_progress.value(), 1)
+            page._audit_finished(
+                {"就绪": True, "总数": 2, "已就绪": 2, "原因": []},
+                None,
+            )
+            self.assertFalse(page._audit_progress.isVisible())
+
     def test_background_export_exposes_progress_cancel_and_completion(self) -> None:
         with self._page_with_variants(total=4) as (page, _variant_ids, root):
             output_dir = root / "输出"
@@ -738,13 +806,34 @@ class ExportPageTests(unittest.TestCase):
                 page._start_export()
 
             self.assertEqual(len(started), 1)
-            worker = started[0]
-            self.assertIs(worker, page._active_worker)
+            prepare_worker = started[0]
+            self.assertIs(prepare_worker, page._prepare_worker)
             self.assertTrue(page._cancel_button.isVisible())
             self.assertTrue(page._export_progress.isVisible())
             self.assertFalse(page._options_host.isEnabled())
-            self.assertEqual(worker._options.mode, ExportService.MODE_LIBRARY_SPEC)
-            self.assertEqual(worker._eligible_variant_ids, frozenset(_variant_ids))
+            self.assertEqual(prepare_worker._options.mode, ExportService.MODE_LIBRARY_SPEC)
+            self.assertEqual(prepare_worker._eligible_variant_ids, frozenset(_variant_ids))
+
+            conflicts = ExportService(page._glyph).find_destination_conflicts(
+                str(output_dir),
+                prepare_worker._options,
+                eligible_variant_ids=prepare_worker._eligible_variant_ids,
+            )
+            with patch.object(
+                page._thread_pool,
+                "start",
+                side_effect=started.append,
+            ):
+                page._prepare_finished(
+                    str(output_dir),
+                    prepare_worker._options,
+                    set(_variant_ids),
+                    conflicts,
+                    prepare_worker,
+                )
+            self.assertEqual(len(started), 2)
+            worker = started[1]
+            self.assertIs(worker, page._active_worker)
 
             worker.signals.progress.emit("导出：天", 2, 4)
             self.app.processEvents()
@@ -770,6 +859,59 @@ class ExportPageTests(unittest.TestCase):
             self.assertFalse(page._cancel_button.isVisible())
             self.assertFalse(page._export_progress.isVisible())
             self.assertIn("已取消", page._export_status_label.text())
+
+    def test_export_success_reports_total_time_from_button_click(self) -> None:
+        with self._page_with_variants(total=3) as (page, variant_ids, root):
+            output_dir = root / "计时输出"
+            output_dir.mkdir()
+            page._directory_edit.setText(str(output_dir))
+            started: list[object] = []
+            with (
+                patch.object(
+                    export_page_module.time,
+                    "perf_counter",
+                    side_effect=(100.0, 112.5),
+                ),
+                patch.object(page._thread_pool, "start", side_effect=started.append),
+                patch.object(QMessageBox, "information") as information,
+            ):
+                page._start_export()
+                prepare_worker = started[0]
+                page._prepare_finished(
+                    str(output_dir),
+                    prepare_worker._options,
+                    set(variant_ids),
+                    [],
+                    prepare_worker,
+                )
+                page._export_finished(
+                    {
+                        "成功": 3,
+                        "跳过": 0,
+                        "失败": 0,
+                        "覆盖": 0,
+                    }
+                )
+
+            information.assert_called_once()
+            self.assertEqual(information.call_args.args[1], "导出完成")
+            self.assertIn("已导出 3 个文件", information.call_args.args[2])
+            self.assertIn("总耗时：12.50 秒", information.call_args.args[2])
+            self.assertIsNone(page._export_started_at)
+
+    def test_export_preparation_can_be_cancelled_and_blocks_repeated_click(self) -> None:
+        with self._page_with_variants(total=2) as (page, _variant_ids, root):
+            output_dir = root / "输出"
+            output_dir.mkdir()
+            page._directory_edit.setText(str(output_dir))
+            started: list[object] = []
+            with patch.object(page._thread_pool, "start", side_effect=started.append):
+                page._start_export()
+                page._start_export()
+            self.assertEqual(len(started), 1)
+            self.assertFalse(page._export_button.isEnabled())
+            page.cancel_export()
+            self.assertTrue(page._prepare_cancel_event.is_set())
 
     def test_conflict_resolver_applies_checked_action_to_remaining_items(self) -> None:
         with self._page_with_variants(total=1) as (page, _variant_ids, root):
@@ -858,12 +1000,13 @@ class ExportPageTests(unittest.TestCase):
 
             with (
                 patch.object(page, "_resolve_export_conflicts", return_value=None) as resolve,
-                patch.object(page._thread_pool, "start") as start,
+                patch.object(page._thread_pool, "start", side_effect=lambda worker: worker.run()) as start,
             ):
                 page._start_export()
+                self.app.processEvents()
             resolve.assert_called_once()
             self.assertEqual(len(resolve.call_args.args[0]), 1)
-            start.assert_not_called()
+            start.assert_called_once()
             self.assertIsNone(page._active_worker)
             self.assertEqual(existing.read_bytes(), b"keep-existing")
 
@@ -888,9 +1031,11 @@ class ExportPageTests(unittest.TestCase):
                 patch.object(page._thread_pool, "start", side_effect=started.append),
             ):
                 page._start_export()
+                started[0].run()
+                self.app.processEvents()
 
-            self.assertEqual(len(started), 1)
-            worker = started[0]
+            self.assertEqual(len(started), 2)
+            worker = started[1]
             self.assertEqual(worker._eligible_variant_ids, frozenset(variant_ids))
             self.assertEqual(worker._conflict_decisions, captured_decisions[0])
             page._active_worker = None
@@ -941,12 +1086,12 @@ class ExportPageTests(unittest.TestCase):
             ):
                 page._start_export()
             self.assertEqual(len(started), 1)
-            self.assertIsNotNone(page._active_worker)
+            self.assertIsNotNone(page._prepare_worker)
             self.assertEqual(
-                page._active_worker._eligible_variant_ids,
+                page._prepare_worker._eligible_variant_ids,
                 frozenset(_variant_ids[:2]),
             )
-            page._active_worker = None
+            page._prepare_worker = None
 
         with self._page_with_variants(total=3, finished=0, summary_completed=False) as (
             page,

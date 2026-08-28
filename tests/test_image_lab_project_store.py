@@ -24,6 +24,8 @@ class ImageLabProjectStoreTests(unittest.TestCase):
                 strength=72,
                 preserve_faint_ink=False,
                 remove_small_noise=False,
+                feather_edges=False,
+                processing_mode="rubbing_dark",
             )
             project.strokes.append(
                 ImageLabStroke("cover", 18, ((0.1, 0.2), (0.4, 0.6)))
@@ -35,6 +37,7 @@ class ImageLabProjectStoreTests(unittest.TestCase):
 
             self.assertEqual(loaded.source_path, source_path)
             self.assertEqual(loaded.options, project.options)
+            self.assertGreaterEqual(loaded.algorithm_version, 2)
             self.assertEqual(loaded.strokes, project.strokes)
             self.assertEqual(loaded.source_width, 120)
             self.assertEqual(loaded.source_height, 80)

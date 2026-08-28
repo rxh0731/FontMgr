@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, Optional
 
-from PySide6.QtCore import QPoint, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QPoint, QObject, QRunnable, QSignalBlocker, QSize, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -61,6 +62,7 @@ from services.workflow_status_service import (
     project_stage_status,
     resolve_safe_stage_file,
 )
+from ui.widgets.adjustable_tree_columns import AdjustableTreeColumns
 from ui.widgets.export_gallery import (
     ExportGallery,
     ExportGalleryEntry,
@@ -68,6 +70,7 @@ from ui.widgets.export_gallery import (
 )
 from ui.widgets.glyph_rename_dialog import run_glyph_rename_dialog
 from ui.workers import FunctionWorker, log_background_exception
+from utils.batch_observability import format_elapsed_time
 from utils.file_utils import natural_key, pinyin_natural_key
 
 
@@ -77,6 +80,52 @@ class _ExportSignals(QObject):
     progress = Signal(str, int, int)
     finished = Signal(object)
     failed = Signal(str)
+
+
+class _PrepareWorker(QRunnable):
+    """后台准备导出清单并扫描同名文件，避免点击导出时阻塞界面。"""
+
+    def __init__(
+        self,
+        glyph_service: GlyphService,
+        output_dir: str,
+        options: ExportOptions,
+        eligible_variant_ids: set[str],
+        cancel_event: threading.Event,
+    ) -> None:
+        super().__init__()
+        self._glyph = glyph_service
+        self._output_dir = output_dir
+        self._options = options
+        self._eligible_variant_ids = frozenset(eligible_variant_ids)
+        self._cancel_event = cancel_event
+        self.signals = _ExportSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            service = ExportService(
+                self._glyph,
+                progress_callback=self.signals.progress.emit,
+            )
+            result = service.find_destination_conflicts(
+                self._output_dir,
+                self._options,
+                eligible_variant_ids=self._eligible_variant_ids,
+                cancel_check=self._cancel_event.is_set,
+                progress_callback=self.signals.progress.emit,
+            )
+        except Exception as exc:
+            log_background_exception("准备字库导出")
+            try:
+                self.signals.failed.emit(str(exc))
+            except RuntimeError:
+                pass
+        else:
+            try:
+                self.signals.finished.emit(result)
+            except RuntimeError:
+                pass
 
 
 class _ExportWorker(QRunnable):
@@ -137,10 +186,12 @@ class ExportPage(QWidget):
     home_requested = Signal()
     summary_changed = Signal(object)
     status_message = Signal(str)
+    audit_progress = Signal(str, int, int)
 
-    LIST_PANEL_MIN_WIDTH = 250
-    LIST_PANEL_DEFAULT_WIDTH = 275
-    LIST_PANEL_MAX_WIDTH = 390
+    # 导出页左侧列表采用紧凑默认宽度；用户仍可通过分隔条或列标题按需加宽。
+    LIST_PANEL_MIN_WIDTH = 300
+    LIST_PANEL_DEFAULT_WIDTH = 300
+    LIST_PANEL_MAX_WIDTH = 440
     OPTION_PANEL_MIN_WIDTH = 248
     OPTION_PANEL_DEFAULT_WIDTH = 276
     OPTION_PANEL_MAX_WIDTH = 330
@@ -173,7 +224,10 @@ class ExportPage(QWidget):
         self._thread_pool = QThreadPool.globalInstance()
         self._audit_workers: set[FunctionWorker] = set()
         self._active_worker: _ExportWorker | None = None
+        self._prepare_worker: _PrepareWorker | None = None
+        self._export_started_at: float | None = None
         self._cancel_event = threading.Event()
+        self._prepare_cancel_event = threading.Event()
         self._audit_cancel_event = threading.Event()
         self._audit_in_progress = False
         self._shutdown = False
@@ -188,6 +242,7 @@ class ExportPage(QWidget):
         self._items_by_id: dict[str, QTreeWidgetItem] = {}
         self._details_by_id: dict[str, dict[str, Any]] = {}
         self._selected_id = ""
+        self._search_query = ""
         self._audit: dict[str, Any] = {}
         self._thumbnail_pool = QThreadPool(self)
         self._thumbnail_pool.setMaxThreadCount(2)
@@ -210,6 +265,7 @@ class ExportPage(QWidget):
         self._thumbnail_timer.timeout.connect(self._load_visible_list_thumbnails)
 
         self._build_ui()
+        self.audit_progress.connect(self._audit_progress_changed)
         settings_service = SettingsService()
         try:
             default_export_directory = (
@@ -229,7 +285,8 @@ class ExportPage(QWidget):
         root.addWidget(self._build_header())
 
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._main_splitter.setChildrenCollapsible(False)
+        # 与自动优化、手工审核工作台保持一致，允许用户折叠左侧列表。
+        self._main_splitter.setChildrenCollapsible(True)
         self._main_splitter.addWidget(self._build_glyph_list())
         self._main_splitter.addWidget(self._build_gallery_panel())
         self._main_splitter.addWidget(self._build_options_panel())
@@ -279,15 +336,28 @@ class ExportPage(QWidget):
 
         self._readiness_badge = QFrame()
         self._readiness_badge.setObjectName("exportReadinessBadge")
-        badge_layout = QHBoxLayout(self._readiness_badge)
+        badge_layout = QVBoxLayout(self._readiness_badge)
         badge_layout.setContentsMargins(10, 6, 10, 6)
-        badge_layout.setSpacing(7)
+        badge_layout.setSpacing(4)
+        badge_row = QHBoxLayout()
+        badge_row.setSpacing(7)
         self._readiness_dot = QLabel()
         self._readiness_dot.setFixedSize(10, 10)
-        badge_layout.addWidget(self._readiness_dot)
+        badge_row.addWidget(self._readiness_dot)
         self._readiness_label = QLabel("正在核对全库状态")
         self._readiness_label.setStyleSheet("font-weight: 600;")
-        badge_layout.addWidget(self._readiness_label)
+        badge_row.addWidget(self._readiness_label)
+        badge_row.addStretch(1)
+        badge_layout.addLayout(badge_row)
+        self._audit_progress = QProgressBar()
+        self._audit_progress.setRange(0, 1)
+        self._audit_progress.setValue(0)
+        self._audit_progress.setFormat("核对进度 %p%")
+        self._audit_progress.setTextVisible(True)
+        self._audit_progress.setFixedHeight(16)
+        self._audit_progress.setMinimumWidth(180)
+        self._audit_progress.setVisible(False)
+        badge_layout.addWidget(self._audit_progress)
         layout.addWidget(self._readiness_badge)
 
         back = QPushButton("返回首页")
@@ -314,11 +384,18 @@ class ExportPage(QWidget):
         heading.addWidget(self._list_count_label)
         layout.addLayout(heading)
 
+        search_row = QHBoxLayout()
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("搜索字符、字形或文件名")
         self._search_edit.setClearButtonEnabled(True)
-        self._search_edit.textChanged.connect(self._apply_filters)
-        layout.addWidget(self._search_edit)
+        self._search_edit.returnPressed.connect(self._execute_search)
+        self._search_edit.textChanged.connect(self._restore_search_when_cleared)
+        search_row.addWidget(self._search_edit, 1)
+        self._search_button = QPushButton("搜索")
+        self._search_button.setObjectName("compactButton")
+        self._search_button.clicked.connect(self._execute_search)
+        search_row.addWidget(self._search_button)
+        layout.addLayout(search_row)
 
         filter_sort_row = QHBoxLayout()
         filter_sort_row.setSpacing(4)
@@ -367,28 +444,24 @@ class ExportPage(QWidget):
             "QTreeWidget::item { min-height: 26px; padding: 1px 3px; }"
             "QTreeWidget::item:selected { background: #3c4773; }"
         )
-        header = self._glyph_list.header()
-        header.setStretchLastSection(False)
-        header.setMinimumSectionSize(48)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        status_width = max(
-            self._glyph_list.fontMetrics().horizontalAdvance(value)
-            for value in (*self.STATUS_FILTERS[1:], "已协调 99/99")
+        self._glyph_list_columns = AdjustableTreeColumns(
+            self._glyph_list,
+            {
+                0: max(
+                    96,
+                    self._glyph_list.fontMetrics().horizontalAdvance("字形与文件") + 12,
+                ),
+                1: max(56, self._glyph_list.fontMetrics().horizontalAdvance("协调状态") + 14),
+                2: max(48, self._glyph_list.fontMetrics().horizontalAdvance("提示") + 14),
+                3: max(52, self._glyph_list.fontMetrics().horizontalAdvance("导出") + 14),
+            },
+            {
+                0: 96,
+                1: max(56, self._glyph_list.fontMetrics().horizontalAdvance("协调状态") + 14),
+                2: max(48, self._glyph_list.fontMetrics().horizontalAdvance("提示") + 14),
+                3: max(52, self._glyph_list.fontMetrics().horizontalAdvance("导出") + 14),
+            },
         )
-        marker_width = max(
-            self._glyph_list.fontMetrics().horizontalAdvance(value)
-            for value in (*WORKFLOW_MARKERS, "问题 99")
-        )
-        export_width = max(
-            self._glyph_list.fontMetrics().horizontalAdvance(value)
-            for value in ("可导出", "不可导出", "可导出 99/99")
-        )
-        header.resizeSection(1, status_width + 20)
-        header.resizeSection(2, marker_width + 24)
-        header.resizeSection(3, export_width + 20)
         self._glyph_list.currentItemChanged.connect(self._tree_selection_changed)
         self._glyph_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -531,38 +604,53 @@ class ExportPage(QWidget):
         self._dpi_spin.setSuffix(" DPI")
         self._dpi_spin.setValue(self._positive_int(metadata.get("DPI"), 300))
         self._width_spin = QSpinBox()
-        self._width_spin.setRange(1, self.MAX_CUSTOM_DIMENSION)
+        library_width = self._positive_int(metadata.get("画布宽"), 250)
+        library_height = self._positive_int(metadata.get("画布高"), 250)
+        max_width = min(
+            self.MAX_CUSTOM_DIMENSION,
+            max(1, self.MAX_CUSTOM_DIMENSION * library_width // library_height),
+        )
+        max_height = min(
+            self.MAX_CUSTOM_DIMENSION,
+            max(1, self.MAX_CUSTOM_DIMENSION * library_height // library_width),
+        )
+        self._width_spin.setRange(1, max_width)
         self._width_spin.setSuffix(" px")
         self._width_spin.setValue(
-            min(
-                self.MAX_CUSTOM_DIMENSION,
-                self._positive_int(metadata.get("画布宽"), 250),
-            )
+            min(max_width, library_width)
         )
         self._height_spin = QSpinBox()
-        self._height_spin.setRange(1, self.MAX_CUSTOM_DIMENSION)
+        self._height_spin.setRange(1, max_height)
         self._height_spin.setSuffix(" px")
         self._height_spin.setValue(
-            min(
-                self.MAX_CUSTOM_DIMENSION,
-                self._positive_int(metadata.get("画布高"), 250),
-            )
+            min(max_height, library_height)
         )
+        self._width_spin.setKeyboardTracking(False)
+        self._height_spin.setKeyboardTracking(False)
         custom_form.addRow("画布 DPI", self._dpi_spin)
         custom_form.addRow("画布宽度", self._width_spin)
         custom_form.addRow("画布高度", self._height_spin)
-        self._include_transparent_check = QCheckBox("包含透明区")
-        self._include_transparent_check.setChecked(True)
-        custom_form.addRow("缩放依据", self._include_transparent_check)
+        self._enlarge_panel = QWidget()
+        enlarge_layout = QVBoxLayout(self._enlarge_panel)
+        enlarge_layout.setContentsMargins(0, 0, 0, 0)
+        enlarge_layout.setSpacing(5)
+        enlarge_hint = QLabel("自定义参数大于字库参数，请选择处理方式")
+        enlarge_hint.setProperty("role", "muted")
+        enlarge_hint.setWordWrap(True)
+        enlarge_layout.addWidget(enlarge_hint)
+        self._enlarge_mode_combo = QComboBox()
+        self._enlarge_mode_combo.addItem("保持原始尺寸并居中（推荐）", False)
+        self._enlarge_mode_combo.addItem("等比放大", True)
+        self._enlarge_mode_combo.currentIndexChanged.connect(
+            self._update_option_summary
+        )
+        enlarge_layout.addWidget(self._enlarge_mode_combo)
+        custom_form.addRow(self._enlarge_panel)
         layout.addWidget(self._custom_panel)
 
-        for control in (
-            self._dpi_spin,
-            self._width_spin,
-            self._height_spin,
-        ):
-            control.valueChanged.connect(self._update_option_summary)
-        self._include_transparent_check.toggled.connect(self._update_option_summary)
+        self._dpi_spin.valueChanged.connect(self._update_option_summary)
+        self._width_spin.valueChanged.connect(self._custom_width_changed)
+        self._height_spin.valueChanged.connect(self._custom_height_changed)
 
         self._option_summary_label = QLabel()
         self._option_summary_label.setWordWrap(True)
@@ -571,14 +659,20 @@ class ExportPage(QWidget):
 
         layout.addWidget(self._horizontal_separator())
         layout.addWidget(self._section_title("文件命名"))
-        self._name_mode_combo = QComboBox()
-        self._name_mode_combo.addItem("使用字符命名", "字符")
-        self._name_mode_combo.addItem("使用原文件名", "原文件名")
-        layout.addWidget(self._name_mode_combo)
-        format_label = QLabel("文件格式：PNG（保留透明背景）")
-        format_label.setProperty("role", "muted")
-        format_label.setWordWrap(True)
-        layout.addWidget(format_label)
+        self._sequence_mode_combo = QComboBox()
+        self._sequence_mode_combo.addItem("普通序号：阿、阿-1、阿-2", "普通序号")
+        self._sequence_mode_combo.addItem("自动等宽序号：阿-01、阿-02", "自动等宽序号")
+        layout.addWidget(self._sequence_mode_combo)
+        layout.addWidget(self._section_title("导出格式"))
+        self._format_combo = QComboBox()
+        self._format_combo.addItems(ExportService.IMAGE_FORMATS)
+        self._format_combo.currentTextChanged.connect(self._update_format_hint)
+        layout.addWidget(self._format_combo)
+        self._format_hint_label = QLabel()
+        self._format_hint_label.setProperty("role", "muted")
+        self._format_hint_label.setWordWrap(True)
+        layout.addWidget(self._format_hint_label)
+        self._update_format_hint(self._format_combo.currentText())
         layout.addStretch(1)
         self._options_scroll.setWidget(self._options_host)
         root.addWidget(self._options_scroll, 1)
@@ -666,15 +760,29 @@ class ExportPage(QWidget):
         self._apply_filters()
         self._start_readiness_audit()
 
-    def _apply_filters(self, _value: object = None) -> None:
-        query = self._search_edit.text().strip().casefold()
+    def _apply_filters(
+        self,
+        _value: object = None,
+        *,
+        select_first: bool = False,
+    ) -> None:
+        query = self._search_query
         status_filter = self._filter_combo.currentText()
         variants: list[dict[str, Any]] = []
         for detail in self._phase_variants:
             projection = self._stage_projection(detail)
             searchable = " ".join(
                 str(detail.get(key, ""))
-                for key in ("归属字", "原始文件", "导入前文件名", "成品文件")
+                for key in (
+                    "归属字",
+                    "变体序号",
+                    "变体ID",
+                    "原始文件",
+                    "导入前文件名",
+                    "中间文件",
+                    "审核文件",
+                    "成品文件",
+                )
             ).casefold()
             if query and query not in searchable:
                 continue
@@ -683,14 +791,27 @@ class ExportPage(QWidget):
             variants.append(detail)
         self._sort_variants(variants)
         self._visible_variants = variants
-        if (
-            self._selected_id
+        if select_first and variants:
+            self._selected_id = str(variants[0].get("变体ID", ""))
+        elif (
+            variants
+            and self._selected_id
             not in {str(detail.get("变体ID", "")) for detail in variants}
-            and variants
         ):
             self._selected_id = str(variants[0].get("变体ID", ""))
         self._populate_list()
         self._populate_gallery()
+
+    def _execute_search(self, _checked: bool = False) -> None:
+        """按搜索按钮或回车提交查询，并定位当前排序的第一条结果。"""
+        self._search_query = self._search_edit.text().strip().casefold()
+        self._apply_filters(select_first=True)
+
+    def _restore_search_when_cleared(self, text: str) -> None:
+        """清空检索文字后立即恢复当前状态筛选下的全部字形。"""
+        if not text.strip():
+            self._search_query = ""
+            self._apply_filters()
 
     def _sort_variants(self, variants: list[dict[str, Any]]) -> None:
         mode = self._sort_combo.currentText()
@@ -881,7 +1002,7 @@ class ExportPage(QWidget):
                 item = QTreeWidgetItem(
                     parent,
                     [
-                        f"字形{variant_number} · {filename}",
+                        f"字形{variant_number}\n{filename}",
                         status,
                         markers,
                         "可导出" if ready else "不可导出",
@@ -925,11 +1046,34 @@ class ExportPage(QWidget):
         if selected_item is not None:
             self._glyph_list.setCurrentItem(selected_item)
         self._glyph_list.blockSignals(False)
+        self._ensure_primary_column_readable()
         self._list_count_label.setText(
             f"显示 / 本阶段：{len(self._visible_variants)} / "
             f"{len(self._phase_variants)}"
         )
         self._schedule_list_thumbnail_loads()
+
+    def _ensure_primary_column_readable(self) -> None:
+        """让字形和完整文件名决定第一列宽度，其他列自然向右顺延。"""
+        metrics = self._glyph_list.fontMetrics()
+        required = metrics.horizontalAdvance("字形与文件") + 24
+        for row in range(self._glyph_list.topLevelItemCount()):
+            parent = self._glyph_list.topLevelItem(row)
+            required = max(required, metrics.horizontalAdvance(parent.text(0)) + 36)
+            for child_index in range(parent.childCount()):
+                child = parent.child(child_index)
+                line_width = max(
+                    (
+                        metrics.horizontalAdvance(line)
+                        for line in child.text(0).splitlines()
+                    ),
+                    default=0,
+                )
+                required = max(
+                    required,
+                    line_width + self.LIST_THUMBNAIL_SIZE + 46,
+                )
+        self._glyph_list_columns.set_protected_minimum(0, required)
 
     def _populate_gallery(self) -> None:
         finished_dir = self._glyph.get_workflow_dirs()["成品"]
@@ -1268,7 +1412,42 @@ class ExportPage(QWidget):
         self._mode_buttons[mode].setChecked(True)
         self._custom_panel.setVisible(mode == ExportService.MODE_CUSTOM_SPEC)
         self._library_spec_label.setVisible(mode != ExportService.MODE_CUSTOM_SPEC)
+        self._update_custom_enlarge_controls()
         self._update_option_summary()
+
+    def _custom_width_changed(self, width: int) -> None:
+        metadata = self._glyph.get_metadata()
+        library_width = self._positive_int(metadata.get("画布宽"), 250)
+        library_height = self._positive_int(metadata.get("画布高"), 250)
+        height = max(1, round(int(width) * library_height / library_width))
+        with QSignalBlocker(self._height_spin):
+            self._height_spin.setValue(height)
+        self._update_custom_enlarge_controls()
+        self._update_option_summary()
+
+    def _custom_height_changed(self, height: int) -> None:
+        metadata = self._glyph.get_metadata()
+        library_width = self._positive_int(metadata.get("画布宽"), 250)
+        library_height = self._positive_int(metadata.get("画布高"), 250)
+        width = max(1, round(int(height) * library_width / library_height))
+        with QSignalBlocker(self._width_spin):
+            self._width_spin.setValue(width)
+        self._update_custom_enlarge_controls()
+        self._update_option_summary()
+
+    def _update_custom_enlarge_controls(self) -> None:
+        if not hasattr(self, "_enlarge_panel"):
+            return
+        metadata = self._glyph.get_metadata()
+        library_width = self._positive_int(metadata.get("画布宽"), 250)
+        library_height = self._positive_int(metadata.get("画布高"), 250)
+        larger = (
+            self._width_spin.value() > library_width
+            or self._height_spin.value() > library_height
+        )
+        self._enlarge_panel.setVisible(
+            self._export_mode == ExportService.MODE_CUSTOM_SPEC and larger
+        )
 
     def _update_option_summary(self, _value: object = None) -> None:
         metadata = self._glyph.get_metadata()
@@ -1277,10 +1456,29 @@ class ExportPage(QWidget):
                 f"保留 {metadata.get('DPI', '--')} DPI，裁掉文字外围的全透明区域。"
             )
         elif self._export_mode == ExportService.MODE_CUSTOM_SPEC:
-            basis = "完整图片（包含透明区）" if self._include_transparent_check.isChecked() else "实际文字（不包含透明区）"
+            library_width = self._positive_int(metadata.get("画布宽"), 250)
+            library_height = self._positive_int(metadata.get("画布高"), 250)
+            larger = (
+                self._width_spin.value() > library_width
+                or self._height_spin.value() > library_height
+            )
+            if larger and not bool(self._enlarge_mode_combo.currentData()):
+                action = (
+                    "不放大；自定义宽高作为最小透明画布，"
+                    "较大的最终成品边保持原尺寸"
+                )
+            elif larger:
+                action = "按字库参数的单一比例等比放大完整成品及透明区"
+            elif (
+                self._width_spin.value() < library_width
+                or self._height_spin.value() < library_height
+            ):
+                action = "按字库参数的单一比例等比缩小完整成品及透明区"
+            else:
+                action = "保持原始像素尺寸"
             text = (
                 f"{self._dpi_spin.value()} DPI，{self._width_spin.value()}×"
-                f"{self._height_spin.value()} 像素；按{basis}等比缩放并居中。"
+                f"{self._height_spin.value()} 像素；{action}。"
             )
         else:
             text = (
@@ -1291,23 +1489,37 @@ class ExportPage(QWidget):
         self._option_summary_label.setText(text)
 
     def _build_options(self) -> ExportOptions:
-        name_mode = str(self._name_mode_combo.currentData() or "字符")
+        sequence_mode = str(self._sequence_mode_combo.currentData() or "普通序号")
+        image_format = str(self._format_combo.currentText() or "PNG")
         if self._export_mode == ExportService.MODE_CUSTOM_SPEC:
             return ExportOptions(
                 mode=self._export_mode,
                 dpi=self._dpi_spin.value(),
                 width=self._width_spin.value(),
                 height=self._height_spin.value(),
-                include_transparent_area=self._include_transparent_check.isChecked(),
-                name_mode=name_mode,
+                sequence_mode=sequence_mode,
+                image_format=image_format,
+                allow_upscale=bool(self._enlarge_mode_combo.currentData()),
             )
         return ExportOptions(
             mode=self._export_mode,
-            include_transparent_area=(
-                self._export_mode != ExportService.MODE_TRIM_TRANSPARENT
-            ),
-            name_mode=name_mode,
+            sequence_mode=sequence_mode,
+            image_format=image_format,
         )
+
+    def _update_format_hint(self, image_format: str) -> None:
+        if not hasattr(self, "_format_hint_label"):
+            return
+        if image_format in {"JPEG", "BMP"}:
+            self._format_hint_label.setText(
+                f"{image_format} 不支持透明背景，导出时将使用白色背景。"
+            )
+        elif image_format == "PNG":
+            self._format_hint_label.setText("PNG 支持透明背景，适合字库导出。")
+        elif image_format == "TIFF":
+            self._format_hint_label.setText("TIFF 适合高清和印刷后期处理。")
+        else:
+            self._format_hint_label.setText("WebP 支持透明背景，文件体积较小。")
 
     def _choose_directory(self) -> None:
         initial = self._directory_edit.text().strip() or os.path.expanduser("~")
@@ -1316,8 +1528,9 @@ class ExportPage(QWidget):
             self._directory_edit.setText(directory)
 
     def _start_export(self) -> None:
-        if self._active_worker is not None:
+        if self._active_worker is not None or self._prepare_worker is not None:
             return
+        clicked_at = time.perf_counter()
         if self._audit_in_progress:
             QMessageBox.information(
                 self,
@@ -1363,28 +1576,59 @@ class ExportPage(QWidget):
             return
 
         options = self._build_options()
-        try:
-            conflicts = ExportService(self._glyph).find_destination_conflicts(
-                output_dir,
-                options,
-                eligible_variant_ids=eligible_variant_ids,
+        self._export_started_at = clicked_at
+        self._prepare_cancel_event = threading.Event()
+        worker = _PrepareWorker(
+            self._glyph,
+            output_dir,
+            options,
+            eligible_variant_ids,
+            self._prepare_cancel_event,
+        )
+        self._prepare_worker = worker
+        worker.signals.progress.connect(self._export_progress_changed)
+        worker.signals.finished.connect(
+            lambda conflicts, task=worker: self._prepare_finished(
+                output_dir, options, eligible_variant_ids, conflicts, task
             )
-        except (OSError, TypeError, ValueError) as exc:
-            self._export_status_label.setText("无法准备导出")
-            QMessageBox.critical(
-                self,
-                "无法准备导出",
-                str(exc),
-            )
+        )
+        worker.signals.failed.connect(
+            lambda message, task=worker: self._prepare_failed(message, task)
+        )
+        self._set_busy(True)
+        self._export_progress.setRange(0, max(1, len(self._all_variants)))
+        self._export_progress.setValue(0)
+        self._export_progress.setFormat("准备导出 %p%")
+        self._export_status_label.setText("正在后台准备导出…")
+        self._thread_pool.start(worker)
+
+    def _prepare_finished(
+        self,
+        output_dir: str,
+        options: ExportOptions,
+        eligible_variant_ids: set[str],
+        conflicts: object,
+        worker: _PrepareWorker,
+    ) -> None:
+        if worker is not self._prepare_worker:
             return
-        conflict_decisions = self._resolve_export_conflicts(conflicts)
+        self._prepare_worker = None
+        if self._shutdown or self._prepare_cancel_event.is_set():
+            self._export_started_at = None
+            self._set_busy(False)
+            self._export_status_label.setText("导出已取消")
+            return
+        conflict_decisions = self._resolve_export_conflicts(
+            conflicts if isinstance(conflicts, list) else []
+        )
         if conflict_decisions is None:
+            self._export_started_at = None
+            self._set_busy(False)
             self._export_status_label.setText("导出已取消")
             self.status_message.emit("导出已取消")
             return
-
         self._cancel_event = threading.Event()
-        worker = _ExportWorker(
+        export_worker = _ExportWorker(
             self._glyph,
             output_dir,
             options,
@@ -1392,15 +1636,24 @@ class ExportPage(QWidget):
             eligible_variant_ids,
             conflict_decisions,
         )
-        self._active_worker = worker
-        worker.signals.progress.connect(self._export_progress_changed)
-        worker.signals.finished.connect(self._export_finished)
-        worker.signals.failed.connect(self._export_failed)
-        self._set_busy(True)
-        self._export_progress.setRange(0, max(1, len(self._all_variants)))
-        self._export_progress.setValue(0)
-        self._export_status_label.setText("正在准备导出…")
-        self._thread_pool.start(worker)
+        self._active_worker = export_worker
+        export_worker.signals.progress.connect(self._export_progress_changed)
+        export_worker.signals.finished.connect(self._export_finished)
+        export_worker.signals.failed.connect(self._export_failed)
+        self._export_progress.setFormat("导出 %p%")
+        self._export_status_label.setText("正在生成导出文件…")
+        self._thread_pool.start(export_worker)
+
+    def _prepare_failed(self, message: str, worker: _PrepareWorker) -> None:
+        if worker is not self._prepare_worker:
+            return
+        self._prepare_worker = None
+        self._export_started_at = None
+        self._set_busy(False)
+        if self._shutdown:
+            return
+        self._export_status_label.setText("无法准备导出")
+        QMessageBox.critical(self, "无法准备导出", message)
 
     def _export_progress_changed(self, message: str, current: int, total: int) -> None:
         if self._shutdown:
@@ -1410,6 +1663,7 @@ class ExportPage(QWidget):
         self._export_status_label.setText(message)
 
     def _export_finished(self, result: object) -> None:
+        elapsed = self._finish_export_timing()
         self._active_worker = None
         self._set_busy(False)
         if self._shutdown:
@@ -1449,9 +1703,12 @@ class ExportPage(QWidget):
             message += f"\n其中覆盖已有文件 {overwritten} 个。"
         if skipped or failed:
             message += f"\n跳过 {skipped} 个，失败 {failed} 个。"
+        if elapsed is not None:
+            message += f"\n\n总耗时：{format_elapsed_time(elapsed)}"
         QMessageBox.information(self, "导出完成", message)
 
     def _export_failed(self, message: str) -> None:
+        self._export_started_at = None
         self._active_worker = None
         self._set_busy(False)
         if self._shutdown:
@@ -1459,7 +1716,20 @@ class ExportPage(QWidget):
         self._export_status_label.setText("导出失败")
         QMessageBox.critical(self, "导出失败", message)
 
+    def _finish_export_timing(self) -> float | None:
+        """结束从用户点击开始导出到后台任务完成的本次计时。"""
+        started_at = self._export_started_at
+        self._export_started_at = None
+        if started_at is None:
+            return None
+        return max(0.0, time.perf_counter() - started_at)
+
     def cancel_export(self) -> None:
+        if self._prepare_worker is not None:
+            self._prepare_cancel_event.set()
+            self._cancel_button.setEnabled(False)
+            self._export_status_label.setText("正在取消准备导出…")
+            return
         if self._active_worker is None:
             return
         self._cancel_event.set()
@@ -1478,7 +1748,7 @@ class ExportPage(QWidget):
         self._cancel_button.setEnabled(busy)
         self._export_progress.setVisible(busy)
     def _refresh_export_button(self, _value: object = None) -> None:
-        if self._active_worker is None:
+        if self._active_worker is None and self._prepare_worker is None:
             self._export_button.setEnabled(
                 not self._audit_in_progress
                 and bool(self._directory_edit.text().strip())
@@ -1493,7 +1763,10 @@ class ExportPage(QWidget):
         self._audit_cancel_event = cancel_event
         self._audit_in_progress = True
         self._show_audit_pending()
-        service = ExportService(self._glyph)
+        service = ExportService(
+            self._glyph,
+            progress_callback=self.audit_progress.emit,
+        )
         worker = FunctionWorker(
             lambda: service.audit_readiness(
                 verify_hash=True,
@@ -1533,8 +1806,11 @@ class ExportPage(QWidget):
             return
         self._audit_in_progress = False
         if bool(result.get("已取消", False)):
+            self._audit_progress.setVisible(False)
             self._refresh_export_button()
             return
+        self._audit_progress.setValue(self._audit_progress.maximum())
+        self._audit_progress.setVisible(False)
         self._audit = dict(result)
         issue_details = result.get("问题详情", [])
         file_issue_types = {
@@ -1581,6 +1857,7 @@ class ExportPage(QWidget):
         if self._shutdown or cancel_event is not self._audit_cancel_event:
             return
         self._audit_in_progress = False
+        self._audit_progress.setVisible(False)
         self._audit = {
             "就绪": False,
             "总数": len(self._all_variants),
@@ -1599,10 +1876,27 @@ class ExportPage(QWidget):
             "border: 1px solid #806B38; border-radius: 6px; }"
         )
         self._readiness_label.setText("正在核对全库状态")
+        total = len(self._all_variants)
+        self._audit_progress.setRange(0, max(1, total))
+        self._audit_progress.setValue(0)
+        self._audit_progress.setFormat("核对进度 %p%")
+        self._audit_progress.setVisible(True)
         self._readiness_badge.setToolTip(
             "正在逐项核对成品文件、图像内容和文件校验值。"
         )
         self._refresh_export_button()
+
+    @Slot(str, int, int)
+    def _audit_progress_changed(self, message: str, current: int, total: int) -> None:
+        """更新全库状态核对进度；回调来自后台线程，只触碰 Qt 信号安全控件。"""
+        if self._shutdown or not self._audit_in_progress:
+            return
+        maximum = max(1, int(total))
+        if self._audit_progress.maximum() != maximum:
+            self._audit_progress.setRange(0, maximum)
+        self._audit_progress.setValue(max(0, min(int(current), maximum)))
+        self._audit_progress.setFormat("核对进度 %p%")
+        self._audit_progress.setToolTip(str(message or "正在核对全库状态"))
 
     def _release_audit_worker(self, worker: FunctionWorker) -> None:
         self._audit_workers.discard(worker)
@@ -1809,13 +2103,19 @@ class ExportPage(QWidget):
     def is_running(self) -> bool:
         """返回导出或完整审计任务是否尚未结束。"""
 
-        return self._active_worker is not None or bool(self._audit_workers)
+        return (
+            self._active_worker is not None
+            or self._prepare_worker is not None
+            or bool(self._audit_workers)
+        )
 
     def shutdown(self) -> None:
         """使后台结果失效，并请求正在运行的导出安全取消。"""
         self._shutdown = True
+        self._export_started_at = None
         self._thumbnail_generation += 1
         self._cancel_event.set()
+        self._prepare_cancel_event.set()
         self._audit_cancel_event.set()
         self._thumbnail_timer.stop()
         self._thumbnail_pool.clear()

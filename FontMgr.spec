@@ -2,16 +2,23 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_dynamic_libs
 
 
 project_root = Path(SPEC).resolve().parent
 rapidocr_datas = collect_data_files("rapidocr")
+opencc_datas, opencc_binaries, opencc_hiddenimports = collect_all("opencc")
+psd_tools_datas, psd_tools_binaries, psd_tools_hiddenimports = collect_all("psd_tools")
+onnxruntime_binaries = collect_dynamic_libs("onnxruntime")
 
 a = Analysis(
     [str(project_root / "main.py")],
     pathex=[str(project_root)],
-    binaries=[],
+    binaries=[
+        *opencc_binaries,
+        *psd_tools_binaries,
+        *onnxruntime_binaries,
+    ],
     datas=[
         (str(project_root / "FontEditor.ico"), "."),
         (
@@ -19,10 +26,16 @@ a = Analysis(
             "assets",
         ),
         *rapidocr_datas,
+        *opencc_datas,
+        *psd_tools_datas,
     ],
     hiddenimports=[
+        *opencc_hiddenimports,
+        *psd_tools_hiddenimports,
         "rapidocr.main",
         "rapidocr.inference_engine.onnxruntime",
+        "rapidocr.inference_engine.onnxruntime.main",
+        "rapidocr.inference_engine.onnxruntime.provider_config",
     ],
     hookspath=[],
     hooksconfig={},

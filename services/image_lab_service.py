@@ -22,6 +22,7 @@ from data.image_lab_project_store import (
     ImageLabProjectStore,
     ImageLabStroke,
 )
+from utils.system_resources import MIB, get_system_memory_status
 
 
 SUPPORTED_IMAGE_FILTER = (
@@ -30,6 +31,9 @@ SUPPORTED_IMAGE_FILTER = (
 PSD_MAX_DIMENSION = 30_000
 PSB_MAX_DIMENSION = 300_000
 PSD_SAFE_FILE_BYTES = 1_800_000_000
+DETAIL_CACHE_MIN_BYTES = 64 * MIB
+DETAIL_CACHE_MAX_BYTES = 512 * MIB
+DETAIL_CACHE_EMERGENCY_BYTES = 16 * MIB
 
 
 class ImageLabCancelled(RuntimeError):
@@ -49,11 +53,24 @@ class ImageLabSourceInfo:
 @dataclass(frozen=True, slots=True)
 class ImageLabPreview:
     source: np.ndarray
+    detail_source: np.ndarray
     cleanup: ImageCleanupResult
     effective_alpha: np.ndarray
     composite: np.ndarray
     source_width: int
     source_height: int
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ImageLabDetailPreview:
+    """按原图区域生成、用于放大查看的临时高清预览。"""
+
+    source: np.ndarray
+    composite: np.ndarray
+    effective_alpha: np.ndarray
+    uncertainty: np.ndarray
+    source_rect: tuple[int, int, int, int]
     elapsed_seconds: float
 
 
@@ -126,29 +143,110 @@ class ImageLabService:
             dpi_y=info.dpi_y,
         )
 
+    @staticmethod
+    def _detail_cache_pixel_budget() -> int:
+        """按当前可用内存限制单个图片实验室高清工作副本。"""
+
+        _total_memory, available_memory = get_system_memory_status()
+        if available_memory <= 0:
+            cache_bytes = DETAIL_CACHE_MIN_BYTES
+        else:
+            cache_bytes = max(
+                DETAIL_CACHE_EMERGENCY_BYTES,
+                min(DETAIL_CACHE_MAX_BYTES, available_memory // 8),
+            )
+        return max(1, cache_bytes // 3)
+
     def load_preview(
         self,
         project: ImageLabProject,
         *,
         max_edge: int = 2200,
+        detail_source_cache: np.ndarray | None = None,
+        build_detail_cache: bool = True,
     ) -> ImageLabPreview:
         if max_edge < 320:
             raise ValueError("预览尺寸过小。")
         started = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            image = self._open_image(project.source_path)
-            try:
-                image = self._apply_exif_orientation(image)
-                image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-                rgb_image = image.convert("RGB")
+        if detail_source_cache is not None:
+            if (
+                not isinstance(detail_source_cache, np.ndarray)
+                or detail_source_cache.dtype != np.uint8
+                or detail_source_cache.ndim != 3
+                or detail_source_cache.shape[2] != 3
+            ):
+                raise ValueError("高清工作缓存格式无效。")
+            detail_source = detail_source_cache
+            cache_height, cache_width = detail_source.shape[:2]
+            aspect_error = abs(
+                cache_width * project.source_height
+                - cache_height * project.source_width
+            )
+            if aspect_error > max(project.source_width, project.source_height):
+                raise ValueError("高清工作缓存与当前原稿尺寸不匹配。")
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                image = self._open_image(project.source_path)
                 try:
-                    source = np.array(rgb_image, dtype=np.uint8, copy=True)
+                    image = self._apply_exif_orientation(image)
+                    source_width, source_height = image.size
+                    if build_detail_cache:
+                        pixel_budget = self._detail_cache_pixel_budget()
+                        detail_scale = min(
+                            1.0,
+                            np.sqrt(
+                                pixel_budget
+                                / max(1, source_width * source_height)
+                            ),
+                        )
+                    else:
+                        detail_scale = min(
+                            1.0,
+                            max_edge / max(source_width, source_height),
+                        )
+                    detail_size = (
+                        max(1, int(round(source_width * detail_scale))),
+                        max(1, int(round(source_height * detail_scale))),
+                    )
+                    if image.size != detail_size:
+                        image.thumbnail(detail_size, Image.Resampling.LANCZOS)
+                    detail_image = image.convert("RGB")
+                    try:
+                        detail_source = np.array(
+                            detail_image,
+                            dtype=np.uint8,
+                            copy=True,
+                        )
+                    finally:
+                        detail_image.close()
                 finally:
-                    rgb_image.close()
-            finally:
-                image.close()
-        cleanup = clean_document_image(source, project.options)
+                    image.close()
+        detail_height, detail_width = detail_source.shape[:2]
+        if max(detail_width, detail_height) <= max_edge:
+            source = detail_source
+        else:
+            preview_scale = min(max_edge / detail_width, max_edge / detail_height)
+            preview_size = (
+                max(1, int(round(detail_width * preview_scale))),
+                max(1, int(round(detail_height * preview_scale))),
+            )
+            source = cv2.resize(
+                detail_source,
+                preview_size,
+                interpolation=cv2.INTER_AREA,
+            )
+        cleanup = clean_document_image(
+            source,
+            project.options,
+            source_region=(
+                0,
+                0,
+                project.source_width,
+                project.source_height,
+            ),
+            source_size=(project.source_width, project.source_height),
+        )
         effective_alpha = self.apply_strokes(
             cleanup.cleanup_layer[:, :, 3],
             project.strokes,
@@ -156,15 +254,189 @@ class ImageLabService:
             project.source_height,
         )
         composite = self.compose(source, effective_alpha)
-        for array in (source, effective_alpha, composite):
+        for array in (source, detail_source, effective_alpha, composite):
             array.setflags(write=False)
         return ImageLabPreview(
             source=source,
+            detail_source=detail_source,
             cleanup=cleanup,
             effective_alpha=effective_alpha,
             composite=composite,
             source_width=project.source_width,
             source_height=project.source_height,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    def load_detail_preview(
+        self,
+        project: ImageLabProject,
+        preview: ImageLabPreview,
+        source_rect: tuple[int, int, int, int],
+        target_size: tuple[int, int],
+        *,
+        processing_overlap: int = 96,
+        max_output_edge: int = 2600,
+    ) -> ImageLabDetailPreview:
+        """从原稿读取当前可见区域，并生成适合屏幕显示的高清处理结果。"""
+
+        started = time.perf_counter()
+        if len(source_rect) != 4 or len(target_size) != 2:
+            raise ValueError("高清预览区域参数无效。")
+        left, top, right, bottom = (int(value) for value in source_rect)
+        left = max(0, min(project.source_width - 1, left))
+        top = max(0, min(project.source_height - 1, top))
+        right = max(left + 1, min(project.source_width, right))
+        bottom = max(top + 1, min(project.source_height, bottom))
+        target_width = max(1, int(target_size[0]))
+        target_height = max(1, int(target_size[1]))
+        if processing_overlap < 16 or max_output_edge < 320:
+            raise ValueError("高清预览处理参数无效。")
+        output_scale = min(
+            1.0,
+            max_output_edge / max(target_width, target_height),
+        )
+        target_width = max(1, int(round(target_width * output_scale)))
+        target_height = max(1, int(round(target_height * output_scale)))
+        source_region_width = right - left
+        source_region_height = bottom - top
+        scale_x = target_width / source_region_width
+        scale_y = target_height / source_region_height
+        source_overlap_x = max(1, int(np.ceil(processing_overlap / scale_x)))
+        source_overlap_y = max(1, int(np.ceil(processing_overlap / scale_y)))
+        read_left = max(0, left - source_overlap_x)
+        read_top = max(0, top - source_overlap_y)
+        read_right = min(project.source_width, right + source_overlap_x)
+        read_bottom = min(project.source_height, bottom + source_overlap_y)
+        read_target_width = max(
+            target_width,
+            int(np.ceil((read_right - read_left) * scale_x)),
+        )
+        read_target_height = max(
+            target_height,
+            int(np.ceil((read_bottom - read_top) * scale_y)),
+        )
+
+        cache_height, cache_width = preview.detail_source.shape[:2]
+        cache_left = max(
+            0,
+            int(np.floor(read_left * cache_width / project.source_width)),
+        )
+        cache_top = max(
+            0,
+            int(np.floor(read_top * cache_height / project.source_height)),
+        )
+        cache_right = min(
+            cache_width,
+            int(np.ceil(read_right * cache_width / project.source_width)),
+        )
+        cache_bottom = min(
+            cache_height,
+            int(np.ceil(read_bottom * cache_height / project.source_height)),
+        )
+        cached_region = preview.detail_source[
+            cache_top:cache_bottom,
+            cache_left:cache_right,
+        ]
+        if cached_region.size == 0:
+            raise ValueError("高清工作缓存未覆盖当前原图区域。")
+        tile = cv2.resize(
+            cached_region,
+            (read_target_width, read_target_height),
+            interpolation=(
+                cv2.INTER_AREA
+                if cached_region.shape[1] > read_target_width
+                or cached_region.shape[0] > read_target_height
+                else cv2.INTER_LANCZOS4
+            ),
+        )
+
+        core_left = int(round((left - read_left) * scale_x))
+        core_top = int(round((top - read_top) * scale_y))
+        core_right = min(tile.shape[1], core_left + target_width)
+        core_bottom = min(tile.shape[0], core_top + target_height)
+
+        def exact_size(values: np.ndarray, interpolation: int) -> np.ndarray:
+            core = np.array(
+                values[core_top:core_bottom, core_left:core_right],
+                copy=True,
+            )
+            if core.shape[:2] != (target_height, target_width):
+                core = cv2.resize(
+                    core,
+                    (target_width, target_height),
+                    interpolation=interpolation,
+                )
+            return core
+
+        source = exact_size(tile, cv2.INTER_LANCZOS4)
+        # 高清预览只提升原图显示清晰度，清理判断统一复用快速预览蒙版，
+        # 避免同一位置因处理尺寸和局部背景不同而产生两套结果。
+        preview_height, preview_width = preview.effective_alpha.shape
+        mask_left = max(
+            0,
+            min(
+                preview_width - 1,
+                int(np.floor(left * preview_width / project.source_width)),
+            ),
+        )
+        mask_top = max(
+            0,
+            min(
+                preview_height - 1,
+                int(np.floor(top * preview_height / project.source_height)),
+            ),
+        )
+        mask_right = max(
+            mask_left + 1,
+            min(
+                preview_width,
+                int(np.ceil(right * preview_width / project.source_width)),
+            ),
+        )
+        mask_bottom = max(
+            mask_top + 1,
+            min(
+                preview_height,
+                int(np.ceil(bottom * preview_height / project.source_height)),
+            ),
+        )
+        mask_region = preview.cleanup.cleanup_layer[
+            mask_top:mask_bottom,
+            mask_left:mask_right,
+            3,
+        ]
+        uncertainty_region = preview.cleanup.uncertainty_mask[
+            mask_top:mask_bottom,
+            mask_left:mask_right,
+        ]
+        if mask_region.size == 0 or uncertainty_region.size == 0:
+            raise ValueError("快速预览清理蒙版未覆盖当前原图区域。")
+        alpha = cv2.resize(
+            mask_region,
+            (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        uncertainty = cv2.resize(
+            uncertainty_region,
+            (target_width, target_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        alpha = self.apply_strokes(
+            alpha,
+            list(project.strokes),
+            project.source_width,
+            project.source_height,
+            source_region=(left, top, right, bottom),
+        )
+        composite = self.compose(source, alpha)
+        for array in (source, composite, alpha, uncertainty):
+            array.setflags(write=False)
+        return ImageLabDetailPreview(
+            source=source,
+            composite=composite,
+            effective_alpha=alpha,
+            uncertainty=uncertainty,
+            source_rect=(left, top, right, bottom),
             elapsed_seconds=time.perf_counter() - started,
         )
 
@@ -187,15 +459,26 @@ class ImageLabService:
         source_height: int,
         *,
         source_offset: tuple[int, int] = (0, 0),
+        source_region: tuple[int, int, int, int] | None = None,
     ) -> np.ndarray:
         """按原图坐标把白色覆盖和还原笔画作用到清理层。"""
 
         result = np.array(cleanup_alpha, dtype=np.uint8, copy=True)
         target_height, target_width = result.shape
+        if source_region is not None and source_offset != (0, 0):
+            raise ValueError("人工笔画不能同时指定区域和分块偏移。")
         offset_x, offset_y = source_offset
         scale_x = target_width / max(1, source_width)
         scale_y = target_height / max(1, source_height)
-        if source_offset != (0, 0):
+        if source_region is not None:
+            region_left, region_top, region_right, region_bottom = source_region
+            region_width = max(1, region_right - region_left)
+            region_height = max(1, region_bottom - region_top)
+            scale_x = target_width / region_width
+            scale_y = target_height / region_height
+            offset_x = region_left * scale_x
+            offset_y = region_top * scale_y
+        elif source_offset != (0, 0):
             scale_x = scale_y = 1.0
         for stroke in strokes:
             points = [
@@ -247,7 +530,11 @@ class ImageLabService:
             raise ValueError("图片导出仅支持 TIFF 或 PNG。")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         started = time.perf_counter()
-        preview = self.load_preview(project, max_edge=1600)
+        preview = self.load_preview(
+            project,
+            max_edge=1600,
+            build_detail_cache=False,
+        )
         guide_mask = preview.cleanup.page_mask
         image = self._open_image(project.source_path)
         temporary_raw = ""
@@ -330,6 +617,8 @@ class ImageLabService:
                         tile,
                         tile_options,
                         calibration=preview.cleanup.calibration,
+                        source_region=(read_left, read_top, read_right, read_bottom),
+                        source_size=(width, height),
                     )
                     core_x = left - read_left
                     core_y = top - read_top
@@ -569,6 +858,8 @@ class ImageLabService:
         bottom: int,
         width: int,
         height: int,
+        *,
+        output_size: tuple[int, int] | None = None,
     ) -> np.ndarray:
         guide_height, guide_width = guide.shape
         x0 = max(0, int(left * guide_width / width) - 1)
@@ -576,8 +867,9 @@ class ImageLabService:
         x1 = min(guide_width, int(np.ceil(right * guide_width / width)) + 1)
         y1 = min(guide_height, int(np.ceil(bottom * guide_height / height)) + 1)
         crop = guide[y0:y1, x0:x1]
+        target_size = output_size or (right - left, bottom - top)
         return cv2.resize(
             crop,
-            (right - left, bottom - top),
+            target_size,
             interpolation=cv2.INTER_NEAREST,
         )

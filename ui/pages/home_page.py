@@ -579,7 +579,7 @@ class HomePage(WatermarkWidget):
         scroll.setWidget(content)
         body.addStretch(1)
 
-        title = QLabel("欢迎使用字库编辑器")
+        title = QLabel("欢迎使用字库编辑器-V1.0")
         title.setObjectName("homeTitle")
         subtitle = QLabel("请选择功能，或从字库列表中选择项目继续制作流程")
         subtitle.setObjectName("homeSubtitle")

@@ -9,11 +9,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.image_cleanup import ImageCleanupOptions
+from core.image_cleanup import IMAGE_CLEANUP_ALGORITHM_VERSION, ImageCleanupOptions
 
 
 IMAGE_LAB_PROJECT_EXTENSION = ".fontlab"
-IMAGE_LAB_SCHEMA_VERSION = 2
+IMAGE_LAB_SCHEMA_VERSION = 4
 
 
 def _utc_now() -> str:
@@ -61,6 +61,8 @@ class ImageLabProject:
     source_dpi_y: float = 0.0
     options: ImageCleanupOptions = field(default_factory=ImageCleanupOptions)
     strokes: list[ImageLabStroke] = field(default_factory=list)
+    algorithm_version: int = IMAGE_CLEANUP_ALGORITHM_VERSION
+    resolved_profile: str = ""
     project_path: str = ""
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -142,6 +144,12 @@ class ImageLabProjectStore:
                     "remove_small_noise": (
                         "1" if project.options.remove_small_noise else "0"
                     ),
+                    "feather_edges": (
+                        "1" if project.options.feather_edges else "0"
+                    ),
+                    "processing_mode": project.options.processing_mode,
+                    "algorithm_version": str(IMAGE_CLEANUP_ALGORITHM_VERSION),
+                    "resolved_profile": project.resolved_profile,
                     "created_at": project.created_at,
                     "updated_at": updated_at,
                 }
@@ -167,6 +175,7 @@ class ImageLabProjectStore:
                 )
             project.project_path = target
             project.updated_at = updated_at
+            project.algorithm_version = IMAGE_CLEANUP_ALGORITHM_VERSION
             return target
         except Exception:
             connection.rollback()
@@ -184,7 +193,7 @@ class ImageLabProjectStore:
                 connection.execute("SELECT key, value FROM project_meta").fetchall()
             )
             version = int(metadata.get("schema_version", "0"))
-            if version != IMAGE_LAB_SCHEMA_VERSION:
+            if version not in {2, 3, IMAGE_LAB_SCHEMA_VERSION}:
                 raise ValueError(f"不支持的图片实验室项目版本：{version}。")
             strokes = [
                 ImageLabStroke(
@@ -217,8 +226,12 @@ class ImageLabProjectStore:
                 strength=int(metadata.get("strength", "50")),
                 preserve_faint_ink=metadata.get("preserve_faint_ink", "1") == "1",
                 remove_small_noise=metadata.get("remove_small_noise", "1") == "1",
+                feather_edges=metadata.get("feather_edges", "1") == "1",
+                processing_mode=metadata.get("processing_mode", "auto"),
             ),
             strokes=strokes,
+            algorithm_version=int(metadata.get("algorithm_version", "1")),
+            resolved_profile=metadata.get("resolved_profile", ""),
             project_path=target,
             created_at=metadata.get("created_at", _utc_now()),
             updated_at=metadata.get("updated_at", _utc_now()),

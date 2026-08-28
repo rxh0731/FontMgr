@@ -1259,7 +1259,8 @@ class ConsistencyPage(QWidget):
         root.addWidget(self._build_coordination_progress())
 
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._main_splitter.setChildrenCollapsible(False)
+        # 与其他工作台保持一致，允许用户折叠左侧字形列表。
+        self._main_splitter.setChildrenCollapsible(True)
         self._main_splitter.addWidget(self._build_glyph_list())
         self._main_splitter.addWidget(self._build_center_panel())
         self._main_splitter.addWidget(self._build_tools())

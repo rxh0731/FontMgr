@@ -35,6 +35,9 @@ class ExportOptions:
     height: Optional[int] = None
     include_transparent_area: bool = True
     name_mode: str = "字符"
+    sequence_mode: str | None = None
+    image_format: str = "PNG"
+    allow_upscale: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,7 +81,16 @@ class ExportService:
         MODE_TRIM_TRANSPARENT,
         MODE_CUSTOM_SPEC,
     )
-    NAME_MODES = ("字符", "原文件名")
+    NAME_MODES = ("普通序号", "自动等宽序号")
+    IMAGE_FORMATS = ("PNG", "JPEG", "TIFF", "BMP", "WEBP")
+    FORMAT_EXTENSIONS = {
+        "PNG": ".png",
+        "JPEG": ".jpg",
+        "TIFF": ".tif",
+        "BMP": ".bmp",
+        "WEBP": ".webp",
+    }
+    SEQUENCE_MODES = NAME_MODES
     OUTPUT_STYLES = ("灰度保真", "纯二值", "统一软边")
     CONFLICT_OVERWRITE = "overwrite"
     CONFLICT_SKIP = "skip"
@@ -100,9 +112,14 @@ class ExportService:
         self,
         verify_hash: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> dict[str, Any]:
         """核对全库流程、协调摘要和成品文件，返回可直接展示的中文摘要。"""
         variants = self._glyph.get_all_variants()
+        progress = progress_callback if progress_callback is not None else self._progress
+        total_variants = len(variants)
+        if progress:
+            progress("核对：准备开始", 0, total_variants)
         counts = {
             "待优化": 0,
             "待审核": 0,
@@ -119,7 +136,7 @@ class ExportService:
         summary = self._glyph.get_coordination_summary()
         finished_dir = self._glyph.get_workflow_dirs()["成品"]
 
-        for detail in variants:
+        for index, detail in enumerate(variants, 1):
             if cancel_check is not None and cancel_check():
                 cancelled = True
                 break
@@ -127,18 +144,26 @@ class ExportService:
             if status == config.STATUS_PENDING_OPTIMIZATION:
                 counts["待优化"] += 1
                 self._append_issue(issue_details, detail, "待优化")
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
             if status == config.STATUS_PENDING_MANUAL_REVIEW:
                 counts["待审核"] += 1
                 self._append_issue(issue_details, detail, "待审核")
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
             if status == config.STATUS_REVIEWED:
                 counts["待协调"] += 1
                 self._append_issue(issue_details, detail, "待协调")
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
             if status != config.STATUS_FINISHED:
                 counts["状态异常"] += 1
                 self._append_issue(issue_details, detail, "状态异常", status or "状态为空")
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
 
             try:
@@ -146,10 +171,14 @@ class ExportService:
             except ValueError as exc:
                 counts["路径无效"] += 1
                 self._append_issue(issue_details, detail, "路径无效", str(exc))
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
             except FileNotFoundError as exc:
                 counts["成品缺失"] += 1
                 self._append_issue(issue_details, detail, "成品缺失", str(exc))
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
 
             try:
@@ -160,6 +189,8 @@ class ExportService:
             except (OSError, ValueError, SyntaxError, UnidentifiedImageError) as exc:
                 counts["成品损坏"] += 1
                 self._append_issue(issue_details, detail, "成品损坏", str(exc))
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
 
             expected_hash = str(detail.get("成品MD5", "")).strip()
@@ -169,10 +200,14 @@ class ExportService:
                 except OSError as exc:
                     counts["成品损坏"] += 1
                     self._append_issue(issue_details, detail, "成品损坏", str(exc))
+                    if progress:
+                        progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                     continue
                 if not hash_matches:
                     counts["校验不符"] += 1
                     self._append_issue(issue_details, detail, "校验不符", "成品 MD5 与记录不一致")
+                    if progress:
+                        progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                     continue
             if cancel_check is not None and cancel_check():
                 cancelled = True
@@ -192,8 +227,15 @@ class ExportService:
                     "待协调",
                     message,
                 )
+                if progress:
+                    progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
                 continue
             ready_count += 1
+            if progress:
+                progress(f"核对：{detail.get('归属字', '')}", index, total_variants)
+
+        if progress and not cancelled:
+            progress("核对完成", total_variants, total_variants)
 
         geometry_completed = bool(summary.get("几何协调完成", False))
         ink_enabled = bool(summary.get("墨色统一启用", True))
@@ -250,6 +292,8 @@ class ExportService:
         options: ExportOptions,
         *,
         eligible_variant_ids: Optional[Iterable[str]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> list[ExportConflict]:
         """只读核对确定性目标文件名，返回需要用户处理的同名文件。"""
         destination_dir = self._validate_output_dir(output_dir)
@@ -259,13 +303,17 @@ class ExportService:
             if eligible_variant_ids is None
             else {str(variant_id) for variant_id in eligible_variant_ids}
         )
+        sequence_mode, _legacy_naming = self._normalized_naming(normalized_options)
+        extension = self.FORMAT_EXTENSIONS[self._normalized_format(normalized_options)]
         _items, _skipped, failures, conflicts = self._build_items(
             destination_dir,
-            normalized_options.name_mode,
+            sequence_mode,
             legacy_mode=False,
-            extension=".png",
+            extension=extension,
             eligible_variant_ids=eligible_ids,
             collect_conflicts=True,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
         if failures:
             details = "；".join(
@@ -295,7 +343,7 @@ class ExportService:
         if legacy_mode:
             if output_style not in self.OUTPUT_STYLES:
                 raise ValueError(f"不支持的成品风格：{output_style}")
-            if name_mode not in self.NAME_MODES:
+            if name_mode not in (*self.NAME_MODES, "字符", "原文件名"):
                 raise ValueError(f"不支持的文件命名方式：{name_mode}")
             normalized_options = ExportOptions(name_mode=name_mode)
         else:
@@ -328,12 +376,16 @@ class ExportService:
             if eligible_variant_ids is None
             else {str(variant_id) for variant_id in eligible_variant_ids}
         )
+        sequence_mode, _legacy_naming = self._normalized_naming(normalized_options)
+        output_format = self._normalized_format(normalized_options)
         items, skipped, plan_failures, _conflicts = self._build_items(
             destination_dir,
-            normalized_options.name_mode,
+            sequence_mode,
             legacy_mode=legacy_mode,
             extension=(
-                ".png" if not legacy_mode or transparent_background else ".bmp"
+                self.FORMAT_EXTENSIONS[output_format]
+                if not legacy_mode
+                else (".png" if transparent_background else ".bmp")
             ),
             eligible_variant_ids=eligible_ids,
             conflict_decisions=decision_map,
@@ -360,6 +412,28 @@ class ExportService:
                     )
                 image: Image.Image | None = None
                 try:
+                    staging_path = self._safe_child_path(
+                        staging_dir,
+                        item.destination_name,
+                        "导出暂存文件",
+                    )
+                    if (
+                        not legacy_mode
+                        and normalized_options.mode == self.MODE_LIBRARY_SPEC
+                        and output_format == "PNG"
+                    ):
+                        # 默认导出保持最终成品文件的编码、像素、透明区和附加信息不变。
+                        with Image.open(item.source_path) as source:
+                            self._validate_source_size(source)
+                            if not self._has_visible_content(source):
+                                raise ValueError("成品图像没有可见文字")
+                        shutil.copyfile(item.source_path, staging_path)
+                        self._report(
+                            f"导出：{item.detail.get('归属字', '')}",
+                            index + 1,
+                            len(items),
+                        )
+                        continue
                     with Image.open(item.source_path) as source:
                         if legacy_mode:
                             image, image_format, dpi = self._render_legacy_mode(
@@ -371,18 +445,25 @@ class ExportService:
                             image, dpi = self._render_new_mode(
                                 source, normalized_options
                             )
-                            image_format = "PNG"
+                            image_format = output_format
+                            if output_format in {"JPEG", "BMP"}:
+                                flattened = Image.new("RGB", image.size, "white")
+                                rgb_image = image.convert("RGB")
+                                alpha = image.getchannel("A")
+                                try:
+                                    flattened.paste(rgb_image, mask=alpha)
+                                finally:
+                                    rgb_image.close()
+                                    alpha.close()
+                                image.close()
+                                image = flattened
                     if cancel_check is not None and cancel_check():
                         return self._result(
                             0, skipped, 0, destination_dir, cancelled=True
                         )
                     self._save_output(
                         image,
-                        self._safe_child_path(
-                            staging_dir,
-                            item.destination_name,
-                            "导出暂存文件",
-                        ),
+                        staging_path,
                         image_format,
                         dpi,
                     )
@@ -420,13 +501,15 @@ class ExportService:
     def _build_items(
         self,
         output_dir: str,
-        name_mode: str,
+        sequence_mode: str,
         *,
         legacy_mode: bool,
         extension: str,
         eligible_variant_ids: set[str] | None = None,
         conflict_decisions: Mapping[str, ExportConflictDecision] | None = None,
         collect_conflicts: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> tuple[
         list[_ExportItem],
         int,
@@ -444,7 +527,21 @@ class ExportService:
             {} if legacy_mode else self._existing_destination_paths(output_dir)
         )
 
-        for detail in self._ordered_variants():
+        ordered_variants = self._ordered_variants()
+        total = len(ordered_variants)
+        max_group_count = max(
+            (len(self._glyph.get_char_variants(char)) for char in self._glyph.get_all_chars()),
+            default=1,
+        )
+        for index, detail in enumerate(ordered_variants, 1):
+            if cancel_check is not None and cancel_check():
+                break
+            if progress_callback is not None:
+                progress_callback(
+                    f"准备：{detail.get('归属字', '')}",
+                    index,
+                    total,
+                )
             char = str(detail.get("归属字", "")) or "字形"
             group_positions[char] = group_positions.get(char, 0) + 1
             variant_index = group_positions[char] - 1
@@ -462,7 +559,7 @@ class ExportService:
                 source_path = self._resolve_finished_source(detail)
                 original_name = (
                     self._preferred_original_name(detail, source_path)
-                    if name_mode == "原文件名"
+                    if sequence_mode not in self.SEQUENCE_MODES
                     else ""
                 )
                 if legacy_mode:
@@ -470,8 +567,9 @@ class ExportService:
                         char,
                         original_name,
                         variant_index,
-                        name_mode,
+                        sequence_mode,
                         extension,
+                        max_group_count=max_group_count,
                     )
                     self._validate_destination_name(base_name)
                     destination_name = self._allocate_legacy_name(
@@ -482,7 +580,9 @@ class ExportService:
                         char,
                         original_name,
                         variant_index,
-                        name_mode,
+                        sequence_mode,
+                        extension,
+                        max_group_count=max_group_count,
                     )
                     self._validate_destination_name(destination_name)
                     self._safe_child_path(
@@ -707,13 +807,26 @@ class ExportService:
             raise TypeError("导出设置必须使用 ExportOptions")
         if options.mode not in self.EXPORT_MODES:
             raise ValueError(f"不支持的导出模式：{options.mode}")
-        if options.name_mode not in self.NAME_MODES:
-            raise ValueError(f"不支持的文件命名方式：{options.name_mode}")
+        self._normalized_naming(options)
+        image_format = self._normalized_format(options)
         if options.mode == self.MODE_CUSTOM_SPEC:
             dpi = self._positive_int(options.dpi, "DPI")
             width = self._positive_int(options.width, "画布宽度")
             height = self._positive_int(options.height, "画布高度")
             self._validate_size(width, height)
+            metadata = self._glyph.get_metadata()
+            library_width = self._positive_int(
+                metadata.get("画布宽", 250), "字库画布宽度"
+            )
+            library_height = self._positive_int(
+                metadata.get("画布高", 250), "字库画布高度"
+            )
+            self._custom_scale_ratio(
+                width,
+                height,
+                library_width,
+                library_height,
+            )
             return ExportOptions(
                 mode=options.mode,
                 dpi=dpi,
@@ -721,12 +834,52 @@ class ExportService:
                 height=height,
                 include_transparent_area=bool(options.include_transparent_area),
                 name_mode=options.name_mode,
+                sequence_mode=options.sequence_mode,
+                image_format=image_format,
+                allow_upscale=bool(options.allow_upscale),
             )
         return ExportOptions(
             mode=options.mode,
             include_transparent_area=bool(options.include_transparent_area),
             name_mode=options.name_mode,
+            sequence_mode=options.sequence_mode,
+            image_format=image_format,
+            allow_upscale=bool(options.allow_upscale),
         )
+
+    def _normalized_naming(self, options: ExportOptions) -> tuple[str, bool]:
+        """返回新序号方式及是否为旧接口调用。"""
+        if options.sequence_mode is not None:
+            mode = str(options.sequence_mode)
+            if mode not in self.SEQUENCE_MODES:
+                raise ValueError(f"不支持的序号编制方式：{mode}")
+            return mode, False
+        legacy_mode = str(options.name_mode or "字符")
+        if legacy_mode in {"字符", "原文件名"}:
+            return legacy_mode, True
+        if legacy_mode in self.SEQUENCE_MODES:
+            return legacy_mode, False
+        raise ValueError(f"不支持的序号编制方式：{legacy_mode}")
+
+    def _normalized_format(self, options: ExportOptions) -> str:
+        image_format = str(options.image_format or "PNG").upper()
+        if image_format not in self.IMAGE_FORMATS:
+            raise ValueError(f"不支持的导出格式：{image_format}")
+        return image_format
+
+    @staticmethod
+    def _custom_scale_ratio(
+        width: int,
+        height: int,
+        library_width: int,
+        library_height: int,
+    ) -> float:
+        """校验自定义宽高等比约束，并返回唯一的完整画布缩放比例。"""
+        ratio = width / library_width
+        expected_height = max(1, round(library_height * ratio))
+        if height != expected_height:
+            raise ValueError("自定义画布必须保持字库参数的宽高比例")
+        return ratio
 
     def _render_new_mode(
         self, source: Image.Image, options: ExportOptions
@@ -734,7 +887,6 @@ class ExportService:
         self._validate_source_size(source)
         source_rgba = source if source.mode == "RGBA" else source.convert("RGBA")
         owns_source_rgba = source_rgba is not source
-        scale_source: Image.Image | None = None
         try:
             bounding_box = source_rgba.getchannel("A").getbbox()
             if bounding_box is None:
@@ -743,39 +895,73 @@ class ExportService:
             metadata_dpi = self._positive_int(
                 metadata.get("DPI", metadata.get("分辨率", 300)), "字库 DPI"
             )
+            source_dpi = self._image_dpi(source, metadata_dpi)
 
             if options.mode == self.MODE_TRIM_TRANSPARENT:
-                return source_rgba.crop(bounding_box), metadata_dpi
+                return source_rgba.crop(bounding_box), source_dpi
 
             if options.mode == self.MODE_LIBRARY_SPEC:
-                width = self._positive_int(
-                    metadata.get("画布宽", 250), "字库画布宽度"
-                )
-                height = self._positive_int(
-                    metadata.get("画布高", 250), "字库画布高度"
-                )
-                dpi = metadata_dpi
-                scale_source = source_rgba
-            else:
-                width = self._positive_int(options.width, "画布宽度")
-                height = self._positive_int(options.height, "画布高度")
-                dpi = self._positive_int(options.dpi, "DPI")
-                scale_source = (
-                    source_rgba
-                    if options.include_transparent_area
-                    else source_rgba.crop(bounding_box)
-                )
+                return source_rgba.copy(), source_dpi
+
+            width = self._positive_int(options.width, "画布宽度")
+            height = self._positive_int(options.height, "画布高度")
+            dpi = self._positive_int(options.dpi, "DPI")
+            library_width = self._positive_int(
+                metadata.get("画布宽", 250), "字库画布宽度"
+            )
+            library_height = self._positive_int(
+                metadata.get("画布高", 250), "字库画布高度"
+            )
             self._validate_size(width, height)
-            return self._contain_on_transparent_canvas(
-                scale_source,
+            ratio = self._custom_scale_ratio(
                 width,
                 height,
+                library_width,
+                library_height,
+            )
+            if ratio > 1.0 and not options.allow_upscale:
+                return self._center_on_minimum_transparent_canvas(
+                    source_rgba,
+                    width,
+                    height,
+                ), dpi
+            return self._scale_complete_product(
+                source_rgba,
+                ratio,
             ), dpi
         finally:
-            if scale_source is not None and scale_source is not source_rgba:
-                scale_source.close()
             if owns_source_rgba:
                 source_rgba.close()
+
+    @staticmethod
+    def _image_dpi(source: Image.Image, fallback: int) -> int:
+        value = source.info.get("dpi", (fallback, fallback))
+        try:
+            dpi = round(float(value[0]))
+        except (IndexError, TypeError, ValueError):
+            return fallback
+        return dpi if dpi > 0 else fallback
+
+    @classmethod
+    def _center_on_minimum_transparent_canvas(
+        cls,
+        source: Image.Image,
+        target_width: int,
+        target_height: int,
+    ) -> Image.Image:
+        """把自定义宽高作为最小画布，完整保留更大的最终成品画布。"""
+        output_width = max(target_width, source.width)
+        output_height = max(target_height, source.height)
+        cls._validate_generated_size(output_width, output_height)
+        output = Image.new(
+            "RGBA",
+            (output_width, output_height),
+            (0, 0, 0, 0),
+        )
+        left = (output_width - source.width) // 2
+        top = (output_height - source.height) // 2
+        output.alpha_composite(source, (left, top))
+        return output
 
     def _render_legacy_mode(
         self,
@@ -802,43 +988,35 @@ class ExportService:
                 source_rgba.close()
 
     @classmethod
-    def _contain_on_transparent_canvas(
-        cls, source: Image.Image, target_width: int, target_height: int
+    def _scale_complete_product(
+        cls,
+        source: Image.Image,
+        ratio: float,
     ) -> Image.Image:
+        """按字库参数得到的单一比例缩放完整成品及其透明画布。"""
         source_width, source_height = source.size
         if source_width <= 0 or source_height <= 0:
             raise ValueError("成品图像尺寸无效")
-        ratio = min(target_width / source_width, target_height / source_height)
-        scaled_width = max(1, min(target_width, round(source_width * ratio)))
-        scaled_height = max(1, min(target_height, round(source_height * ratio)))
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("自定义缩放比例无效")
+        scaled_width = max(1, round(source_width * ratio))
+        scaled_height = max(1, round(source_height * ratio))
+        cls._validate_generated_size(scaled_width, scaled_height)
         if (scaled_width, scaled_height) == source.size:
-            scaled = source.copy()
-        else:
-            # 预乘 Alpha 后缩放，避免透明边缘的 RGB 颜色污染抗锯齿像素。
-            premultiplied = source.convert("RGBa")
-            try:
-                resized = premultiplied.resize(
-                    (scaled_width, scaled_height),
-                    Image.Resampling.LANCZOS,
-                )
-            finally:
-                premultiplied.close()
-            try:
-                scaled = resized.convert("RGBA")
-            finally:
-                resized.close()
+            return source.copy()
+        # 预乘 Alpha 后缩放，避免透明边缘的 RGB 颜色污染抗锯齿像素。
+        premultiplied = source.convert("RGBa")
         try:
-            output = Image.new(
-                "RGBA",
-                (target_width, target_height),
-                (0, 0, 0, 0),
+            resized = premultiplied.resize(
+                (scaled_width, scaled_height),
+                Image.Resampling.LANCZOS,
             )
-            left = (target_width - scaled_width) // 2
-            top = (target_height - scaled_height) // 2
-            output.alpha_composite(scaled, (left, top))
-            return output
         finally:
-            scaled.close()
+            premultiplied.close()
+        try:
+            return resized.convert("RGBA")
+        finally:
+            resized.close()
 
     @staticmethod
     def _save_output(
@@ -976,13 +1154,21 @@ class ExportService:
         target_char: str,
         original_name: str,
         variant_index: int,
-        name_mode: str,
+        sequence_mode: str,
+        extension: str,
+        max_group_count: int,
     ) -> str:
-        if name_mode == "原文件名":
+        if sequence_mode == "原文件名":
             stem = os.path.splitext(os.path.basename(original_name))[0] or "字形"
-            return f"{stem}.png"
-        suffix = "" if variant_index == 0 else f"-{variant_index + 1:04d}"
-        return f"{target_char}{suffix}.png"
+            return f"{stem}{extension}"
+        if sequence_mode == "字符":
+            suffix = "" if variant_index == 0 else f"-{variant_index + 1:04d}"
+            return f"{target_char}{suffix}{extension}"
+        if sequence_mode == "自动等宽序号":
+            width = len(str(max(1, max_group_count)))
+            return f"{target_char}-{variant_index + 1:0{width}d}{extension}"
+        suffix = "" if variant_index == 0 else f"-{variant_index}"
+        return f"{target_char}{suffix}{extension}"
 
     @classmethod
     def _allocate_legacy_name(
@@ -1015,11 +1201,13 @@ class ExportService:
     def _batch_failure_details(
         items: list[_ExportItem], failed_item: _ExportItem, message: str
     ) -> list[tuple[str, str]]:
-        details: list[tuple[str, str]] = []
+        failed_id = str(failed_item.detail.get("变体ID", ""))
+        details: list[tuple[str, str]] = [(failed_id, message)]
         for item in items:
+            if item is failed_item:
+                continue
             variant_id = str(item.detail.get("变体ID", ""))
-            reason = message if item is failed_item else "同批次存在失败字形，本字未导出。"
-            details.append((variant_id, reason))
+            details.append((variant_id, "同批次存在失败字形，本字未导出。"))
         return details
 
     @staticmethod
@@ -1185,6 +1373,22 @@ class ExportService:
             )
 
     @classmethod
+    def _validate_generated_size(cls, width: int, height: int) -> None:
+        """限制由扩展画布或缩放产生的实际输出，防止异常尺寸耗尽内存。"""
+        if (
+            width <= 0
+            or height <= 0
+            or width > cls.MAX_SOURCE_DIMENSION
+            or height > cls.MAX_SOURCE_DIMENSION
+            or width * height > cls.MAX_PIXELS
+        ):
+            raise ValueError(
+                "导出结果画布过大，"
+                f"单边不得超过 {cls.MAX_SOURCE_DIMENSION} 像素，"
+                f"总像素不得超过 {cls.MAX_PIXELS}"
+            )
+
+    @classmethod
     def _validate_source_size(cls, source: Image.Image) -> None:
         width, height = source.size
         if (
@@ -1308,11 +1512,15 @@ class ExportService:
         variant_index: int,
         name_mode: str,
         extension: str,
+        max_group_count: int = 1,
     ) -> str:
-        """保留旧命名接口；新版字符命名使用四位变体序号。"""
+        """兼容旧命名入口，并支持新版普通序号与自动等宽序号。"""
         if name_mode == "原文件名":
             stem = os.path.splitext(os.path.basename(original_name))[0] or "字形"
             return f"{stem}{extension}"
+        if name_mode == "自动等宽序号":
+            width = len(str(max(1, max_group_count)))
+            return f"{target_char}-{variant_index + 1:0{width}d}{extension}"
         suffix = "" if variant_index == 0 else f"-{variant_index}"
         return f"{target_char}{suffix}{extension}"
 

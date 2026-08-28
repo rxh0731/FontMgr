@@ -60,6 +60,110 @@ class ImageLabServiceTests(unittest.TestCase):
                 int(first.effective_alpha[row, column]),
             )
 
+    def test_detail_preview_reads_original_region_and_maps_strokes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "高清区域.png")
+            height, width = 900, 1200
+            y_grid, x_grid = np.indices((height, width))
+            source = np.empty((height, width, 3), dtype=np.uint8)
+            source[:, :, 0] = (x_grid % 251).astype(np.uint8)
+            source[:, :, 1] = (y_grid % 239).astype(np.uint8)
+            source[:, :, 2] = ((x_grid + y_grid) % 247).astype(np.uint8)
+            Image.fromarray(source).save(source_path)
+            service = ImageLabService()
+            project = service.create_project(source_path)
+            project.strokes.append(
+                ImageLabStroke("cover", 40, ((0.5, 0.5),))
+            )
+            preview = service.load_preview(project, max_edge=400)
+
+            detail = service.load_detail_preview(
+                project,
+                preview,
+                (400, 300, 800, 600),
+                (400, 300),
+            )
+
+            self.assertEqual(detail.source_rect, (400, 300, 800, 600))
+            self.assertEqual(detail.source.shape, (300, 400, 3))
+            self.assertTrue(
+                np.array_equal(detail.source, source[300:600, 400:800])
+            )
+            self.assertEqual(int(detail.effective_alpha[150, 200]), 255)
+            self.assertFalse(detail.source.flags.writeable)
+            self.assertFalse(detail.composite.flags.writeable)
+            self.assertFalse(detail.effective_alpha.flags.writeable)
+
+    def test_detail_preview_reuses_fast_preview_cleanup_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "统一清理蒙版.png")
+            source = self._source(source_path)
+            service = ImageLabService()
+            project = service.create_project(source_path)
+            preview = service.load_preview(project, max_edge=320)
+            source_rect = (80, 60, 400, 300)
+            target_size = (640, 480)
+
+            detail = service.load_detail_preview(
+                project,
+                preview,
+                source_rect,
+                target_size,
+            )
+
+            preview_height, preview_width = preview.effective_alpha.shape
+            left, top, right, bottom = source_rect
+            mask_left = int(np.floor(left * preview_width / project.source_width))
+            mask_top = int(np.floor(top * preview_height / project.source_height))
+            mask_right = int(np.ceil(right * preview_width / project.source_width))
+            mask_bottom = int(np.ceil(bottom * preview_height / project.source_height))
+            expected = cv2.resize(
+                preview.cleanup.cleanup_layer[mask_top:mask_bottom, mask_left:mask_right, 3],
+                target_size,
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+            self.assertTrue(np.array_equal(detail.effective_alpha, expected))
+
+    def test_preview_reuses_existing_detail_source_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "复用缓存.png")
+            self._source(source_path)
+            service = ImageLabService()
+            project = service.create_project(source_path)
+            first = service.load_preview(project, max_edge=360)
+
+            with patch.object(
+                service,
+                "_open_image",
+                side_effect=AssertionError("不应重新解码原稿"),
+            ):
+                second = service.load_preview(
+                    project,
+                    max_edge=320,
+                    detail_source_cache=first.detail_source,
+                )
+
+            self.assertIs(second.detail_source, first.detail_source)
+            self.assertEqual(max(second.source.shape[:2]), 320)
+
+    def test_lightweight_preview_does_not_build_large_detail_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "轻量预览.png")
+            source = np.full((800, 1600, 3), 210, dtype=np.uint8)
+            Image.fromarray(source).save(source_path)
+            service = ImageLabService()
+            project = service.create_project(source_path)
+
+            preview = service.load_preview(
+                project,
+                max_edge=400,
+                build_detail_cache=False,
+            )
+
+            self.assertEqual(preview.detail_source.shape[:2], (200, 400))
+            self.assertIs(preview.source, preview.detail_source)
+
     def test_full_export_is_atomic_and_keeps_original_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source_path = os.path.join(temp_dir, "样本.png")
@@ -98,9 +202,19 @@ class ImageLabServiceTests(unittest.TestCase):
             project = service.create_project(source_path)
             calibrations = []
 
-            def tracked_cleanup(source_array, options=None, calibration=None):
+            def tracked_cleanup(
+                source_array,
+                options=None,
+                calibration=None,
+                **geometry,
+            ):
                 calibrations.append(calibration)
-                return clean_document_image(source_array, options, calibration)
+                return clean_document_image(
+                    source_array,
+                    options,
+                    calibration,
+                    **geometry,
+                )
 
             with patch(
                 "services.image_lab_service.clean_document_image",

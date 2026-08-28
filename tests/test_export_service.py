@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -336,6 +337,23 @@ class ExportServiceTests(unittest.TestCase):
             self.assertTrue(result["已取消"])
             self.assertFalse(output_dir.exists())
 
+    def test_audit_reports_per_variant_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            glyph, _details = self._build_library(root, variants=2)
+            progress: list[tuple[str, int, int]] = []
+
+            audit = ExportService(glyph).audit_readiness(
+                progress_callback=lambda message, current, total: progress.append(
+                    (message, current, total)
+                )
+            )
+
+            self.assertTrue(audit["就绪"])
+            self.assertEqual(progress[0][1:], (0, 2))
+            self.assertEqual(progress[-1][1:], (2, 2))
+            self.assertEqual([item[1] for item in progress[1:-1]], [1, 2])
+
     def test_audit_and_export_reject_finished_path_outside_library_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -396,11 +414,19 @@ class ExportServiceTests(unittest.TestCase):
             output_dir = root / "按字库参数"
             result = service.export(str(output_dir), options=options, require_ready=True)
 
-            self.assertEqual(preview.size, (40, 30))
+            source_path = (
+                Path(glyph.get_workflow_dirs()["成品"])
+                / str(details[0]["成品文件"])
+            )
+            self.assertEqual(preview.size, (20, 10))
             self.assertEqual(result["成功"], 1)
             self.assertFalse(result["已取消"])
+            self.assertEqual(
+                (output_dir / "甲.png").read_bytes(),
+                source_path.read_bytes(),
+            )
             with Image.open(output_dir / "甲.png") as exported:
-                self.assertEqual(exported.size, (40, 30))
+                self.assertEqual(exported.size, (20, 10))
                 self.assertAlmostEqual(exported.info["dpi"][0], 300, delta=0.1)
                 self.assertEqual(exported.mode, "RGBA")
 
@@ -437,45 +463,114 @@ class ExportServiceTests(unittest.TestCase):
                 self.assertEqual(exported.size, (10, 6))
                 self.assertAlmostEqual(exported.info["dpi"][0], 300, delta=0.1)
 
-    def test_custom_spec_uses_full_image_or_text_bbox_as_scaling_basis(self) -> None:
+    def test_custom_spec_requires_library_aspect_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             glyph, details = self._build_library(root)
             service = ExportService(glyph)
-            full = service.preview_image(
+            with self.assertRaisesRegex(ValueError, "宽高比例"):
+                service.preview_image(
+                    details[0],
+                    ExportOptions(
+                        mode=ExportService.MODE_CUSTOM_SPEC,
+                        dpi=600,
+                        width=100,
+                        height=100,
+                    ),
+                )
+
+    def test_custom_larger_canvas_can_center_original_or_scale_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            glyph, details = self._build_library(root)
+            finished_path = (
+                Path(glyph.get_workflow_dirs()["成品"])
+                / str(details[0]["成品文件"])
+            )
+            expanded_source = self._source_image((90, 50))
+            expanded_source.save(finished_path, "PNG", dpi=(300, 300))
+            service = ExportService(glyph)
+            centered = service.preview_image(
                 details[0],
                 ExportOptions(
                     mode=ExportService.MODE_CUSTOM_SPEC,
                     dpi=600,
-                    width=100,
-                    height=100,
-                    include_transparent_area=True,
+                    width=80,
+                    height=60,
+                    allow_upscale=False,
                 ),
             )
-            text = service.preview_image(
+            enlarged = service.preview_image(
                 details[0],
                 ExportOptions(
                     mode=ExportService.MODE_CUSTOM_SPEC,
                     dpi=600,
-                    width=100,
-                    height=100,
-                    include_transparent_area=False,
+                    width=80,
+                    height=60,
+                    allow_upscale=True,
                 ),
             )
 
-            full_bbox = full.getchannel("A").getbbox()
-            text_bbox = text.getchannel("A").getbbox()
-            self.assertEqual(full.size, (100, 100))
-            self.assertEqual(text.size, (100, 100))
-            self.assertIsNotNone(full_bbox)
-            self.assertIsNotNone(text_bbox)
-            if full_bbox is None or text_bbox is None:
-                self.fail("自定义导出预览必须保留可见文字")
-            self.assertGreater(text_bbox[2] - text_bbox[0], full_bbox[2] - full_bbox[0])
-            self.assertGreater(text_bbox[3] - text_bbox[1], full_bbox[3] - full_bbox[1])
-            self.assertEqual(text.info["dpi"], (600.0, 600.0))
+            self.assertEqual(centered.size, (90, 60))
+            self.assertEqual(enlarged.size, (180, 100))
+            self.assertEqual(centered.getchannel("A").getbbox(), (5, 7, 15, 13))
+            centered_bbox = centered.getchannel("A").getbbox()
+            enlarged_bbox = enlarged.getchannel("A").getbbox()
+            self.assertIsNotNone(centered_bbox)
+            self.assertIsNotNone(enlarged_bbox)
+            if centered_bbox is None or enlarged_bbox is None:
+                self.fail("自定义导出必须保留可见文字")
+            self.assertGreater(
+                enlarged_bbox[2] - enlarged_bbox[0],
+                centered_bbox[2] - centered_bbox[0],
+            )
+            self.assertGreater(
+                enlarged_bbox[3] - enlarged_bbox[1],
+                centered_bbox[3] - centered_bbox[1],
+            )
+            output_dir = root / "扩展画布保持原尺寸"
+            result = service.export(
+                str(output_dir),
+                options=ExportOptions(
+                    mode=ExportService.MODE_CUSTOM_SPEC,
+                    dpi=600,
+                    width=80,
+                    height=60,
+                    allow_upscale=False,
+                ),
+            )
+            self.assertEqual(result["成功"], 1)
+            with Image.open(output_dir / "甲.png") as exported:
+                self.assertEqual(exported.size, (90, 60))
 
-    def test_custom_export_writes_requested_size_and_dpi(self) -> None:
+    def test_custom_smaller_canvas_scales_full_product_proportionally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            glyph, details = self._build_library(root)
+            finished_path = (
+                Path(glyph.get_workflow_dirs()["成品"])
+                / str(details[0]["成品文件"])
+            )
+            expanded_source = self._source_image((60, 40))
+            expanded_source.save(finished_path, "PNG", dpi=(300, 300))
+            reduced = ExportService(glyph).preview_image(
+                details[0],
+                ExportOptions(
+                    mode=ExportService.MODE_CUSTOM_SPEC,
+                    dpi=600,
+                    width=20,
+                    height=15,
+                ),
+            )
+            self.assertEqual(reduced.size, (30, 20))
+            bbox = reduced.getchannel("A").getbbox()
+            self.assertIsNotNone(bbox)
+            if bbox is None:
+                self.fail("缩小导出必须保留可见文字")
+            self.assertLessEqual(bbox[0], 3)
+            self.assertGreaterEqual(bbox[2], 7)
+
+    def test_custom_export_scales_complete_product_and_writes_dpi(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             glyph, _details = self._build_library(root)
@@ -485,14 +580,14 @@ class ExportServiceTests(unittest.TestCase):
                 dpi=720,
                 width=64,
                 height=48,
-                include_transparent_area=False,
+                allow_upscale=True,
             )
 
             result = ExportService(glyph).export(str(output_dir), options=options)
 
             self.assertEqual(result["成功"], 1)
             with Image.open(output_dir / "甲.png") as exported:
-                self.assertEqual(exported.size, (64, 48))
+                self.assertEqual(exported.size, (32, 16))
                 self.assertAlmostEqual(exported.info["dpi"][0], 720, delta=0.1)
 
     def test_new_character_names_are_deterministic_for_multiple_variants(self) -> None:
@@ -511,6 +606,58 @@ class ExportServiceTests(unittest.TestCase):
                 sorted(path.name for path in output_dir.glob("*.png")),
                 ["甲-0002.png", "甲-0003.png", "甲.png"],
             )
+
+    def test_new_sequence_modes_follow_confirmed_numbering_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            glyph, _details = self._build_library(root, variants=10)
+            normal_dir = root / "普通序号"
+            padded_dir = root / "等宽序号"
+
+            ExportService(glyph).export(
+                str(normal_dir),
+                options=ExportOptions(sequence_mode="普通序号"),
+            )
+            ExportService(glyph).export(
+                str(padded_dir),
+                options=ExportOptions(sequence_mode="自动等宽序号"),
+            )
+
+            self.assertEqual(
+                {path.name for path in normal_dir.iterdir()},
+                {"甲.png", *(f"甲-{index}.png" for index in range(1, 10))},
+            )
+            self.assertEqual(
+                {path.name for path in padded_dir.iterdir()},
+                {f"甲-{index:02d}.png" for index in range(1, 11)},
+            )
+
+    def test_new_export_supports_common_image_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            glyph, _details = self._build_library(root)
+            expected = {
+                "PNG": (".png", "RGBA"),
+                "JPEG": (".jpg", "RGB"),
+                "TIFF": (".tif", "RGBA"),
+                "BMP": (".bmp", "RGB"),
+                "WEBP": (".webp", "RGBA"),
+            }
+            for image_format, (extension, expected_mode) in expected.items():
+                with self.subTest(image_format=image_format):
+                    output_dir = root / image_format
+                    result = ExportService(glyph).export(
+                        str(output_dir),
+                        options=ExportOptions(
+                            sequence_mode="普通序号",
+                            image_format=image_format,
+                        ),
+                    )
+                    self.assertEqual(result["成功"], 1)
+                    target = output_dir / f"甲{extension}"
+                    self.assertTrue(target.is_file())
+                    with Image.open(target) as exported:
+                        self.assertEqual(exported.mode, expected_mode)
 
     def test_partial_export_only_writes_eligible_variants_and_keeps_full_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -678,7 +825,7 @@ class ExportServiceTests(unittest.TestCase):
             self.assertEqual(second.read_bytes(), b"keep-me")
             self.assertTrue((output_dir / "甲-0003.png").is_file())
             with Image.open(first) as exported:
-                self.assertEqual(exported.size, (40, 30))
+                self.assertEqual(exported.size, (20, 10))
             self.assertFalse(list(root.glob(".fonteditor_export_*")))
             self.assertFalse(list(root.glob(".fonteditor_export_backup_*")))
 
@@ -843,17 +990,17 @@ class ExportServiceTests(unittest.TestCase):
             output_dir.mkdir()
             sentinel = output_dir / "已有.txt"
             sentinel.write_text("保留", encoding="utf-8")
-            original_save = ExportService._save_output
+            original_copy = shutil.copyfile
             calls = 0
 
-            def fail_second(image, path, image_format, dpi):
+            def fail_second(source, target):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("模拟第二张保存失败")
-                original_save(image, path, image_format, dpi)
+                return original_copy(source, target)
 
-            with patch.object(ExportService, "_save_output", side_effect=fail_second):
+            with patch("services.export_service.shutil.copyfile", side_effect=fail_second):
                 result = ExportService(glyph).export(
                     str(output_dir),
                     options=ExportOptions(mode=ExportService.MODE_LIBRARY_SPEC),
@@ -862,6 +1009,7 @@ class ExportServiceTests(unittest.TestCase):
             self.assertEqual(result["成功"], 0)
             self.assertEqual(result["失败"], 2)
             self.assertTrue(any("第二张保存失败" in reason for _item, reason in result["失败详情"]))
+            self.assertIn("第二张保存失败", result["失败详情"][0][1])
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "保留")
             self.assertFalse(list(output_dir.glob("*.png")))
             self.assertFalse(list(root.glob(".fonteditor_export_*")))

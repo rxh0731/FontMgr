@@ -13,6 +13,16 @@ from core.algorithms import sauvola_binarize, wolf_binarize
 
 
 RECOGNITION_METHOD = "多通道通用识别"
+RUBBING_RECOGNITION_METHOD = "拓片深色文字（笔画尺度重建）"
+IMAGE_CLEANUP_ALGORITHM_VERSION = 6
+PROCESSING_MODE_AUTO = "auto"
+PROCESSING_MODE_GENERAL = "general"
+PROCESSING_MODE_RUBBING = "rubbing_dark"
+PROCESSING_MODES = {
+    PROCESSING_MODE_AUTO,
+    PROCESSING_MODE_GENERAL,
+    PROCESSING_MODE_RUBBING,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,7 +32,9 @@ class ImageCleanupOptions:
     strength: int = 50
     preserve_faint_ink: bool = True
     remove_small_noise: bool = True
+    feather_edges: bool = True
     detect_page: bool = True
+    processing_mode: str = PROCESSING_MODE_AUTO
 
     def __post_init__(self) -> None:
         if not 0 <= int(self.strength) <= 100:
@@ -31,8 +43,12 @@ class ImageCleanupOptions:
             raise TypeError("保护浅色和残损笔迹必须是布尔值。")
         if not isinstance(self.remove_small_noise, bool):
             raise TypeError("清除孤立小噪点必须是布尔值。")
+        if not isinstance(self.feather_edges, bool):
+            raise TypeError("羽化清理边缘必须是布尔值。")
         if not isinstance(self.detect_page, bool):
             raise TypeError("文献边界检测必须是布尔值。")
+        if self.processing_mode not in PROCESSING_MODES:
+            raise ValueError("图片处理方式无效。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +59,10 @@ class ImageCleanupCalibration:
     color_support_distance_sq: int
     color_seed_distance_sq: int
     colorful_document: bool
+    resolved_mode: str = PROCESSING_MODE_GENERAL
+    rubbing_strong_threshold: float = 0.0
+    rubbing_difficulty_grid: tuple[tuple[float, ...], ...] = ()
+    rubbing_unevenness: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.background_palette:
@@ -54,6 +74,27 @@ class ImageCleanupCalibration:
             raise ValueError("彩色笔迹弱阈值不能为负数。")
         if int(self.color_seed_distance_sq) < int(self.color_support_distance_sq):
             raise ValueError("彩色笔迹强阈值不能小于弱阈值。")
+        if self.resolved_mode not in {
+            PROCESSING_MODE_GENERAL,
+            PROCESSING_MODE_RUBBING,
+        }:
+            raise ValueError("背景清理校准中的处理方式无效。")
+        if not np.isfinite(float(self.rubbing_strong_threshold)):
+            raise ValueError("拓片强笔迹阈值必须是有限数值。")
+        if not np.isfinite(float(self.rubbing_unevenness)):
+            raise ValueError("拓片背景不均匀指数必须是有限数值。")
+        if self.rubbing_difficulty_grid:
+            row_width = len(self.rubbing_difficulty_grid[0])
+            if row_width < 2 or len(self.rubbing_difficulty_grid) < 2:
+                raise ValueError("拓片局部参数图尺寸过小。")
+            for row in self.rubbing_difficulty_grid:
+                if len(row) != row_width:
+                    raise ValueError("拓片局部参数图必须是规则矩阵。")
+                if any(
+                    not np.isfinite(float(value)) or not 0.0 <= float(value) <= 1.5
+                    for value in row
+                ):
+                    raise ValueError("拓片局部参数图包含无效数值。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,8 +171,18 @@ def _estimate_multichannel_background(
         cv2.MORPH_ELLIPSE,
         (kernel_size, kernel_size),
     )
-    dark_background = cv2.morphologyEx(lightness, cv2.MORPH_CLOSE, element)
-    light_background = cv2.morphologyEx(lightness, cv2.MORPH_OPEN, element)
+    dark_background = cv2.morphologyEx(
+        lightness,
+        cv2.MORPH_CLOSE,
+        element,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+    light_background = cv2.morphologyEx(
+        lightness,
+        cv2.MORPH_OPEN,
+        element,
+        borderType=cv2.BORDER_REFLECT101,
+    )
     sigma = max(1.0, kernel_size / 12.0)
     dark_background = cv2.GaussianBlur(dark_background, (0, 0), sigmaX=sigma)
     light_background = cv2.GaussianBlur(light_background, (0, 0), sigmaX=sigma)
@@ -277,12 +328,222 @@ def _background_chroma_distance_sq(
     return distance_table[lab[:, :, 1], lab[:, :, 2]]
 
 
+def _rubbing_base_threshold(
+    dark_contrast: np.ndarray,
+    page_mask: np.ndarray,
+    strength_ratio: float,
+    preserve_faint_ink: bool,
+) -> float:
+    page_contrast = dark_contrast[page_mask]
+    if page_contrast.size:
+        otsu_threshold, _binary = cv2.threshold(
+            page_contrast.reshape(-1, 1),
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+    else:
+        otsu_threshold = 0.0
+    threshold = max(
+        12.0,
+        float(otsu_threshold) + (strength_ratio - 0.5) * 24.0,
+    )
+    if preserve_faint_ink:
+        threshold = max(10.0, threshold - 3.0)
+    return threshold
+
+
+def _rubbing_core_radius(
+    reference_short_side: float,
+    strength_ratio: float,
+    preserve_faint_ink: bool,
+) -> float:
+    radius = max(1.0, reference_short_side / 820.0)
+    radius *= 0.72 + strength_ratio * 0.56
+    if preserve_faint_ink:
+        radius *= 0.9
+    return max(1.0, radius)
+
+
+def _build_rubbing_spatial_profile(
+    lab: np.ndarray,
+    page_mask: np.ndarray,
+    strength_ratio: float,
+    preserve_faint_ink: bool,
+) -> tuple[float, tuple[tuple[float, ...], ...], float]:
+    """在整图分析层生成平滑污染难度图，禁止各分块自行分类。"""
+
+    height, width = page_mask.shape
+    short_side = min(height, width)
+    background_kernel = _odd_size(short_side * 0.035, 15, 181)
+    element = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (background_kernel, background_kernel),
+    )
+    lightness = lab[:, :, 0]
+    local_background = cv2.morphologyEx(
+        lightness,
+        cv2.MORPH_CLOSE,
+        element,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+    dark_contrast = cv2.subtract(local_background, lightness)
+    strong_threshold = _rubbing_base_threshold(
+        dark_contrast,
+        page_mask,
+        strength_ratio,
+        preserve_faint_ink,
+    )
+    strong = (dark_contrast >= strong_threshold) & page_mask
+    distance = cv2.distanceTransform(strong.astype(np.uint8), cv2.DIST_L2, 5)
+    core_radius = _rubbing_core_radius(
+        short_side,
+        strength_ratio,
+        preserve_faint_ink,
+    )
+    stable_core = distance >= max(1.0, core_radius * 0.95)
+    stable_radius = max(1, int(round(core_radius * 2.4)))
+    stable_neighborhood = cv2.dilate(
+        stable_core.astype(np.uint8),
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (stable_radius * 2 + 1, stable_radius * 2 + 1),
+        ),
+    ) > 0
+    unstable = strong & ~stable_neighborhood
+
+    grid_rows = max(5, min(18, int(round(height / 120.0))))
+    grid_columns = max(5, min(24, int(round(width / 120.0))))
+    scores = np.zeros((grid_rows, grid_columns), dtype=np.float32)
+    valid = np.zeros((grid_rows, grid_columns), dtype=bool)
+    half_height = max(24, int(np.ceil(height / max(1, grid_rows - 1))))
+    half_width = max(24, int(np.ceil(width / max(1, grid_columns - 1))))
+    for row in range(grid_rows):
+        center_y = int(round(row * (height - 1) / max(1, grid_rows - 1)))
+        top = max(0, center_y - half_height)
+        bottom = min(height, center_y + half_height + 1)
+        for column in range(grid_columns):
+            center_x = int(round(column * (width - 1) / max(1, grid_columns - 1)))
+            left = max(0, center_x - half_width)
+            right = min(width, center_x + half_width + 1)
+            local_page = page_mask[top:bottom, left:right]
+            page_count = int(np.count_nonzero(local_page))
+            if page_count < 64:
+                continue
+            local_strong = strong[top:bottom, left:right]
+            local_unstable = unstable[top:bottom, left:right]
+            local_contrast = dark_contrast[top:bottom, left:right][local_page]
+            strong_density = float(np.count_nonzero(local_strong)) / page_count
+            unstable_density = float(np.count_nonzero(local_unstable)) / page_count
+            contrast_level = float(np.percentile(local_contrast, 72.0)) / 255.0
+            scores[row, column] = (
+                unstable_density * 1.85
+                + strong_density * 0.52
+                + contrast_level * 0.10
+            )
+            valid[row, column] = True
+
+    valid_scores = scores[valid]
+    if valid_scores.size < 4:
+        difficulty = np.zeros_like(scores)
+        unevenness = 0.0
+    else:
+        median_score = float(np.median(valid_scores))
+        high_score = float(np.percentile(valid_scores, 90.0))
+        low_score = float(np.percentile(valid_scores, 10.0))
+        spread = max(0.0, high_score - median_score)
+        unevenness = max(0.0, high_score - low_score)
+        if spread < 0.012:
+            difficulty = np.zeros_like(scores)
+        else:
+            difficulty = np.clip(
+                (scores - median_score) / max(0.012, spread),
+                0.0,
+                1.5,
+            )
+    difficulty = cv2.GaussianBlur(difficulty, (0, 0), sigmaX=0.85)
+    difficulty = np.clip(difficulty, 0.0, 1.5)
+    return (
+        float(strong_threshold),
+        tuple(
+            tuple(round(float(value), 5) for value in row)
+            for row in difficulty
+        ),
+        float(unevenness),
+    )
+
+
+def _spatial_difficulty_map(
+    grid: tuple[tuple[float, ...], ...],
+    output_shape: tuple[int, int],
+    source_region: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+) -> np.ndarray:
+    """按整幅原图坐标把低分辨率参数图平滑映射到当前处理区域。"""
+
+    height, width = output_shape
+    if not grid:
+        return np.zeros((height, width), dtype=np.float32)
+    grid_array = np.asarray(grid, dtype=np.float32)
+    grid_height, grid_width = grid_array.shape
+    left, top, right, bottom = source_region
+    source_width, source_height = source_size
+    x = left + (np.arange(width, dtype=np.float32) + 0.5) * (
+        (right - left) / max(1, width)
+    )
+    y = top + (np.arange(height, dtype=np.float32) + 0.5) * (
+        (bottom - top) / max(1, height)
+    )
+    map_x = np.broadcast_to(
+        x[None, :] * ((grid_width - 1) / max(1, source_width)),
+        (height, width),
+    ).astype(np.float32, copy=False)
+    map_y = np.broadcast_to(
+        y[:, None] * ((grid_height - 1) / max(1, source_height)),
+        (height, width),
+    ).astype(np.float32, copy=False)
+    return cv2.remap(
+        grid_array,
+        map_x,
+        map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _edge_risk_map(
+    output_shape: tuple[int, int],
+    source_region: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+) -> np.ndarray:
+    """按原图坐标生成四边四角的连续污染风险权重。"""
+
+    height, width = output_shape
+    left, top, right, bottom = source_region
+    source_width, source_height = source_size
+    band = max(
+        24.0,
+        min(720.0, min(source_width, source_height) * 0.045),
+    )
+    x = left + (np.arange(width, dtype=np.float32) + 0.5) * (
+        (right - left) / max(1, width)
+    )
+    y = top + (np.arange(height, dtype=np.float32) + 0.5) * (
+        (bottom - top) / max(1, height)
+    )
+    distance_x = np.minimum(x, source_width - 1.0 - x)
+    distance_y = np.minimum(y, source_height - 1.0 - y)
+    distance = np.minimum(distance_y[:, None], distance_x[None, :])
+    return np.clip((band - distance) / band, 0.0, 1.0)
+
+
 def _build_cleanup_calibration(
     lab: np.ndarray,
     page_mask: np.ndarray,
     stroke_detail: np.ndarray,
     strength_ratio: float,
     preserve_faint_ink: bool,
+    processing_mode: str,
 ) -> ImageCleanupCalibration:
     palette = _background_chroma_palette(lab, page_mask, stroke_detail)
     distance_sq = _background_chroma_distance_sq(lab, palette)
@@ -298,12 +559,67 @@ def _build_cleanup_calibration(
         else 0.0
     )
     colorful_document = color_peak >= seed_distance
+    resolved_mode = _resolve_processing_mode(
+        lab,
+        page_mask,
+        colorful_document,
+        processing_mode,
+    )
+    rubbing_strong_threshold = 0.0
+    rubbing_difficulty_grid: tuple[tuple[float, ...], ...] = ()
+    rubbing_unevenness = 0.0
+    if resolved_mode == PROCESSING_MODE_RUBBING:
+        (
+            rubbing_strong_threshold,
+            rubbing_difficulty_grid,
+            rubbing_unevenness,
+        ) = _build_rubbing_spatial_profile(
+            lab,
+            page_mask,
+            strength_ratio,
+            preserve_faint_ink,
+        )
     return ImageCleanupCalibration(
         background_palette=palette,
         color_support_distance_sq=int(round(support_distance**2)),
         color_seed_distance_sq=int(round(seed_distance**2)),
         colorful_document=colorful_document,
+        resolved_mode=resolved_mode,
+        rubbing_strong_threshold=rubbing_strong_threshold,
+        rubbing_difficulty_grid=rubbing_difficulty_grid,
+        rubbing_unevenness=rubbing_unevenness,
     )
+
+
+def _resolve_processing_mode(
+    lab: np.ndarray,
+    page_mask: np.ndarray,
+    colorful_document: bool,
+    requested_mode: str,
+) -> str:
+    """自动区分通用彩色文献和亮底深色拓片。"""
+
+    if requested_mode != PROCESSING_MODE_AUTO:
+        return requested_mode
+    if colorful_document:
+        return PROCESSING_MODE_GENERAL
+    page_lightness = lab[:, :, 0][page_mask]
+    if page_lightness.size < 64:
+        return PROCESSING_MODE_GENERAL
+    median_lightness = float(np.median(page_lightness))
+    low_lightness = float(np.percentile(page_lightness, 12.0))
+    if median_lightness < 145.0 or median_lightness - low_lightness < 24.0:
+        return PROCESSING_MODE_GENERAL
+    threshold, _mask = cv2.threshold(
+        page_lightness.reshape(-1, 1),
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    dark_ratio = float(np.mean(page_lightness < float(threshold)))
+    if 0.01 <= dark_ratio <= 0.58:
+        return PROCESSING_MODE_RUBBING
+    return PROCESSING_MODE_GENERAL
 
 
 def _component_touch_count(mask: np.ndarray) -> int:
@@ -399,6 +715,28 @@ def _reconstruct_from_seeds(
     return marker > 0
 
 
+def _reconstruct_from_seeds_with_limit(
+    seed: np.ndarray,
+    support: np.ndarray,
+    distance_limit: np.ndarray,
+) -> np.ndarray:
+    """按整图局部参数限制恢复距离，避免重污染区重新吞入纸纹。"""
+
+    marker = seed.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    maximum = max(1, int(np.ceil(float(np.max(distance_limit)))))
+    for step in range(1, maximum + 1):
+        grown = cv2.dilate(marker, kernel) > 0
+        current = (
+            (grown & support & (distance_limit >= float(step))).astype(np.uint8)
+            | marker
+        )
+        if np.array_equal(current, marker):
+            break
+        marker = current
+    return marker > 0
+
+
 def _remove_isolated_noise(
     foreground: np.ndarray,
     evidence: np.ndarray,
@@ -432,10 +770,332 @@ def _remove_isolated_noise(
     return keep[labels]
 
 
+def _filter_rubbing_components(
+    foreground: np.ndarray,
+    core_radius: float,
+    strength_ratio: float,
+) -> np.ndarray:
+    """删除缺乏字形尺度的孤立颗粒，同时保留细长笔画。"""
+
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        foreground.astype(np.uint8),
+        8,
+        cv2.CV_32S,
+    )
+    if count <= 1:
+        return foreground
+    area_factor = 4.0 + strength_ratio * 6.0
+    area_limit = max(2, int(round(core_radius * core_radius * area_factor)))
+    span_limit = max(3, int(round(core_radius * (4.0 + strength_ratio * 2.0))))
+    keep = np.zeros(count, dtype=bool)
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        component_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        keep[label] = (
+            area >= area_limit
+            or max(component_width, component_height) >= span_limit
+        )
+    return keep[labels]
+
+
+def _identity_cleanup_result(
+    rgb: np.ndarray,
+    settings: ImageCleanupOptions,
+) -> ImageCleanupResult:
+    """强度为零时保留原稿，避免用户误以为仍会发生自动删减。"""
+
+    height, width = rgb.shape[:2]
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    palette_value = np.median(lab[:, :, 1:].reshape(-1, 2), axis=0)
+    palette = (
+        (
+            int(round(float(palette_value[0]))),
+            int(round(float(palette_value[1]))),
+        ),
+    )
+
+    resolved_mode = (
+        PROCESSING_MODE_RUBBING
+        if settings.processing_mode == PROCESSING_MODE_RUBBING
+        else PROCESSING_MODE_GENERAL
+    )
+    calibration = ImageCleanupCalibration(
+        background_palette=palette,
+        color_support_distance_sq=0,
+        color_seed_distance_sq=0,
+        colorful_document=False,
+        resolved_mode=resolved_mode,
+    )
+    foreground = np.full((height, width), 255, dtype=np.uint8)
+    uncertainty = np.zeros((height, width), dtype=np.uint8)
+    cleanup_layer = np.zeros((height, width, 4), dtype=np.uint8)
+    cleanup_layer[:, :, :3] = 255
+    composite = np.array(rgb, dtype=np.uint8, copy=True)
+    return ImageCleanupResult(
+        cleanup_layer=cleanup_layer,
+        composite=composite,
+        foreground_mask=foreground,
+        uncertainty_mask=uncertainty,
+        page_mask=np.full((height, width), 255, dtype=np.uint8),
+        resolved_profile="原稿保真（未自动清理）",
+        metrics={
+            "识别方式": "原稿保真（未自动清理）",
+            "算法版本": IMAGE_CLEANUP_ALGORITHM_VERSION,
+            "清理强度": 0,
+            "边缘羽化": "是" if settings.feather_edges else "否",
+            "保留前景占比": 1.0,
+            "完全清理占比": 0.0,
+            "待核对占比": 0.0,
+            "局部自适应": "否",
+            "背景不均匀指数": 0.0,
+        },
+        calibration=calibration,
+    )
+
+
+def _build_foreground_alpha(
+    foreground: np.ndarray,
+    page_mask: np.ndarray,
+    feather_edges: bool,
+) -> np.ndarray:
+    """按选项生成前景 Alpha；关闭羽化时保留算法的硬边结果。"""
+
+    foreground_u8 = foreground.astype(np.uint8) * 255
+    if feather_edges:
+        foreground_alpha = cv2.GaussianBlur(foreground_u8, (3, 3), 0.55)
+        foreground_alpha[foreground] = 255
+    else:
+        foreground_alpha = foreground_u8
+    foreground_alpha[~page_mask] = 0
+    return foreground_alpha
+
+
+def _clean_dark_rubbing(
+    rgb: np.ndarray,
+    lab: np.ndarray,
+    page_mask: np.ndarray,
+    settings: ImageCleanupOptions,
+    calibration: ImageCleanupCalibration,
+    source_region: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+    reference_short_side: float,
+) -> ImageCleanupResult:
+    """以粗笔画核心为种子清理亮底深色拓片的颗粒和细纹。"""
+
+    height, width = page_mask.shape
+    strength_ratio = int(settings.strength) / 100.0
+    lightness = lab[:, :, 0]
+    background_kernel = _odd_size(reference_short_side * 0.035, 15, 181)
+    element = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (background_kernel, background_kernel),
+    )
+    local_background = cv2.morphologyEx(
+        lightness,
+        cv2.MORPH_CLOSE,
+        element,
+        borderType=cv2.BORDER_REFLECT101,
+    )
+    dark_contrast = cv2.subtract(local_background, lightness)
+    strong_threshold = float(calibration.rubbing_strong_threshold)
+    if strong_threshold <= 0.0:
+        strong_threshold = _rubbing_base_threshold(
+            dark_contrast,
+            page_mask,
+            strength_ratio,
+            settings.preserve_faint_ink,
+        )
+    difficulty = _spatial_difficulty_map(
+        calibration.rubbing_difficulty_grid,
+        (height, width),
+        source_region,
+        source_size,
+    )
+    # 满幅拓片的四边四角往往包含压边、漏墨和扫描阴影。边缘污染不能
+    # 通过提高整图强度处理，否则会同时误伤中心的细笔画；这里按原图
+    # 坐标连续提高边缘门槛，并只在背景不均匀时进一步加大幅度。
+    edge_risk = _edge_risk_map(
+        (height, width),
+        source_region,
+        source_size,
+    )
+    uneven_factor = np.clip(
+        (float(calibration.rubbing_unevenness) - 0.015) / 0.08,
+        0.0,
+        1.0,
+    )
+    edge_profile = edge_risk * (0.35 + 0.65 * uneven_factor)
+    local_boost = 18.0 + strength_ratio * 32.0
+    strong_threshold_map = strong_threshold + difficulty * local_boost
+    edge_threshold_boost = (20.0 + strength_ratio * 90.0) * edge_profile
+    strong_threshold_map += edge_threshold_boost
+    support_ratio = 0.34 + strength_ratio * 0.28
+    if settings.preserve_faint_ink:
+        support_ratio = max(0.28, support_ratio - 0.055)
+    support_ratio_map = support_ratio + edge_profile * (
+        0.10 + strength_ratio * 0.12
+    )
+    support_threshold_map = np.maximum(7.0, strong_threshold_map * support_ratio)
+    support_threshold_map = np.maximum(
+        support_threshold_map,
+        strong_threshold_map * support_ratio_map,
+    )
+
+    core_radius = _rubbing_core_radius(
+        reference_short_side,
+        strength_ratio,
+        settings.preserve_faint_ink,
+    )
+    core_radius_map = core_radius * (
+        1.0 + difficulty * (0.62 + strength_ratio * 0.46)
+        + edge_profile * (0.20 + strength_ratio * 0.55)
+    )
+    strong = (dark_contrast >= strong_threshold_map) & page_mask
+    support = (dark_contrast >= support_threshold_map) & page_mask
+    distance = cv2.distanceTransform(strong.astype(np.uint8), cv2.DIST_L2, 5)
+    seed = distance >= core_radius_map
+
+    growth_multiplier = 3.8 - strength_ratio * 1.8
+    if settings.preserve_faint_ink:
+        growth_multiplier += 0.8
+    reconstruction_distance = max(
+        2,
+        min(12, int(round(core_radius * growth_multiplier))),
+    )
+    local_reconstruction_limit = np.maximum(
+        1.0,
+        reconstruction_distance
+        * (1.0 - difficulty * (0.18 + strength_ratio * 0.10)),
+    )
+    local_reconstruction_limit = np.maximum(
+        1.0,
+        local_reconstruction_limit
+        * (1.0 - edge_profile * (0.12 + strength_ratio * 0.20)),
+    )
+    foreground = _reconstruct_from_seeds_with_limit(
+        seed,
+        support | seed,
+        local_reconstruction_limit,
+    )
+    if settings.remove_small_noise:
+        foreground = _filter_rubbing_components(
+            foreground,
+            core_radius,
+            strength_ratio,
+        )
+
+    # 低强度优先保留有歧义的暗纹，并在中等强度逐步减弱保护，
+    # 避免强度跨过固定分界后突然吞掉整片细笔画。
+    protection = np.clip((0.50 - strength_ratio) / 0.25, 0.0, 1.0)
+    if protection > 0.0:
+        floor_ratio = 0.18 + min(strength_ratio, 0.25) * 0.42
+        floor_threshold = (
+            strong_threshold_map
+            * floor_ratio
+            * np.maximum(0.72, 1.0 - difficulty * 0.28)
+        )
+        # 低强度保底仍保护中心残损笔画，但不应把边缘污染整体恢复。
+        floor_threshold *= 1.0 + edge_profile * (
+            0.75 + strength_ratio * 0.80
+        )
+        # 权重降低时把保底阈值连续抬高，避免在保护关闭处再次产生断崖。
+        floor_threshold = (
+            floor_threshold * float(protection)
+            + 255.0 * (1.0 - float(protection))
+        )
+        foreground |= (
+            (dark_contrast >= floor_threshold)
+            & page_mask
+        )
+
+    edge_support = cv2.dilate(
+        foreground.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    ) > 0
+    foreground |= edge_support & (dark_contrast >= support_threshold_map * 0.82)
+    foreground &= page_mask
+
+    foreground_alpha = _build_foreground_alpha(
+        foreground,
+        page_mask,
+        settings.feather_edges,
+    )
+    cleanup_alpha = 255 - foreground_alpha
+    cleanup_layer = np.empty((height, width, 4), dtype=np.uint8)
+    cleanup_layer[:, :, :3] = 255
+    cleanup_layer[:, :, 3] = cleanup_alpha
+    alpha = foreground_alpha.astype(np.float32)[:, :, None] / 255.0
+    composite = np.clip(
+        rgb.astype(np.float32) * alpha + 255.0 * (1.0 - alpha),
+        0,
+        255,
+    ).astype(np.uint8)
+
+    uncertain_core = distance >= np.maximum(0.8, core_radius_map * 0.68)
+    uncertainty = page_mask & ~foreground & uncertain_core
+    uncertainty |= (
+        page_mask
+        & ~foreground
+        & (dark_contrast >= strong_threshold_map * 0.92)
+        & (dark_contrast < strong_threshold_map * 1.18)
+    )
+    uncertainty_mask = uncertainty.astype(np.uint8) * 255
+    metrics: dict[str, float | int | str] = {
+        "识别方式": RUBBING_RECOGNITION_METHOD,
+        "算法版本": IMAGE_CLEANUP_ALGORITHM_VERSION,
+        "彩色笔迹优先": "否",
+        "清理强度": int(settings.strength),
+        "边缘羽化": "是" if settings.feather_edges else "否",
+        "背景核大小": background_kernel,
+        "局部窗口": background_kernel,
+        "弱笔迹证据阈值": round(float(np.median(support_threshold_map)), 4),
+        "强笔迹证据阈值": round(float(strong_threshold), 4),
+        "局部自适应": "是" if calibration.rubbing_difficulty_grid else "否",
+        "背景不均匀指数": round(float(calibration.rubbing_unevenness), 6),
+        "边缘污染自适应": "是" if float(np.max(edge_profile)) > 0.0 else "否",
+        "边缘风险均值": round(float(np.mean(edge_profile)), 6),
+        "边缘阈值增量最大值": round(float(np.max(edge_threshold_boost)), 4),
+        "局部强阈值最小值": round(float(np.min(strong_threshold_map)), 4),
+        "局部强阈值最大值": round(float(np.max(strong_threshold_map)), 4),
+        "笔画核心半径": round(float(core_radius), 4),
+        "边缘恢复距离": reconstruction_distance,
+        "文献区域占比": round(float(np.mean(page_mask)), 6),
+        "保留前景占比": round(float(np.mean(foreground_alpha > 0)), 6),
+        "完全清理占比": round(float(np.mean(cleanup_alpha == 255)), 6),
+        "待核对占比": round(float(np.mean(uncertainty)), 6),
+        "亮度差异90分位": round(float(np.percentile(dark_contrast, 90.0)), 4),
+        "颜色差异90分位": 0.0,
+        "背景色域数量": len(calibration.background_palette),
+        "背景色域弱阈值": round(
+            float(np.sqrt(calibration.color_support_distance_sq)),
+            4,
+        ),
+        "背景色域强阈值": round(
+            float(np.sqrt(calibration.color_seed_distance_sq)),
+            4,
+        ),
+    }
+    return ImageCleanupResult(
+        cleanup_layer=cleanup_layer,
+        composite=composite,
+        foreground_mask=foreground_alpha,
+        uncertainty_mask=uncertainty_mask,
+        page_mask=page_mask.astype(np.uint8) * 255,
+        resolved_profile=RUBBING_RECOGNITION_METHOD,
+        metrics=metrics,
+        calibration=calibration,
+    )
+
+
 def clean_document_image(
     source: np.ndarray,
     options: ImageCleanupOptions | None = None,
     calibration: ImageCleanupCalibration | None = None,
+    *,
+    source_region: tuple[int, int, int, int] | None = None,
+    source_size: tuple[int, int] | None = None,
 ) -> ImageCleanupResult:
     """生成白色透明清理层、文字保留蒙版和合成预览。
 
@@ -446,6 +1106,39 @@ def clean_document_image(
     settings = options or ImageCleanupOptions()
     rgb = _normalize_rgb(source)
     height, width = rgb.shape[:2]
+    if (source_region is None) != (source_size is None):
+        raise ValueError("原图区域和原图尺寸必须同时提供。")
+    if source_region is None or source_size is None:
+        resolved_region = (0, 0, width, height)
+        resolved_source_size = (width, height)
+    else:
+        resolved_region = tuple(int(value) for value in source_region)
+        resolved_source_size = tuple(int(value) for value in source_size)
+        if len(resolved_region) != 4 or len(resolved_source_size) != 2:
+            raise ValueError("原图空间参数格式无效。")
+        left, top, right, bottom = resolved_region
+        source_width, source_height = resolved_source_size
+        if (
+            source_width < 3
+            or source_height < 3
+            or left < 0
+            or top < 0
+            or right <= left
+            or bottom <= top
+            or right > source_width
+            or bottom > source_height
+        ):
+            raise ValueError("原图空间参数超出有效范围。")
+    region_width = resolved_region[2] - resolved_region[0]
+    region_height = resolved_region[3] - resolved_region[1]
+    scale_x = width / max(1, region_width)
+    scale_y = height / max(1, region_height)
+    reference_short_side = min(
+        resolved_source_size[0] * scale_x,
+        resolved_source_size[1] * scale_y,
+    )
+    if int(settings.strength) == 0:
+        return _identity_cleanup_result(rgb, settings)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     lightness = lab[:, :, 0]
     short_side = min(height, width)
@@ -474,7 +1167,19 @@ def clean_document_image(
         stroke_detail,
         strength_ratio,
         settings.preserve_faint_ink,
+        settings.processing_mode,
     )
+    if resolved_calibration.resolved_mode == PROCESSING_MODE_RUBBING:
+        return _clean_dark_rubbing(
+            rgb,
+            lab,
+            page_mask,
+            settings,
+            resolved_calibration,
+            resolved_region,
+            resolved_source_size,
+            reference_short_side,
+        )
     background_chroma_distance_sq = _background_chroma_distance_sq(
         lab,
         resolved_calibration.background_palette,
@@ -628,10 +1333,11 @@ def clean_document_image(
     ) > 0
     foreground |= edge_support & (evidence >= max(1.5, support_threshold * 0.42))
 
-    foreground_u8 = foreground.astype(np.uint8) * 255
-    foreground_alpha = cv2.GaussianBlur(foreground_u8, (3, 3), 0.55)
-    foreground_alpha[foreground] = 255
-    foreground_alpha[~page_mask] = 0
+    foreground_alpha = _build_foreground_alpha(
+        foreground,
+        page_mask,
+        settings.feather_edges,
+    )
     cleanup_alpha = 255 - foreground_alpha
 
     cleanup_layer = np.empty((height, width, 4), dtype=np.uint8)
@@ -664,8 +1370,10 @@ def clean_document_image(
 
     metrics: dict[str, float | int | str] = {
         "识别方式": RECOGNITION_METHOD,
+        "算法版本": IMAGE_CLEANUP_ALGORITHM_VERSION,
         "彩色笔迹优先": "是" if colorful_document else "否",
         "清理强度": int(settings.strength),
+        "边缘羽化": "是" if settings.feather_edges else "否",
         "背景核大小": background_kernel,
         "局部窗口": local_window,
         "弱笔迹证据阈值": round(float(support_threshold), 4),

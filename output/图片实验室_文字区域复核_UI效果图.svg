@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <rect width="1440" height="900" fill="#eef1f4"/>
+  <rect x="0" y="0" width="1440" height="64" fill="#263746"/>
+  <text x="28" y="40" font-family="Microsoft YaHei, sans-serif" font-size="23" fill="#ffffff" font-weight="600">图片实验室</text>
+  <text x="205" y="39" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#cbd5dc">文字区域复核</text>
+  <rect x="1170" y="15" width="112" height="34" rx="5" fill="#3e5668"/>
+  <text x="1192" y="37" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#ffffff">保存项目</text>
+  <rect x="1297" y="15" width="116" height="34" rx="5" fill="#3e5668"/>
+  <text x="1320" y="37" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#ffffff">返回首页</text>
+
+  <rect x="0" y="64" width="1440" height="56" fill="#ffffff" stroke="#d5dce2"/>
+  <text x="26" y="98" font-family="Microsoft YaHei, sans-serif" font-size="15" fill="#33424e">原稿：Image00139.tif</text>
+  <text x="258" y="98" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#667782">7867 × 17965 · 300 DPI</text>
+  <rect x="505" y="78" width="150" height="31" rx="4" fill="#e8f4f7" stroke="#5caebe"/>
+  <text x="530" y="98" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#1e7180">区域复核模式</text>
+  <text x="1014" y="98" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#536570">检测区域 126 个</text>
+  <text x="1123" y="98" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#2c8a67">已确认 98</text>
+  <text x="1210" y="98" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#b7782a">待复核 28</text>
+  <text x="1312" y="98" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#b14b55">已拒绝 0</text>
+
+  <rect x="18" y="138" width="1010" height="694" fill="#ffffff" stroke="#d5dce2"/>
+  <rect x="18" y="138" width="1010" height="48" fill="#f7f9fa" stroke="#d5dce2"/>
+  <text x="37" y="168" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#33424e">区域叠加预览</text>
+  <rect x="211" y="149" width="94" height="28" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="229" y="168" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#4f626d">原稿</text>
+  <rect x="314" y="149" width="94" height="28" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="325" y="168" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#4f626d">清理效果</text>
+  <rect x="417" y="149" width="106" height="28" rx="4" fill="#dff1f3" stroke="#5caebe"/>
+  <text x="430" y="168" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#236d79">文字区域</text>
+  <rect x="854" y="149" width="31" height="28" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="865" y="168" font-family="Arial" font-size="18" fill="#4f626d">−</text>
+  <rect x="890" y="149" width="31" height="28" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="898" y="168" font-family="Arial" font-size="18" fill="#4f626d">＋</text>
+  <rect x="927" y="149" width="82" height="28" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="944" y="168" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#4f626d">适合窗口</text>
+
+  <rect x="39" y="206" width="968" height="600" fill="#d9d4c8"/>
+  <rect x="61" y="227" width="924" height="558" fill="#c9bda9"/>
+  <path d="M61 300 C260 270 380 324 540 292 S810 276 985 315 M61 520 C270 493 390 550 558 520 S790 500 985 538 M61 690 C270 662 430 718 630 680 S825 660 985 700" fill="none" stroke="#a79884" stroke-width="8" opacity=".35"/>
+  <g fill="#302d29" opacity=".88" font-family="STKaiti, KaiTi, serif" font-size="64">
+    <text x="116" y="330">佛</text><text x="226" y="330">說</text><text x="336" y="330">阿</text><text x="446" y="330">彌</text><text x="556" y="330">陀</text><text x="666" y="330">經</text><text x="776" y="330">卷</text>
+    <text x="116" y="475">如</text><text x="226" y="475">是</text><text x="336" y="475">我</text><text x="446" y="475">聞</text><text x="556" y="475">一</text><text x="666" y="475">時</text><text x="776" y="475">佛</text>
+    <text x="116" y="620">在</text><text x="226" y="620">舍</text><text x="336" y="620">衛</text><text x="446" y="620">國</text><text x="556" y="620">祇</text><text x="666" y="620">樹</text><text x="776" y="620">給</text>
+    <text x="116" y="765">孤</text><text x="226" y="765">獨</text><text x="336" y="765">園</text><text x="446" y="765">中</text><text x="556" y="765">與</text><text x="666" y="765">大</text><text x="776" y="765">比</text>
+  </g>
+  <g fill="none" stroke="#28a6c1" stroke-width="3">
+    <polygon points="103,263 172,254 180,347 108,353"/><polygon points="212,258 284,260 286,350 214,347"/><polygon points="323,258 392,253 396,351 324,354"/><polygon points="433,259 502,255 507,351 438,352"/><polygon points="543,257 614,261 612,350 545,352"/><polygon points="654,259 723,256 726,348 655,352"/><polygon points="764,259 835,262 837,350 767,352"/>
+    <polygon points="102,407 174,407 180,493 104,498"/><polygon points="212,404 283,408 285,497 214,495"/><polygon points="322,406 391,404 395,495 324,499"/><polygon points="433,404 504,407 506,496 436,495"/><polygon points="543,405 613,405 615,497 546,496"/><polygon points="654,405 724,409 723,495 656,499"/><polygon points="764,406 835,405 838,496 766,498"/>
+    <polygon points="103,552 174,551 178,645 106,645"/><polygon points="212,552 284,548 286,644 214,647"/><polygon points="322,551 392,552 395,644 324,646"/><polygon points="433,549 503,550 506,646 435,646"/><polygon points="543,551 613,549 616,646 545,645"/><polygon points="654,552 724,549 725,644 656,646"/><polygon points="764,550 836,551 837,646 766,647"/>
+  </g>
+  <polygon points="206,687 295,684 299,779 209,781" fill="none" stroke="#d95368" stroke-width="4"/>
+  <text x="306" y="705" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#bd3e54">当前选中：区域 102 · 待复核</text>
+  <g font-family="Microsoft YaHei, sans-serif" font-size="12">
+    <rect x="52" y="742" width="186" height="34" rx="4" fill="#ffffff" fill-opacity=".88"/>
+    <circle cx="70" cy="759" r="5" fill="#28a6c1"/><text x="83" y="763" fill="#465863">已确认区域</text>
+    <circle cx="158" cy="759" r="5" fill="#d95368"/><text x="171" y="763" fill="#465863">当前区域</text>
+  </g>
+
+  <rect x="1046" y="138" width="376" height="694" fill="#ffffff" stroke="#d5dce2"/>
+  <text x="1071" y="172" font-family="Microsoft YaHei, sans-serif" font-size="16" fill="#33424e" font-weight="600">区域处理</text>
+  <line x1="1068" y1="189" x2="1400" y2="189" stroke="#e1e6e9"/>
+  <text x="1071" y="219" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#667782">检测方式</text>
+  <rect x="1070" y="232" width="326" height="34" rx="4" fill="#ffffff" stroke="#cbd4da"/>
+  <text x="1084" y="254" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">文字检测 + 轮廓分割</text>
+  <text x="1071" y="292" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#667782">区域操作</text>
+  <rect x="1070" y="305" width="155" height="36" rx="4" fill="#2d8a9b"/><text x="1102" y="328" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#ffffff">重新检测</text>
+  <rect x="1240" y="305" width="156" height="36" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1273" y="328" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">手工绘制</text>
+  <rect x="1070" y="350" width="155" height="36" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1100" y="373" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">接受当前</text>
+  <rect x="1240" y="350" width="156" height="36" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1268" y="373" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">拒绝当前</text>
+  <rect x="1070" y="395" width="155" height="36" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1100" y="418" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">合并区域</text>
+  <rect x="1240" y="395" width="156" height="36" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1270" y="418" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">拆分区域</text>
+  <text x="1071" y="466" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#667782">处理范围</text>
+  <rect x="1070" y="479" width="18" height="18" fill="#2d8a9b"/><path d="M1074 488 l5 5 l8 -10" fill="none" stroke="#ffffff" stroke-width="2"/><text x="1098" y="494" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">仅处理已确认区域</text>
+  <rect x="1070" y="512" width="18" height="18" fill="#ffffff" stroke="#aeb9c0"/><text x="1098" y="527" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">保留安全边距</text>
+  <text x="1071" y="565" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#667782">清理参数</text>
+  <text x="1071" y="596" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">清理强度</text>
+  <line x1="1153" y1="591" x2="1387" y2="591" stroke="#c7d0d5" stroke-width="6"/>
+  <circle cx="1262" cy="591" r="8" fill="#2d8a9b"/><text x="1345" y="596" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">50</text>
+  <rect x="1070" y="620" width="18" height="18" fill="#2d8a9b"/><path d="M1074 629 l5 5 l8 -10" fill="none" stroke="#ffffff" stroke-width="2"/><text x="1098" y="635" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">保护浅色和残损笔迹</text>
+  <rect x="1070" y="653" width="18" height="18" fill="#2d8a9b"/><path d="M1074 662 l5 5 l8 -10" fill="none" stroke="#ffffff" stroke-width="2"/><text x="1098" y="668" font-family="Microsoft YaHei, sans-serif" font-size="13" fill="#33424e">羽化清理边缘</text>
+  <rect x="1070" y="702" width="326" height="40" rx="4" fill="#2d8a9b"/><text x="1171" y="727" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#ffffff">处理已确认区域</text>
+  <rect x="1070" y="752" width="326" height="40" rx="4" fill="#ffffff" stroke="#cbd4da"/><text x="1176" y="777" font-family="Microsoft YaHei, sans-serif" font-size="14" fill="#33424e">撤销上一步</text>
+
+  <rect x="18" y="850" width="1404" height="34" fill="#263746"/>
+  <text x="34" y="872" font-family="Microsoft YaHei, sans-serif" font-size="12" fill="#d7e0e5">提示：拖动顶点调整边界；双击区域可进入高清确认。当前选择仅影响界面叠加层，不会修改原稿。</text>
+</svg>
